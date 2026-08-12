@@ -1,6 +1,8 @@
 # FIX_PLAN — execution-ready global repository fix
 
 **Status:** pass 2 of N (self-paced hardening loop) — §1–4 specified, §5 outstanding
+**Operational counterpart:** `REBUILD_PLAN.md` — which of these changes must land before each phase of
+the clean-slate rebuild, and the manual runbook for executing it in a new experiment directory.
 **Source:** the *Global Repository Fix Plan* section of `ASSESSMENT_blast_radius_2026_08_12.md`
 **Rule for this document:** nothing is recorded here until its `file:line` citation has been read
 against the working tree and the change is specified to the point where it could be handed to someone
