@@ -141,7 +141,7 @@ class RunDirFixture(unittest.TestCase):
 
     # -- manifests ---------------------------------------------------------
 
-    def salvage_rows(self):
+    def reuse_rows(self):
         common = dict(old_gene_label="whatever", label_was_correct=False,
                       new_job_dir=None, excluded_reason="not selected")
         return [
@@ -202,7 +202,7 @@ class RunDirFixture(unittest.TestCase):
                  cavity_index=r["cavity_index"], old_sample_type="negative",
                  old_gene_label=r["old_gene_label"],
                  classification="valid_non_interaction", has_final_results=True)
-            for r in self.salvage_rows()
+            for r in self.reuse_rows()
             if r["classification"] == "valid_non_interaction"
         ]
 
@@ -218,7 +218,7 @@ class RunDirFixture(unittest.TestCase):
         return os.path.join(self.manifests, filename)
 
     def write_manifests(self):
-        write_checked(pd.DataFrame(self.salvage_rows()), self.path("salvage_map.csv"), "salvage_map")
+        write_checked(pd.DataFrame(self.reuse_rows()), self.path("job_classification.csv"), "job_classification")
         write_checked(pd.DataFrame(self.positive_rows()), self.path("positives_planned.csv"),
                       "positives_planned")
         write_checked(pd.DataFrame(self.drawn_rows()), self.path("negatives_drawn.csv"),
@@ -231,23 +231,23 @@ class RunDirFixture(unittest.TestCase):
                       "redock_queue")
 
     def run_curation(self):
-        salvaged_manifest = os.path.join(self.root, "salvaged_manifest.csv")
+        reused_manifest = os.path.join(self.root, "reused_manifest.csv")
         code = curate_jobs.main(
             [
-                "--salvage-map", self.path("salvage_map.csv"),
+                "--job-classification", self.path("job_classification.csv"),
                 "--drawn", self.path("negatives_drawn.csv"),
                 "--positives", self.path("positives_planned.csv"),
                 "--index", self.index_path,
                 "--src", self.src,
                 "--dst", self.curated,
                 "--evidence-only",
-                "--manifest-out", salvaged_manifest,
+                "--manifest-out", reused_manifest,
                 "--code-revision", "test-revision",
                 "--quiet",
             ]
         )
         self.assertEqual(code, 0)
-        salvaged = pd.read_csv(salvaged_manifest)
+        reused = pd.read_csv(reused_manifest)
         newly = pd.DataFrame(
             [
                 dict(job_id=r["job_id"], drugbank_id=r["drugbank_id"],
@@ -259,7 +259,7 @@ class RunDirFixture(unittest.TestCase):
             ]
         )
         write_checked(
-            pd.concat([salvaged, newly], ignore_index=True),
+            pd.concat([reused, newly], ignore_index=True),
             self.path("run_manifest.csv"),
             "run_manifest",
         )
@@ -528,8 +528,8 @@ class TestAuditCurated(RunDirFixture):
         self.assertEqual(exact["dir_count_equals_manifest"].status, FAIL)
         self.assertEqual(exact["dir_set_equals_manifest"].status, FAIL)
 
-    def test_subset_mode_still_requires_every_salvaged_row(self):
-        """A partial Phase 7 must not mask a missing salvaged job."""
+    def test_subset_mode_still_requires_every_reused_row(self):
+        """A partial Phase 7 must not mask a missing reused job."""
         # materialise the newly-docked row: subset must still pass ...
         shutil.copytree(
             os.path.join(self.curated, "DB00035__P30518__AVPR2__F1__cav1"),
@@ -554,7 +554,7 @@ class TestAuditCurated(RunDirFixture):
             by_name(self.curated_results(expect="exact"))["dir_count_equals_manifest"].status,
             PASS,
         )
-        # but a missing SALVAGED job is a failure in either mode
+        # but a missing REUSED job is a failure in either mode
         shutil.rmtree(os.path.join(self.curated, "DB00035__P30518__AVPR2__F1__cav1"))
         results = by_name(self.curated_results())
         self.assertEqual(results["dir_set_equals_manifest"].status, FAIL)
@@ -578,10 +578,10 @@ class TestAuditCurated(RunDirFixture):
         self.assertEqual(results["identity_matches_manifest"].status, FAIL)
         self.assertIn("sample_type", results["identity_matches_manifest"].detail)
 
-    def test_a_salvaged_job_with_no_source_is_not_traceable_and_fails(self):
+    def test_a_reused_job_with_no_source_is_not_traceable_and_fails(self):
         self.rewrite_identity("DB00035__Q8NCT1__ARRDC4__F1__cav2", source_job="")
         results = by_name(self.curated_results())
-        self.assertEqual(results["salvaged_jobs_name_their_source"].status, FAIL)
+        self.assertEqual(results["reused_jobs_name_their_source"].status, FAIL)
 
     def test_a_stray_file_in_the_tree_is_reported(self):
         with open(os.path.join(self.curated, "notes.txt"), "w", encoding="utf-8") as handle:

@@ -1863,7 +1863,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Modes:\n"
             "  authoritative : --idmapping FILE --proteome FILE [--hgnc FILE]\n"
             "  reduced       : --from-legacy-gene-names uniprot_gene_mapping.csv\n"
-            "                  (stamped REDUCED_LOCAL; unblocks the salvage phases "
+            "                  (stamped REDUCED_LOCAL; unblocks the reuse phases "
             "today)\n"
         ),
     )

@@ -2,8 +2,8 @@
 
 Two properties carry the weight here:
 
-* the manifest must list **every** job the design wants, salvaged or not --
-  a manifest covering only the salvaged half would reproduce the blind spot that
+* the manifest must list **every** job the design wants, reused or not --
+  a manifest covering only the reused half would reproduce the blind spot that
   let ``max_files_per_pattern = 10000`` drop 14,173 completed jobs unnoticed;
 * matching a planned job to an existing directory happens on the **full** pocket
   key. Dropping ``fragment_id`` from a key of this shape is what made the old
@@ -59,8 +59,8 @@ def drawn(rows) -> pd.DataFrame:
     )
 
 
-def salvage(rows) -> pd.DataFrame:
-    """salvage_map rows.
+def reuse(rows) -> pd.DataFrame:
+    """job_classification rows.
 
     The schema requires exactly one of new_job_dir / excluded_reason, so a kept
     row names its destination and an excluded row names its reason.
@@ -87,18 +87,18 @@ def salvage(rows) -> pd.DataFrame:
 
 
 class TestCoverage(unittest.TestCase):
-    def test_every_planned_job_appears_salvaged_or_not(self):
+    def test_every_planned_job_appears_reused_or_not(self):
         manifest, _ = brm.build_manifest(
             positives([("DB00035", "P30518", "AVPR2", "F1", 1),
                        ("DB00035", "P30518", "AVPR2", "F1", 2)]),
             drawn([("DB00157", "P68363", "TUBA1B", "F1", 3, "new", None)]),
-            salvage([("DB00035_AVPR2_P30518_cavity_1", "true_positive",
+            reuse([("DB00035_AVPR2_P30518_cavity_1", "true_positive",
                       "DB00035", "P30518", "AVPR2", "F1", 1, "AVPR2")]),
         )
         self.assertEqual(len(manifest), 3)
         self.assertEqual(
             sorted(manifest["provenance"]),
-            ["newly_docked", "newly_docked", "salvaged_from"],
+            ["newly_docked", "newly_docked", "reused_from"],
         )
 
     def test_newly_docked_rows_reconcile_with_the_redock_queue(self):
@@ -106,7 +106,7 @@ class TestCoverage(unittest.TestCase):
             positives([("DB00035", "P30518", "AVPR2", "F1", 1),
                        ("DB00157", "P68363", "TUBA1B", "F1", 1)]),
             drawn([("DB00157", "Q8NCT1", "ARRDC4", "F1", 2, "new", None)]),
-            salvage([]),
+            reuse([]),
         )
         self.assertEqual(len(redock), int((manifest["provenance"] == "newly_docked").sum()))
         self.assertEqual(len(redock), 3)
@@ -116,7 +116,7 @@ class TestCoverage(unittest.TestCase):
         _, redock = brm.build_manifest(
             positives([("DB00035", "P30518", "AVPR2", "F1", 1)]),
             drawn([]),
-            salvage([]),
+            reuse([]),
         )
         self.assertEqual(len(redock), 1)
         self.assertEqual(redock.iloc[0]["sample_type"], "positive")
@@ -124,11 +124,11 @@ class TestCoverage(unittest.TestCase):
 
 class TestPocketKeyMatching(unittest.TestCase):
     def test_match_requires_the_full_key_including_fragment(self):
-        """A salvaged F2 job must not satisfy a planned F1 job."""
+        """A reused F2 job must not satisfy a planned F1 job."""
         manifest, _ = brm.build_manifest(
             positives([("DB00035", "P30518", "AVPR2", "F1", 1)]),
             drawn([]),
-            salvage([("old_f2", "true_positive", "DB00035", "P30518", "AVPR2", "F2", 1, "AVPR2")]),
+            reuse([("old_f2", "true_positive", "DB00035", "P30518", "AVPR2", "F2", 1, "AVPR2")]),
         )
         self.assertEqual(manifest.iloc[0]["provenance"], "newly_docked")
 
@@ -136,26 +136,26 @@ class TestPocketKeyMatching(unittest.TestCase):
         manifest, _ = brm.build_manifest(
             positives([("DB00035", "P30518", "AVPR2", "F1", 1)]),
             drawn([]),
-            salvage([("old_1", "true_positive", "DB00035", "P30518", "AVPR2", "1", 1, "AVPR2")]),
+            reuse([("old_1", "true_positive", "DB00035", "P30518", "AVPR2", "1", 1, "AVPR2")]),
         )
-        self.assertEqual(manifest.iloc[0]["provenance"], "salvaged_from")
+        self.assertEqual(manifest.iloc[0]["provenance"], "reused_from")
         self.assertEqual(manifest.iloc[0]["source_job"], "old_1")
 
-    def test_non_true_positive_salvage_rows_do_not_satisfy_a_positive(self):
+    def test_non_true_positive_reuse_rows_do_not_satisfy_a_positive(self):
         manifest, _ = brm.build_manifest(
             positives([("DB00035", "P30518", "AVPR2", "F1", 1)]),
             drawn([]),
-            salvage([("old", "valid_non_interaction",
+            reuse([("old", "valid_non_interaction",
                       "DB00035", "P30518", "AVPR2", "F1", 1, "AVPR2")]),
         )
         self.assertEqual(manifest.iloc[0]["provenance"], "newly_docked")
 
-    def test_two_salvaged_dirs_claiming_one_pocket_raises(self):
+    def test_two_reused_dirs_claiming_one_pocket_raises(self):
         with self.assertRaises(InvariantViolation) as ctx:
             brm.build_manifest(
                 positives([("DB00035", "P30518", "AVPR2", "F1", 1)]),
                 drawn([]),
-                salvage([
+                reuse([
                     ("dir_a", "true_positive", "DB00035", "P30518", "AVPR2", "F1", 1, "AVPR2"),
                     ("dir_b", "true_positive", "DB00035", "P30518", "AVPR2", "F1", 1, "nan"),
                 ]),
@@ -170,7 +170,7 @@ class TestIntegrity(unittest.TestCase):
             brm.build_manifest(
                 positives([("DB00035", "P30518", "AVPR2", "F1", 1)]),
                 drawn([("DB00035", "P30518", "AVPR2", "F1", 1, "new", None)]),
-                salvage([]),
+                reuse([]),
             )
 
     def test_pool_source_without_an_old_dir_raises(self):
@@ -178,28 +178,28 @@ class TestIntegrity(unittest.TestCase):
             brm.build_manifest(
                 positives([]),
                 drawn([("DB00035", "P30518", "AVPR2", "F1", 1, "pool", None)]),
-                salvage([]),
+                reuse([]),
             )
         self.assertIn("nowhere", str(ctx.exception))
 
     def test_job_id_uses_the_new_naming_scheme(self):
         manifest, _ = brm.build_manifest(
-            positives([("DB00035", "P30518", "AVPR2", "F1", 2)]), drawn([]), salvage([])
+            positives([("DB00035", "P30518", "AVPR2", "F1", 2)]), drawn([]), reuse([])
         )
         self.assertEqual(manifest.iloc[0]["job_id"], "DB00035__P30518__AVPR2__F1__cav2")
 
     def test_row_order_is_deterministic(self):
         rows = [("DB00157", "P68363", "TUBA1B", "F1", 1),
                 ("DB00035", "P30518", "AVPR2", "F1", 1)]
-        a, _ = brm.build_manifest(positives(rows), drawn([]), salvage([]))
-        b, _ = brm.build_manifest(positives(list(reversed(rows))), drawn([]), salvage([]))
+        a, _ = brm.build_manifest(positives(rows), drawn([]), reuse([]))
+        b, _ = brm.build_manifest(positives(list(reversed(rows))), drawn([]), reuse([]))
         pd.testing.assert_frame_equal(a, b)
 
     def test_outputs_validate_against_their_schemas(self):
         manifest, redock = brm.build_manifest(
             positives([("DB00035", "P30518", "AVPR2", "F1", 1)]),
             drawn([("DB00157", "P68363", "TUBA1B", "F1", 2, "pool", "old_dir")]),
-            salvage([]),
+            reuse([]),
         )
         with tempfile.TemporaryDirectory() as tmp:
             m = os.path.join(tmp, "run_manifest.csv")
@@ -210,7 +210,7 @@ class TestIntegrity(unittest.TestCase):
             self.assertEqual(len(schemas.read_checked(r, "redock_queue")), 1)
 
     def test_empty_inputs_produce_valid_empty_outputs(self):
-        manifest, redock = brm.build_manifest(positives([]), drawn([]), salvage([]))
+        manifest, redock = brm.build_manifest(positives([]), drawn([]), reuse([]))
         self.assertTrue(manifest.empty)
         self.assertTrue(redock.empty)
         with tempfile.TemporaryDirectory() as tmp:
@@ -231,14 +231,14 @@ class TestCli(unittest.TestCase):
                 d, "negatives_drawn",
             )
             schemas.write_checked(
-                salvage([("old_dir2", "true_positive",
+                reuse([("old_dir2", "true_positive",
                           "DB00035", "P30518", "AVPR2", "F1", 1, "AVPR2")]),
-                s, "salvage_map",
+                s, "job_classification",
             )
             out = os.path.join(tmp, "run_manifest.csv")
             queue = os.path.join(tmp, "redock_queue.csv")
             rc = brm.main(
-                ["--positives", p, "--drawn", d, "--salvage-map", s,
+                ["--positives", p, "--drawn", d, "--job-classification", s,
                  "--out", out, "--redock-out", queue]
             )
             self.assertEqual(rc, 0)
@@ -246,7 +246,7 @@ class TestCli(unittest.TestCase):
             self.assertEqual(len(manifest), 2)
             self.assertEqual(
                 manifest.set_index("sample_type")["provenance"].to_dict(),
-                {"positive": "salvaged_from", "negative": "salvaged_from"},
+                {"positive": "reused_from", "negative": "reused_from"},
             )
             self.assertEqual(len(schemas.read_checked(queue, "redock_queue")), 0)
 
@@ -255,7 +255,7 @@ class TestCli(unittest.TestCase):
             rc = brm.main(
                 ["--positives", os.path.join(tmp, "nope.csv"),
                  "--drawn", os.path.join(tmp, "nope2.csv"),
-                 "--salvage-map", os.path.join(tmp, "nope3.csv"),
+                 "--job-classification", os.path.join(tmp, "nope3.csv"),
                  "--out", os.path.join(tmp, "out.csv")]
             )
             self.assertEqual(rc, 2)

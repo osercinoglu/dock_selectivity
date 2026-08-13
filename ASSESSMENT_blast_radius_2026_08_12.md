@@ -80,7 +80,7 @@ To reproduce the final parquet: **2.95 GB**. To drive a corrected re-run: **~29 
 ---
 
 
-# Salvage & Re-Run Design
+# Reuse & Re-Run Design
 
 **Bottom line:** nothing needs to be re-docked to fix what already exists. All 24,173 completed job directories are physically valid — a real ligand docked into a real cavity of a real protein — and the accession embedded in every folder name is the receptor that was actually loaded. The corruption is an *identity* defect, not a *physics* defect, so it is repairable in software. The one thing software cannot fix is coverage: only **2,100 of 8,285** intended drug–target pairs (25.35%) were ever docked against the correct protein. Closing that gap costs **13,903 new jobs ≈ 6–8 days** on the 64-core box, and needs **888 AlphaFold accessions and 2,878 cavities** — 6.4× and 13.4× less than what was originally extracted.
 
@@ -108,7 +108,7 @@ New measurements I made this session: real per-engine throughput from the campai
 
 ---
 
-## 1. SALVAGE LEDGER
+## 1. REUSE LEDGER
 
 ### 1a. The docking compute — 24,173 job directories
 
@@ -1052,7 +1052,7 @@ Independently established: the parquet contains `gene_name` values like `MT-ATP6
 | P1.3 | `generate_negative_samples.py` | `required_structures_with_negatives.csv`, `negative_samples_metadata.json`. **The new negative set will differ; old negatives must not be mixed with new positives** |
 | P1.4 | `create_ic50_mapping.py` on the index | `ic50_mapping.csv` — strictly better, independent of docking, can land immediately and be joined onto existing data for the audit |
 
-**Deliverable of Phase 1:** a corrected target list *and* a diff against the current one, which turns the salvage ledger (2,235 job dirs relabelable, 8,810 on non-targets, 6,185 intended pairs never correctly docked, 4,196 of them re-dockable today) into a reproducible artifact instead of a forensic estimate.
+**Deliverable of Phase 1:** a corrected target list *and* a diff against the current one, which turns the reuse ledger (2,235 job dirs relabelable, 8,810 on non-targets, 6,185 intended pairs never correctly docked, 4,196 of them re-dockable today) into a reproducible artifact instead of a forensic estimate.
 
 ### Phase 2 — structure prep (cheap; existing files largely reusable)
 

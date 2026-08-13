@@ -164,7 +164,7 @@ REASON_NO_FINAL_RESULTS = "no_final_results"
 REASON_DUPLICATE_POCKET = "duplicate_pocket"
 
 #: Precedence, highest first.  A row gets the first reason that applies, so the
-#: ``*_no_positives`` counts remain comparable with the salvage analysis.
+#: ``*_no_positives`` counts remain comparable with the reuse analysis.
 ELIGIBILITY_REASONS = (
     ELIGIBLE,
     REASON_NOT_IN_INDEX,
@@ -399,7 +399,7 @@ def classify_pool(
     2. ``known_interaction`` -- contamination.  The 2025 negatives contained 5.
     3. ``*_no_positives`` -- structural ineligibility under balanced sampling.
     4. ``no_final_results`` -- eligible by design, but carries no evidence, so
-       salvaging it would salvage nothing; the pocket stays available as a fresh
+       salvaging it would reuse nothing; the pocket stays available as a fresh
        docking job.
     5. ``duplicate_pocket`` -- a second old directory for the same
        ``(drug, accession, fragment, cavity)``; keeping both would break the
@@ -1651,7 +1651,7 @@ def _log_summary(result: SamplingResult) -> None:
         if count:
             logger.info("    %-28s %d", reason, count)
     logger.info(
-        "drawn ................ %d rows: %d from pool, %d to re-dock (%.1f%% salvaged)",
+        "drawn ................ %d rows: %d from pool, %d to re-dock (%.1f%% reused)",
         drawn["n_rows"],
         drawn["n_from_pool"],
         drawn["n_new"],

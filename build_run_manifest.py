@@ -2,7 +2,7 @@
 """REBUILD_PLAN Phase 4 -- assemble run_manifest.csv and the complete redock queue.
 
 Emits ``manifests/run_manifest.csv`` (schema ``run_manifest``): **every job the
-corrected design says should exist**, whether it is salvaged from the old campaign
+corrected design says should exist**, whether it is reused from the old campaign
 or has yet to be docked. Optionally emits ``manifests/redock_queue.csv`` (schema
 ``redock_queue``): the subset that must be docked fresh.
 
@@ -12,12 +12,12 @@ Why this stage exists
 Two holes, both found by running the chain end to end.
 
 **1. Nothing wrote the full manifest.** ``curate_jobs.py --manifest-out`` writes
-``run_manifest`` rows only for jobs it actually copied -- i.e. salvaged ones. But
+``run_manifest`` rows only for jobs it actually copied -- i.e. reused ones. But
 the manifest's whole purpose is to be *the authority on what should exist*, so
 that ``parse_prepare.py`` can check discovery against it and a truncated pass
 becomes detectable. The 2025-06-29 campaign lost 14,173 completed jobs (58%) to
 ``max_files_per_pattern = 10000`` and nothing noticed, because there was nothing
-to notice against. A manifest listing only the salvaged half would reproduce that
+to notice against. A manifest listing only the reused half would reproduce that
 blind spot for every newly-docked job.
 
 **2. Nothing queued the positive re-dock gap.** ``sample_negatives.py`` emits a
@@ -33,7 +33,7 @@ On the full pocket key ``(drugbank_id, accession, fragment_id, cavity_index)`` -
 never on a directory-name substring, and never on a partial key. Dropping
 ``fragment_id`` from a key of this shape is exactly what made the old sample-type
 merge non-unique and duplicated 410,087 rows, so the match is asserted to be
-one-to-one: a planned job resolves to at most one salvaged directory, and
+one-to-one: a planned job resolves to at most one reused directory, and
 :func:`assert_unique_key` enforces that ``job_id`` is unique across the whole
 manifest before it is written.
 
@@ -48,7 +48,7 @@ Usage
     python3 build_run_manifest.py \\
         --positives    manifests/positives_planned.csv \\
         --drawn        manifests/negatives_drawn.csv \\
-        --salvage-map  manifests/salvage_map.csv \\
+        --job-classification  manifests/job_classification.csv \\
         --out          manifests/run_manifest.csv \\
         --redock-out   manifests/redock_queue.csv
 """
@@ -68,10 +68,10 @@ from dock_selectivity.invariants import InvariantViolation, assert_unique_key
 
 LOG = logging.getLogger("build_run_manifest")
 
-#: Salvage classification that makes a job reusable as a positive.
+#: Reuse classification that makes a job reusable as a positive.
 _TRUE_POSITIVE = "true_positive"
 
-#: ``negatives_drawn.source`` value meaning "already docked, salvage it".
+#: ``negatives_drawn.source`` value meaning "already docked, reuse it".
 _FROM_POOL = "pool"
 
 
@@ -93,17 +93,17 @@ def _pocket_key(row: Any) -> Tuple[str, str, str, int]:
     )
 
 
-def index_salvaged_positives(salvage_map: pd.DataFrame) -> Dict[Tuple[str, str, str, int], str]:
+def index_reused_positives(job_classification: pd.DataFrame) -> Dict[Tuple[str, str, str, int], str]:
     """Pocket key -> old directory, for jobs reusable as positives.
 
-    Raises if two salvaged directories claim the same pocket: that would make the
+    Raises if two reused directories claim the same pocket: that would make the
     manifest ambiguous about which one a planned positive resolves to, and silently
     picking one is the class of mistake this whole rebuild exists to eliminate.
     """
     out: Dict[Tuple[str, str, str, int], str] = {}
-    if salvage_map.empty:
+    if job_classification.empty:
         return out
-    rows = salvage_map[salvage_map["classification"] == _TRUE_POSITIVE]
+    rows = job_classification[job_classification["classification"] == _TRUE_POSITIVE]
     for _, row in rows.iterrows():
         if pd.isna(row.get("cavity_index")):
             continue
@@ -111,7 +111,7 @@ def index_salvaged_positives(salvage_map: pd.DataFrame) -> Dict[Tuple[str, str, 
         old_dir = str(row["old_job_dir"]).strip()
         if key in out and out[key] != old_dir:
             raise ManifestError(
-                "two salvaged directories claim pocket {}: {!r} and {!r}. The manifest "
+                "two reused directories claim pocket {}: {!r} and {!r}. The manifest "
                 "cannot say which a planned positive resolves to.".format(
                     key, out[key], old_dir
                 )
@@ -123,7 +123,7 @@ def index_salvaged_positives(salvage_map: pd.DataFrame) -> Dict[Tuple[str, str, 
 def build_manifest(
     positives: pd.DataFrame,
     drawn: pd.DataFrame,
-    salvage_map: pd.DataFrame,
+    job_classification: pd.DataFrame,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Assemble ``(run_manifest, redock_queue)``.
 
@@ -132,12 +132,12 @@ def build_manifest(
     so the two outputs reconcile by construction:
     ``len(redock_queue) == (manifest.provenance == 'newly_docked').sum()``.
     """
-    salvaged = index_salvaged_positives(salvage_map)
+    reused = index_reused_positives(job_classification)
     rows: List[Dict[str, Any]] = []
 
     for _, row in positives.iterrows():
         key = _pocket_key(row)
-        old_dir = salvaged.get(key)
+        old_dir = reused.get(key)
         rows.append(
             {
                 "job_id": jobid.format_job_dir(
@@ -153,7 +153,7 @@ def build_manifest(
                 "fragment_id": key[2],
                 "cavity_index": key[3],
                 "sample_type": "positive",
-                "provenance": "salvaged_from" if old_dir else "newly_docked",
+                "provenance": "reused_from" if old_dir else "newly_docked",
                 "source_job": old_dir,
                 "selected_by": row.get("selected_by", "") or "",
             }
@@ -167,7 +167,7 @@ def build_manifest(
         if from_pool and not old_dir:
             raise ManifestError(
                 "negatives_drawn row {} says source='pool' but names no old_job_dir; "
-                "it cannot be salvaged from nowhere.".format(key)
+                "it cannot be reused from nowhere.".format(key)
             )
         rows.append(
             {
@@ -184,7 +184,7 @@ def build_manifest(
                 "fragment_id": key[2],
                 "cavity_index": key[3],
                 "sample_type": "negative",
-                "provenance": "salvaged_from" if from_pool else "newly_docked",
+                "provenance": "reused_from" if from_pool else "newly_docked",
                 "source_job": old_dir if from_pool else None,
                 "selected_by": row.get("selected_by", "") or "",
             }
@@ -239,7 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--positives", required=True, help="positives_planned.csv")
     parser.add_argument("--drawn", required=True, help="negatives_drawn.csv")
-    parser.add_argument("--salvage-map", required=True, help="salvage_map.csv")
+    parser.add_argument("--job-classification", required=True, help="job_classification.csv")
     parser.add_argument("--out", required=True, help="run_manifest.csv to write")
     parser.add_argument(
         "--redock-out",
@@ -260,13 +260,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         positives = schemas.read_checked(args.positives, "positives_planned")
         drawn = schemas.read_checked(args.drawn, "negatives_drawn")
-        salvage_map = schemas.read_checked(args.salvage_map, "salvage_map")
+        job_classification = schemas.read_checked(args.job_classification, "job_classification")
     except (InvariantViolation, OSError, ValueError) as exc:
         LOG.error("%s", exc)
         return 2
 
     try:
-        manifest, redock = build_manifest(positives, drawn, salvage_map)
+        manifest, redock = build_manifest(positives, drawn, job_classification)
     except InvariantViolation as exc:
         LOG.error("%s", exc)
         return 3
@@ -275,14 +275,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.redock_out:
         schemas.write_checked(redock, args.redock_out, "redock_queue")
 
-    n_salv = int((manifest["provenance"] == "salvaged_from").sum()) if not manifest.empty else 0
+    n_salv = int((manifest["provenance"] == "reused_from").sum()) if not manifest.empty else 0
     n_new = len(manifest) - n_salv
-    LOG.info("run_manifest: %d jobs (%d salvaged, %d to dock)", len(manifest), n_salv, n_new)
+    LOG.info("run_manifest: %d jobs (%d reused, %d to dock)", len(manifest), n_salv, n_new)
     if not manifest.empty:
         for sample_type, group in manifest.groupby("sample_type"):
-            salv = int((group["provenance"] == "salvaged_from").sum())
+            salv = int((group["provenance"] == "reused_from").sum())
             LOG.info(
-                "  %-9s %6d  (%d salvaged, %d new)",
+                "  %-9s %6d  (%d reused, %d new)",
                 sample_type, len(group), salv, len(group) - salv,
             )
     LOG.info("wrote %s", args.out)

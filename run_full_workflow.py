@@ -35,7 +35,7 @@ Usage
         --edges     1_drug_to_protein.tsv \\
         --tarballs  /opt/data/cavity_space/af_strong_cavities_data_all \\
         --ligands   $NEW/ligands \\
-        --mode      salvage-and-redock
+        --mode      reuse-and-redock
 
     python3 run_full_workflow.py --run-dir $NEW --dry-run     # print the plan only
 """
@@ -54,7 +54,7 @@ LOG = logging.getLogger("workflow")
 REPO = os.path.dirname(os.path.abspath(__file__))
 
 #: Docking modes. Explicit -- never inferred from which files happen to exist.
-MODES = ("positives-only", "salvage-and-redock", "full-redock")
+MODES = ("positives-only", "reuse-and-redock", "full-redock")
 
 
 class PhaseFailed(RuntimeError):
@@ -90,7 +90,7 @@ def build_phases(args):
     interactions = j(manifests, "interactions_resolved.csv")
     cavity_manifest = j(manifests, "cavity_manifest.csv")
     positives = j(manifests, "positives_planned.csv")
-    salvage_map = j(manifests, "salvage_map.csv")
+    job_classification = j(manifests, "job_classification.csv")
     pool = j(manifests, "negatives_pool.csv")
     drawn = j(manifests, "negatives_drawn.csv")
     manifest = j(manifests, "run_manifest.csv")
@@ -105,7 +105,7 @@ def build_phases(args):
         Phase("interactions", "Phase 1 - resolve the drug-target edges",
               "resolve_interactions.py",
               ["--edges", args.edges or "", "--index", identity,
-               "--drugs", args.drugs, "--out", interactions,
+               "--drugs", args.drugs or "", "--out", interactions,
                "--rejects", j(manifests, "interactions_rejected.csv")],
               produces=[interactions], requires=[identity]),
         Phase("cavities", "Phase 2 - cavity manifest (names only, no unpacking)",
@@ -115,25 +115,25 @@ def build_phases(args):
         Phase("positives", "Phase 3 - plan the positive jobs",
               "plan_positives.py",
               ["--interactions", interactions, "--index", identity,
-               "--cavities", cavity_manifest, "--drugs", args.drugs,
+               "--cavities", cavity_manifest, "--drugs", args.drugs or "",
                "--out", positives, "--rejects", j(manifests, "positives_rejected.csv")]
               + (["--ligands", args.ligands] if args.ligands else []),
               produces=[positives], requires=[interactions, cavity_manifest]),
     ]
 
-    if args.mode in ("salvage-and-redock",):
+    if args.mode in ("reuse-and-redock",):
         phases.append(
-            Phase("salvage", "Phase 4 - classify the old campaign (read-only)",
-                  "salvage_scan.py",
-                  ["--old-results", args.old_results or "", "--index", identity,
+            Phase("reuse", "Phase 4 - classify the old campaign (read-only)",
+                  "classify_existing.py",
+                  ["--existing-results", args.existing_results or "", "--index", identity,
                    "--interactions", interactions,
-                   "--out-map", salvage_map, "--out-pool", pool],
-                  produces=[salvage_map, pool], requires=[interactions]))
+                   "--out-map", job_classification, "--out-pool", pool],
+                  produces=[job_classification, pool], requires=[interactions]))
 
     sample_args = ["--index", identity, "--interactions", interactions,
                    "--positives", positives, "--out", drawn,
                    "--redock-queue", j(manifests, "negatives_redock_queue.csv")]
-    if args.mode == "salvage-and-redock":
+    if args.mode == "reuse-and-redock":
         sample_args += ["--pool", pool, "--prefer-pool"]
     if args.mode != "positives-only":
         phases.append(
@@ -147,7 +147,7 @@ def build_phases(args):
               "build_run_manifest.py",
               ["--positives", positives,
                "--drawn", drawn if args.mode != "positives-only" else positives,
-               "--salvage-map", salvage_map,
+               "--job-classification", job_classification,
                "--out", manifest, "--redock-out", queue],
               produces=[manifest, queue], requires=[positives]))
 
@@ -208,21 +208,71 @@ def run_phase(phase, dry_run=False, timeout=None, will_exist=()):
     return 0
 
 
+#: Where each input lives inside an --inputs-dir. Explicit, so a typo is a
+#: missing-file error rather than a stage quietly running on the wrong data.
+INPUT_LAYOUT = {
+    "edges": "1_drug_to_protein.tsv",
+    "drugs": "small_molecule_drug_links.csv",
+    "ligands": "ligands",
+    "idmapping": os.path.join("uniprot", "HUMAN_9606_idmapping.dat.gz"),
+    "proteome": os.path.join("uniprot", "UP000005640_9606.fasta.gz"),
+}
+
+
+#: Last-resort location for the DrugBank vocabulary if neither --drugs nor
+#: --inputs-dir supplies one.
+DEFAULT_DRUGS = "/opt/data/drugbank/small_molecule_drug_links.csv"
+
+
+def resolve_inputs(args):
+    """Fill unset input paths from ``--inputs-dir``.
+
+    An explicit flag always wins. Anything still unset after this is reported by
+    the phase that needs it, rather than being silently defaulted -- the whole
+    point of separating inputs from outputs is that you can see which is which.
+    """
+    if not args.inputs_dir:
+        if not args.drugs:
+            args.drugs = DEFAULT_DRUGS
+        return args
+    for attr, relative in INPUT_LAYOUT.items():
+        if getattr(args, attr, None):
+            continue
+        candidate = os.path.join(args.inputs_dir, relative)
+        if os.path.exists(candidate):
+            setattr(args, attr, candidate)
+            LOG.info("input %-10s <- %s", attr, candidate)
+        else:
+            LOG.warning("input %-10s not found at %s", attr, candidate)
+    if not args.drugs:
+        args.drugs = DEFAULT_DRUGS
+    return args
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--run-dir", required=True, help="the new experiment directory")
-    parser.add_argument("--mode", choices=MODES, default="salvage-and-redock",
+    parser.add_argument("--run-dir", required=True,
+                        help="OUTPUT directory: manifests, structures, docking results, analysis")
+    parser.add_argument("--inputs-dir", default=None,
+                        help=("INPUT directory holding the small reusable inputs "
+                              "(edges TSV, drug links, ligands/, uniprot/). Kept separate "
+                              "from --run-dir so inputs are shared and versioned while "
+                              "outputs are per-run. Individual --edges/--drugs/--ligands/"
+                              "--idmapping/--proteome override what is found here."))
+    parser.add_argument("--mode", choices=MODES, default="reuse-and-redock",
                         help=("EXPLICIT docking mode (default: %(default)s). The old "
                               "runner inferred this from whether a file happened to "
                               "exist."))
     parser.add_argument("--idmapping", default=None, help="HUMAN_9606_idmapping.dat.gz")
     parser.add_argument("--proteome", default=None, help="UP000005640_9606.fasta.gz")
     parser.add_argument("--edges", default=None, help="1_drug_to_protein.tsv")
-    parser.add_argument("--drugs", default="/opt/data/drugbank/small_molecule_drug_links.csv")
+    parser.add_argument("--drugs", default=None,
+                        help=("small_molecule_drug_links.csv. Resolved from --inputs-dir "
+                              "when unset, else %s" % DEFAULT_DRUGS))
     parser.add_argument("--tarballs", default="/opt/data/cavity_space/af_strong_cavities_data_all")
     parser.add_argument("--ligands", default=None, help="prepared ligand SDF folder")
-    parser.add_argument("--old-results", default=None,
+    parser.add_argument("--existing-results", default=None,
                         help="the OLD consensus_docking_results tree (read-only)")
     parser.add_argument("--complex-pdb", choices=("keep", "delete", "compress"),
                         default="delete")
@@ -240,6 +290,7 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    resolve_inputs(args)
 
     phases = build_phases(args)
     if args.only:

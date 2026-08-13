@@ -7,14 +7,14 @@ Reads the 24,173 job directories of the 2025-06-29 campaign **read-only**, and
 answers one question per directory: *under corrected identity, what is this job
 actually a measurement of, and does the corrected design want it?*
 
-Four outcomes, written to ``salvage_map.csv`` (one row per directory, always):
+Four outcomes, written to ``job_classification.csv`` (one row per directory, always):
 
 =========================  ===================================================
 ``true_positive``          the drug really does bind the accession that was
                            physically docked (per ``interactions_resolved.csv``)
 ``valid_non_interaction``  a real measurement with no annotated interaction --
                            a candidate for the balanced negative pool
-``incomplete``             no ``final_results.csv``: nothing to salvage
+``incomplete``             no ``final_results.csv``: nothing to reuse
 ``unparseable``            the directory name yielded no identity
 =========================  ===================================================
 
@@ -22,10 +22,10 @@ The ``valid_non_interaction`` rows are additionally emitted to
 ``negatives_pool.csv``, which is the candidate pool the re-run balanced sampler
 draws from in Phase 3.
 
-Two further files sit beside the map: ``salvage_map.evidence.csv`` (the per-job
-evidence the ``salvage_map`` schema does not declare -- the old campaign's own
+Two further files sit beside the map: ``job_classification.evidence.csv`` (the per-job
+evidence the ``job_classification`` schema does not declare -- the old campaign's own
 sample_type and where each derived value came from, keyed 1:1 on
-``old_job_dir``) and ``salvage_scan_summary.json`` (counts, invariant reports,
+``old_job_dir``) and ``classify_existing_summary.json`` (counts, invariant reports,
 every unparseable name and every non-directory entry).
 
 The three rules this script exists to honour
@@ -69,11 +69,11 @@ under different ``PYTHONHASHSEED`` values.
 
 Usage (``REBUILD_PLAN.md`` Phase 2)::
 
-    python $REPO/salvage_scan.py \\
-        --old-results  $OLD/consensus_docking_results \\
+    python $REPO/classify_existing.py \\
+        --existing-results  $OLD/consensus_docking_results \\
         --index        $NEW/identity/identity_index.parquet \\
         --interactions $NEW/manifests/interactions_resolved.csv \\
-        --out-map      $NEW/manifests/salvage_map.csv \\
+        --out-map      $NEW/manifests/job_classification.csv \\
         --out-pool     $NEW/manifests/negatives_pool.csv
 
 Python 3.9 compatible: no PEP 604 unions at runtime, no ``match``.
@@ -119,8 +119,8 @@ from dock_selectivity.joins import checked_merge_with_report
 __all__ = [
     "CLASSIFICATIONS",
     "EVIDENCE_COLUMNS",
-    "SALVAGE_MAP_COLUMNS",
-    "SALVAGE_MAP_EXTRA_COLUMNS",
+    "JOB_CLASSIFICATION_COLUMNS",
+    "JOB_CLASSIFICATION_EXTRA_COLUMNS",
     "FATAL_ERRORS",
     "FINAL_RESULTS_FILENAME",
     "DirObservation",
@@ -136,7 +136,7 @@ __all__ = [
     "main",
 ]
 
-logger = logging.getLogger("salvage_scan")
+logger = logging.getLogger("classify_existing")
 
 # --------------------------------------------------------------------------
 # vocabulary -- kept in lockstep with dock_selectivity.schemas
@@ -152,25 +152,25 @@ CLASSIFICATIONS = (TRUE_POSITIVE, VALID_NON_INTERACTION, INCOMPLETE, UNPARSEABLE
 
 if set(CLASSIFICATIONS) != set(schemas.CLASSIFICATIONS):  # pragma: no cover
     raise ImportError(
-        "salvage_scan classifications {0} disagree with schemas.CLASSIFICATIONS "
+        "classify_existing classifications {0} disagree with schemas.CLASSIFICATIONS "
         "{1}; the manifest contract and its producer must use one "
         "vocabulary".format(sorted(CLASSIFICATIONS), sorted(schemas.CLASSIFICATIONS))
     )
 
-#: The payload that makes a job salvageable at all.
+#: The payload that makes a job reuseable at all.
 FINAL_RESULTS_FILENAME = "final_results.csv"
 
-#: Per-job evidence this stage is required to record that the ``salvage_map``
+#: Per-job evidence this stage is required to record that the ``job_classification``
 #: schema in ``dock_selectivity/schemas.py`` does not declare.
 #:
-#: By default these go to a **companion file** (``salvage_map.evidence.csv``,
+#: By default these go to a **companion file** (``job_classification.evidence.csv``,
 #: one row per job directory, keyed 1:1 on ``old_job_dir``) so that
-#: ``salvage_map.csv`` stays strictly conformant and every reader --
-#: ``curate_jobs.py:1204`` calls ``read_checked(path, "salvage_map")`` with no
+#: ``job_classification.csv`` stays strictly conformant and every reader --
+#: ``curate_jobs.py:1204`` calls ``read_checked(path, "job_classification")`` with no
 #: ``allow_extra`` -- keeps working. ``--inline-extras`` folds them into
-#: ``salvage_map.csv`` instead, for anyone who would rather declare them in
+#: ``job_classification.csv`` instead, for anyone who would rather declare them in
 #: ``schemas.py`` and read with ``allow_extra=True``.
-SALVAGE_MAP_EXTRA_COLUMNS = (
+JOB_CLASSIFICATION_EXTRA_COLUMNS = (
     "old_sample_type",
     "old_sample_type_source",
     "is_known_interaction",
@@ -178,10 +178,10 @@ SALVAGE_MAP_EXTRA_COLUMNS = (
     "has_final_results",
 )
 
-#: The companion file's columns: the salvage_map key plus the evidence.
-EVIDENCE_COLUMNS = ("old_job_dir",) + SALVAGE_MAP_EXTRA_COLUMNS
+#: The companion file's columns: the job_classification key plus the evidence.
+EVIDENCE_COLUMNS = ("old_job_dir",) + JOB_CLASSIFICATION_EXTRA_COLUMNS
 
-_SALVAGE_MAP_DTYPES: Tuple[Tuple[str, str], ...] = (
+_JOB_CLASSIFICATION_DTYPES: Tuple[Tuple[str, str], ...] = (
     ("old_job_dir", "string"),
     ("classification", "string"),
     ("drugbank_id", "string"),
@@ -201,7 +201,7 @@ _SALVAGE_MAP_DTYPES: Tuple[Tuple[str, str], ...] = (
     ("has_final_results", "boolean"),
 )
 
-SALVAGE_MAP_COLUMNS = tuple(name for name, _ in _SALVAGE_MAP_DTYPES)
+JOB_CLASSIFICATION_COLUMNS = tuple(name for name, _ in _JOB_CLASSIFICATION_DTYPES)
 
 #: Why a job is not carried over. Recorded per row; never a bare drop.
 POOL_PENDING_REASON = (
@@ -210,7 +210,7 @@ POOL_PENDING_REASON = (
 )
 INCOMPLETE_REASON = (
     "no {0} in the job directory: the consensus payload was never written, so "
-    "there is nothing to salvage".format(FINAL_RESULTS_FILENAME)
+    "there is nothing to reuse".format(FINAL_RESULTS_FILENAME)
 )
 UNPARSEABLE_REASON = "unparseable directory name: {0}"
 NAME_BUILD_FAILED_REASON = "cannot build a new job directory name: {0}"
@@ -244,9 +244,9 @@ FATAL_ERRORS = (
 )
 
 CHECKPOINT_SCHEMA_VERSION = 1
-CHECKPOINT_TOOL = "salvage_scan"
-DEFAULT_CHECKPOINT_NAME = ".salvage_scan_checkpoint.jsonl"
-DEFAULT_SUMMARY_NAME = "salvage_scan_summary.json"
+CHECKPOINT_TOOL = "classify_existing"
+DEFAULT_CHECKPOINT_NAME = ".classify_existing_checkpoint.jsonl"
+DEFAULT_SUMMARY_NAME = "classify_existing_summary.json"
 
 _MAX_REPORTED = 10
 
@@ -273,7 +273,7 @@ class DirObservation:
 class ScanResult:
     """Everything a caller (or a test) needs to inspect a completed scan."""
 
-    salvage_map: pd.DataFrame
+    job_classification: pd.DataFrame
     negatives_pool: pd.DataFrame
     summary: Dict[str, Any]
     out_map: Optional[str] = None
@@ -338,7 +338,7 @@ def assert_not_under(path: Any, root: Any, label: str) -> str:
             "refusing to write {0} to {1}: it is inside the read-only old run "
             "directory {2}. $OLD is the only copy of the campaign's docking "
             "output; point this output at $NEW.".format(label, target, base),
-            name="salvage_scan.read_only_guard",
+            name="classify_existing.read_only_guard",
         )
     return target
 
@@ -409,7 +409,7 @@ def _write_json(payload: Any, path: str) -> str:
 # --------------------------------------------------------------------------
 
 
-def list_entries(old_results: Any) -> Tuple[List[str], List[str]]:
+def list_entries(existing_results: Any) -> Tuple[List[str], List[str]]:
     """Single-level listing of ``$OLD/consensus_docking_results``.
 
     Returns ``(job_dirs, non_directory_entries)``, both sorted. **One level
@@ -421,10 +421,10 @@ def list_entries(old_results: Any) -> Tuple[List[str], List[str]]:
     = 24,173 dirs + 1 file" is an accounting statement the summary makes
     explicitly.
     """
-    root = os.fspath(old_results)
+    root = os.fspath(existing_results)
     if not os.path.isdir(root):
         raise NotADirectoryError(
-            "--old-results {0} is not a directory. It must point at "
+            "--existing-results {0} is not a directory. It must point at "
             "$OLD/consensus_docking_results. A missing prerequisite is an "
             "error, never a fallback.".format(root)
         )
@@ -501,10 +501,10 @@ def observe_job_dirs(
 # --------------------------------------------------------------------------
 
 
-def read_checkpoint(path: Any, old_results: Any) -> Tuple[Dict[str, bool], Dict[str, Any]]:
+def read_checkpoint(path: Any, existing_results: Any) -> Tuple[Dict[str, bool], Dict[str, Any]]:
     """Load a checkpoint written by a previous run of this scan.
 
-    A checkpoint recorded against a *different* ``--old-results`` directory
+    A checkpoint recorded against a *different* ``--existing-results`` directory
     raises rather than being reused: silently mixing observations from two
     trees is exactly the class of universe-widening fallback ``FIX_PLAN.md`` G8
     bans. Delete the file or pass ``--no-resume``.
@@ -532,29 +532,29 @@ def read_checkpoint(path: Any, old_results: Any) -> Tuple[Dict[str, bool], Dict[
         raise InvariantViolation(
             "checkpoint {0} has an unreadable header line. Delete it or pass "
             "--no-resume; it will not be silently ignored.".format(path),
-            name="salvage_scan.checkpoint",
+            name="classify_existing.checkpoint",
         )
-    expected = _real(old_results)
+    expected = _real(existing_results)
     if (
         not isinstance(header, dict)
         or header.get("tool") != CHECKPOINT_TOOL
         or header.get("schema_version") != CHECKPOINT_SCHEMA_VERSION
-        or header.get("old_results") != expected
+        or header.get("existing_results") != expected
     ):
         raise InvariantViolation(
-            "checkpoint {0} was written by {1!r} (schema {2}) for old_results "
+            "checkpoint {0} was written by {1!r} (schema {2}) for existing_results "
             "{3!r}, but this run is {4!r} (schema {5}) over {6!r}. Reusing it "
             "would mix observations from two different trees. Delete the "
             "checkpoint or pass --no-resume.".format(
                 path,
                 header.get("tool") if isinstance(header, dict) else None,
                 header.get("schema_version") if isinstance(header, dict) else None,
-                header.get("old_results") if isinstance(header, dict) else None,
+                header.get("existing_results") if isinstance(header, dict) else None,
                 CHECKPOINT_TOOL,
                 CHECKPOINT_SCHEMA_VERSION,
                 expected,
             ),
-            name="salvage_scan.checkpoint",
+            name="classify_existing.checkpoint",
         )
     cached: Dict[str, bool] = {}
     for position, line in enumerate(lines[1:], start=2):
@@ -576,14 +576,14 @@ def read_checkpoint(path: Any, old_results: Any) -> Tuple[Dict[str, bool], Dict[
                 "checkpoint {0} line {1} is not valid JSON. Delete the file or "
                 "pass --no-resume; a partially readable checkpoint is not "
                 "silently accepted.".format(path, position),
-                name="salvage_scan.checkpoint",
+                name="classify_existing.checkpoint",
             )
         cached[str(record["d"])] = bool(record["f"])
     report["n_entries"] = len(cached)
     return cached, report
 
 
-def _open_checkpoint(path: str, old_results: str, entries: Dict[str, bool]) -> Any:
+def _open_checkpoint(path: str, existing_results: str, entries: Dict[str, bool]) -> Any:
     """Rewrite the checkpoint from *entries*, then open it for appending.
 
     Rewriting rather than blindly appending is what makes a *crashed* run
@@ -598,7 +598,7 @@ def _open_checkpoint(path: str, old_results: str, entries: Dict[str, bool]) -> A
         {
             "tool": CHECKPOINT_TOOL,
             "schema_version": CHECKPOINT_SCHEMA_VERSION,
-            "old_results": _real(old_results),
+            "existing_results": _real(existing_results),
         },
         sort_keys=True,
     )
@@ -676,7 +676,7 @@ def load_interaction_pairs(
                     os.fspath(path),
                     ", ".join(unknown[:_MAX_REPORTED]),
                 ),
-                name="salvage_scan.interactions",
+                name="classify_existing.interactions",
             )
     return pairs, report
 
@@ -694,7 +694,7 @@ def _coerce_cavity_index(value: Any) -> Optional[int]:
     if not text.isdigit():
         raise InvariantViolation(
             "cavity index {0!r} is not a non-negative integer".format(value),
-            name="salvage_scan.old_plan",
+            name="classify_existing.old_plan",
         )
     return int(text)
 
@@ -732,7 +732,7 @@ def load_old_plan(path: Any) -> Tuple[pd.DataFrame, Dict[str, Any]]:
             "Present: {3}".format(
                 path, missing, list(OLD_PLAN_COLUMNS), list(raw.columns)
             ),
-            name="salvage_scan.old_plan",
+            name="classify_existing.old_plan",
         )
     sample_types = [str(v).strip().lower() for v in raw["sample_type"].tolist()]
     bad = sorted({s for s in sample_types if s not in schemas.SAMPLE_TYPES})
@@ -742,7 +742,7 @@ def load_old_plan(path: Any) -> Tuple[pd.DataFrame, Dict[str, Any]]:
             "label outside the declared vocabulary is not coerced.".format(
                 path, bad[:_MAX_REPORTED], list(schemas.SAMPLE_TYPES)
             ),
-            name="salvage_scan.old_plan",
+            name="classify_existing.old_plan",
         )
     plan = pd.DataFrame(
         {
@@ -784,7 +784,7 @@ def load_old_plan(path: Any) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     )
     collapse = assert_collapse_factor_one(
         pd.DataFrame({"key": key, "old_sample_type": plan["old_sample_type"]}),
-        name="salvage_scan old_plan (drug, accession, fragment, cavity) -> sample_type",
+        name="classify_existing old_plan (drug, accession, fragment, cavity) -> sample_type",
     )
     report = {
         "path": path,
@@ -811,7 +811,7 @@ def load_old_plan(path: Any) -> Tuple[pd.DataFrame, Dict[str, Any]]:
 
 
 def _row_template(name: str) -> Dict[str, Any]:
-    row: Dict[str, Any] = {column: None for column in SALVAGE_MAP_COLUMNS}
+    row: Dict[str, Any] = {column: None for column in JOB_CLASSIFICATION_COLUMNS}
     row["old_job_dir"] = name
     return row
 
@@ -913,9 +913,9 @@ def classify_jobs(
     frame = pd.DataFrame(
         {
             column: _series([row[column] for row in rows], dtype)
-            for column, dtype in _SALVAGE_MAP_DTYPES
+            for column, dtype in _JOB_CLASSIFICATION_DTYPES
         },
-        columns=list(SALVAGE_MAP_COLUMNS),
+        columns=list(JOB_CLASSIFICATION_COLUMNS),
     )
     return frame
 
@@ -952,15 +952,15 @@ def attach_old_sample_type(
             plan,
             on=["drugbank_id", "accession", "fragment_id", "cavity_index"],
             how="left",
-            name="salvage_scan old_sample_type <- old plan",
+            name="classify_existing old_sample_type <- old plan",
             allow_growth=False,
         )
         report["merge"] = merge_report
-        frame = merged[list(SALVAGE_MAP_COLUMNS)]
+        frame = merged[list(JOB_CLASSIFICATION_COLUMNS)]
         assert_no_row_growth(
             n_before,
             frame,
-            name="salvage_scan old_plan merge",
+            name="classify_existing old_plan merge",
             allow_shrinkage=False,
         )
 
@@ -986,7 +986,7 @@ def attach_old_sample_type(
     return frame, report
 
 
-def negatives_pool_frame(salvage_map: pd.DataFrame) -> pd.DataFrame:
+def negatives_pool_frame(job_classification: pd.DataFrame) -> pd.DataFrame:
     """The negative candidate pool: exactly the ``valid_non_interaction`` rows.
 
     Emitted separately (``REBUILD_PLAN.md`` §2 ``manifests/negatives_pool.csv``)
@@ -998,7 +998,7 @@ def negatives_pool_frame(salvage_map: pd.DataFrame) -> pd.DataFrame:
     must receive zero negatives, so a large part of the pool is structurally
     ineligible. Eligibility is the sampler's judgement, not this scan's.
     """
-    rows = salvage_map[salvage_map["classification"] == VALID_NON_INTERACTION]
+    rows = job_classification[job_classification["classification"] == VALID_NON_INTERACTION]
     pool = pd.DataFrame(
         {
             "old_job_dir": rows["old_job_dir"].astype("string"),
@@ -1038,7 +1038,7 @@ def _count(frame: pd.DataFrame, column: str, vocabulary: Sequence[str]) -> Dict[
 
 
 def run_scan(
-    old_results: Any,
+    existing_results: Any,
     index_path: Any,
     interactions_path: Any,
     out_map: Optional[Any] = None,
@@ -1055,7 +1055,7 @@ def run_scan(
     code_revision: Optional[str] = None,
 ) -> ScanResult:
     """Run the whole Phase-2 scan and (optionally) write its artifacts."""
-    old_results = os.fspath(old_results)
+    existing_results = os.fspath(existing_results)
 
     # Guard before anything is opened for writing.
     targets = {
@@ -1067,12 +1067,12 @@ def run_scan(
     }
     for label, target in targets.items():
         if target is not None:
-            assert_not_under(target, old_results, label)
+            assert_not_under(target, existing_results, label)
     if out_map is not None and out_pool is not None and _real(out_map) == _real(out_pool):
         raise InvariantViolation(
             "--out-map and --out-pool resolve to the same file ({0}); one would "
             "overwrite the other".format(_real(out_map)),
-            name="salvage_scan.outputs",
+            name="classify_existing.outputs",
         )
 
     index = IdentityIndex.load(index_path, expect_sha256=index_sha256)
@@ -1116,10 +1116,10 @@ def run_scan(
             "records its source in old_sample_type_source."
         )
 
-    job_dirs, non_dirs = list_entries(old_results)
+    job_dirs, non_dirs = list_entries(existing_results)
     logger.info(
         "%s: %d entries = %d job directories + %d non-directory entries",
-        old_results,
+        existing_results,
         len(job_dirs) + len(non_dirs),
         len(job_dirs),
         len(non_dirs),
@@ -1142,7 +1142,7 @@ def run_scan(
         if checkpoint is not None:
             checkpoint = os.fspath(checkpoint)
             if resume:
-                cached, checkpoint_report = read_checkpoint(checkpoint, old_results)
+                cached, checkpoint_report = read_checkpoint(checkpoint, existing_results)
             else:
                 checkpoint_report = {
                     "path": checkpoint,
@@ -1150,7 +1150,7 @@ def run_scan(
                     "n_entries": 0,
                     "n_truncated_lines": 0,
                 }
-            handle = _open_checkpoint(checkpoint, old_results, cached)
+            handle = _open_checkpoint(checkpoint, existing_results, cached)
             if cached:
                 logger.info(
                     "resuming: %d of %d directories already observed",
@@ -1170,7 +1170,7 @@ def run_scan(
             handle.write("\n")
 
         observations = observe_job_dirs(
-            old_results,
+            existing_results,
             job_dirs,
             cached=cached,
             on_new=record,
@@ -1182,52 +1182,52 @@ def run_scan(
 
     n_cached_used = sum(1 for name in job_dirs if name in cached)
 
-    salvage_map = classify_jobs(
+    job_classification = classify_jobs(
         observations,
         index=index,
         interaction_pairs=interaction_pairs,
         default_fragment=default_fragment,
     )
-    salvage_map, sample_type_report = attach_old_sample_type(salvage_map, plan_frame)
+    job_classification, sample_type_report = attach_old_sample_type(job_classification, plan_frame)
 
     # ---- invariants -------------------------------------------------------
     invariants: List[Dict[str, Any]] = []
     invariants.append(
         assert_no_row_growth(
             len(job_dirs),
-            salvage_map,
-            name="salvage_scan one row per job directory",
+            job_classification,
+            name="classify_existing one row per job directory",
             allow_shrinkage=False,
         )
     )
-    n_unparseable = int((salvage_map["classification"] == UNPARSEABLE).sum())
+    n_unparseable = int((job_classification["classification"] == UNPARSEABLE).sum())
     invariants.append(
         assert_total_accounting(
             n_in=len(job_dirs),
-            n_resolved=len(salvage_map) - n_unparseable,
+            n_resolved=len(job_classification) - n_unparseable,
             n_rejected=n_unparseable,
-            name="salvage_scan directories -> classified + unparseable",
+            name="classify_existing directories -> classified + unparseable",
         )
     )
     invariants.append(
         assert_unique_key(
-            salvage_map, ["old_job_dir"], name="salvage_scan salvage_map key"
+            job_classification, ["old_job_dir"], name="classify_existing job_classification key"
         )
     )
     # The failure this whole rebuild exists for: a gene symbol standing in for
     # an accession collapses many proteins onto one. Every directory yields
     # exactly one accession, and that mapping must be a function.
-    parsed = salvage_map[salvage_map["classification"] != UNPARSEABLE]
+    parsed = job_classification[job_classification["classification"] != UNPARSEABLE]
     invariants.append(
         assert_collapse_factor_one(
             parsed[["old_job_dir", "accession"]],
-            name="salvage_scan old_job_dir -> accession",
+            name="classify_existing old_job_dir -> accession",
         )
     )
-    carried = salvage_map[salvage_map["new_job_dir"].notna()]
+    carried = job_classification[job_classification["new_job_dir"].notna()]
     invariants.append(
         assert_unique_key(
-            carried, ["new_job_dir"], name="salvage_scan new_job_dir uniqueness"
+            carried, ["new_job_dir"], name="classify_existing new_job_dir uniqueness"
         )
     )
     if plan_report is not None:
@@ -1235,37 +1235,37 @@ def run_scan(
     if sample_type_report.get("merge") is not None:
         invariants.append(sample_type_report["merge"])
 
-    pool = negatives_pool_frame(salvage_map)
+    pool = negatives_pool_frame(job_classification)
 
     # ---- summary ----------------------------------------------------------
-    label_known = salvage_map["label_was_correct"].notna()
+    label_known = job_classification["label_was_correct"].notna()
     counts = {
         "n_entries_listed": len(job_dirs) + len(non_dirs),
         "n_directories": len(job_dirs),
         "n_non_directory_entries": len(non_dirs),
-        "n_rows": int(len(salvage_map)),
-        "by_classification": _count(salvage_map, "classification", CLASSIFICATIONS),
-        "n_carried": int(salvage_map["new_job_dir"].notna().sum()),
-        "n_excluded": int(salvage_map["excluded_reason"].notna().sum()),
+        "n_rows": int(len(job_classification)),
+        "by_classification": _count(job_classification, "classification", CLASSIFICATIONS),
+        "n_carried": int(job_classification["new_job_dir"].notna().sum()),
+        "n_excluded": int(job_classification["excluded_reason"].notna().sum()),
         "n_pool_rows": int(len(pool)),
-        "n_with_final_results": int(salvage_map["has_final_results"].sum()),
-        "n_without_final_results": int((~salvage_map["has_final_results"]).sum()),
+        "n_with_final_results": int(job_classification["has_final_results"].sum()),
+        "n_without_final_results": int((~job_classification["has_final_results"]).sum()),
         "n_cached_observations": n_cached_used,
         "n_new_observations": len(job_dirs) - n_cached_used,
         "n_stale_checkpoint_entries": len(cached) - n_cached_used,
         "label_was_correct": {
-            "true": int((salvage_map["label_was_correct"] == True).sum()),  # noqa: E712
-            "false": int((salvage_map["label_was_correct"] == False).sum()),  # noqa: E712
+            "true": int((job_classification["label_was_correct"] == True).sum()),  # noqa: E712
+            "false": int((job_classification["label_was_correct"] == False).sum()),  # noqa: E712
             "unknown_no_label": int((~label_known).sum()),
         },
-        "old_sample_type": _count(salvage_map, "old_sample_type", schemas.SAMPLE_TYPES),
+        "old_sample_type": _count(job_classification, "old_sample_type", schemas.SAMPLE_TYPES),
         "old_sample_type_source": _count(
-            salvage_map,
+            job_classification,
             "old_sample_type_source",
             (SOURCE_OLD_PLAN, SOURCE_GENE_TOKEN, SOURCE_UNPARSEABLE),
         ),
         "fragment_source": _count(
-            salvage_map,
+            job_classification,
             "fragment_source",
             (FRAGMENT_FROM_DIR_NAME, FRAGMENT_FROM_DEFAULT),
         ),
@@ -1276,14 +1276,14 @@ def run_scan(
         ),
     }
     summary: Dict[str, Any] = {
-        "tool": "salvage_scan.py",
+        "tool": "classify_existing.py",
         "schema_version": 1,
         "code_revision": (
             code_revision
             if code_revision is not None
             else _git_revision(os.path.dirname(os.path.abspath(__file__)))
         ),
-        "old_results": _real(old_results),
+        "existing_results": _real(existing_results),
         "default_fragment": normalize_fragment_id(default_fragment),
         "identity_index": index_report,
         "interactions": interactions_report,
@@ -1293,15 +1293,15 @@ def run_scan(
         "non_directory_entries": non_dirs,
         "unparseable": [
             {"old_job_dir": row.old_job_dir, "reason": row.excluded_reason}
-            for row in salvage_map[
-                salvage_map["classification"] == UNPARSEABLE
+            for row in job_classification[
+                job_classification["classification"] == UNPARSEABLE
             ].itertuples()
         ],
         "invariants": invariants,
         "outputs": {
-            "salvage_map": None if out_map is None else _real(out_map),
+            "job_classification": None if out_map is None else _real(out_map),
             "negatives_pool": None if out_pool is None else _real(out_pool),
-            "salvage_map_evidence": (
+            "job_classification_evidence": (
                 None if (out_evidence is None or inline_extras) else _real(out_evidence)
             ),
             "extra_columns": (
@@ -1312,7 +1312,7 @@ def run_scan(
 
     logger.info(
         "classified %d directories: %s",
-        len(salvage_map),
+        len(job_classification),
         ", ".join(
             "{0}={1}".format(key, counts["by_classification"][key])
             for key in CLASSIFICATIONS
@@ -1321,29 +1321,29 @@ def run_scan(
     if n_unparseable:
         logger.warning(
             "%d directory name(s) did not parse; REBUILD_PLAN Phase 2 expects 0. "
-            "They are recorded in salvage_map.csv as 'unparseable' with a "
+            "They are recorded in job_classification.csv as 'unparseable' with a "
             "reason, never dropped.",
             n_unparseable,
         )
 
     written_map = written_pool = written_summary = written_evidence = None
     if out_map is not None:
-        declared = list(schemas.get_schema("salvage_map").column_names)
+        declared = list(schemas.get_schema("job_classification").column_names)
         written_map = schemas.write_checked(
-            salvage_map if inline_extras else salvage_map[declared],
+            job_classification if inline_extras else job_classification[declared],
             os.fspath(out_map),
-            "salvage_map",
+            "job_classification",
             allow_extra=inline_extras,
         )
-        logger.info("wrote %d rows to %s", len(salvage_map), written_map)
+        logger.info("wrote %d rows to %s", len(job_classification), written_map)
         if not inline_extras and out_evidence is not None:
             written_evidence = _write_csv(
-                salvage_map[list(EVIDENCE_COLUMNS)], os.fspath(out_evidence)
+                job_classification[list(EVIDENCE_COLUMNS)], os.fspath(out_evidence)
             )
             logger.info(
-                "wrote %d rows to %s (per-job evidence the salvage_map schema "
+                "wrote %d rows to %s (per-job evidence the job_classification schema "
                 "does not declare, keyed 1:1 on old_job_dir)",
-                len(salvage_map),
+                len(job_classification),
                 written_evidence,
             )
     if out_pool is not None:
@@ -1356,7 +1356,7 @@ def run_scan(
         logger.info("wrote %s", written_summary)
 
     return ScanResult(
-        salvage_map=salvage_map,
+        job_classification=job_classification,
         negatives_pool=pool,
         summary=summary,
         out_map=written_map,
@@ -1373,22 +1373,22 @@ def run_scan(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="salvage_scan.py",
+        prog="classify_existing.py",
         description=(
             "REBUILD_PLAN Phase 2: classify every old job directory under "
-            "corrected identity, read-only. Writes salvage_map.csv (one row per "
+            "corrected identity, read-only. Writes job_classification.csv (one row per "
             "directory) and negatives_pool.csv (the valid non-interactions)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Nothing under --old-results is written, moved or renamed; output "
+            "Nothing under --existing-results is written, moved or renamed; output "
             "paths that resolve inside it are refused before any file is "
             "opened. The scan is resumable: filesystem observations are "
             "checkpointed as they are made."
         ),
     )
     parser.add_argument(
-        "--old-results",
+        "--existing-results",
         required=True,
         help="$OLD/consensus_docking_results (read-only). Listed one level deep.",
     )
@@ -1405,7 +1405,7 @@ def build_parser() -> argparse.ArgumentParser:
             "(drugbank_id, accession) is the only input to the positive decision."
         ),
     )
-    parser.add_argument("--out-map", required=True, help="salvage_map.csv to write")
+    parser.add_argument("--out-map", required=True, help="job_classification.csv to write")
     parser.add_argument("--out-pool", required=True, help="negatives_pool.csv to write")
     parser.add_argument(
         "--out-summary",
@@ -1420,16 +1420,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--out-evidence",
         default=None,
         help=(
-            "companion CSV carrying the per-job evidence the salvage_map schema "
+            "companion CSV carrying the per-job evidence the job_classification schema "
             "does not declare ({0}), keyed 1:1 on old_job_dir. Default: "
-            "<--out-map>.evidence.csv".format(", ".join(SALVAGE_MAP_EXTRA_COLUMNS))
+            "<--out-map>.evidence.csv".format(", ".join(JOB_CLASSIFICATION_EXTRA_COLUMNS))
         ),
     )
     parser.add_argument(
         "--inline-extras",
         action="store_true",
         help=(
-            "write those columns into salvage_map.csv instead of the companion "
+            "write those columns into job_classification.csv instead of the companion "
             "file. Readers must then pass allow_extra=True; curate_jobs.py:1204 "
             "does not, which is why this is off by default."
         ),
@@ -1524,7 +1524,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     try:
         run_scan(
-            old_results=args.old_results,
+            existing_results=args.existing_results,
             index_path=args.index,
             interactions_path=args.interactions,
             out_map=args.out_map,

@@ -8,12 +8,12 @@ that the *corrected* design actually wants into ``$NEW/docking_results``, under
 the new naming scheme, with an authoritative ``job_identity.json`` in every
 directory.
 
-* ``--salvage-map``   one row per old job dir, classified under correct identity
+* ``--job-classification``   one row per old job dir, classified under correct identity
 * ``--positives``     the positive (drug, accession, fragment, cavity) jobs wanted
 * ``--drawn``         what the balanced sampler drew; ``source='pool'`` rows name
-                      the old directory they are salvaged from
+                      the old directory they are reused from
 
-  positives carried  = salvage rows classified ``true_positive`` whose pocket key
+  positives carried  = reuse rows classified ``true_positive`` whose pocket key
                        appears in ``positives_planned.csv``
   negatives carried  = ``negatives_drawn.csv`` rows with ``source == 'pool'``
 
@@ -50,7 +50,7 @@ The three structural fixes it applies
    (the default) takes ``gold_soln_*.sdf`` + rankings = 363 KB, which lands
    total evidence at ~1.21 MB/job -- the plan's ~1.14 MB / 2.4%.
    ``--gold-output all`` takes the tree and costs ~4.52 MB/job (9.1%): 62 GB
-   over 13,730 salvaged jobs instead of 19 GB.  Measured on six real job
+   over 13,730 reused jobs instead of 19 GB.  Measured on six real job
    directories, read-only.
 
 Read-only source, safe posture
@@ -74,7 +74,7 @@ Usage::
 
     python3 curate_jobs.py --dry-run \\
         --index       $NEW/identity/identity_index.parquet \\
-        --salvage-map $NEW/manifests/salvage_map.csv \\
+        --job-classification $NEW/manifests/job_classification.csv \\
         --drawn       $NEW/manifests/negatives_drawn.csv \\
         --positives   $NEW/manifests/positives_planned.csv \\
         --src $OLD/consensus_docking_results \\
@@ -145,7 +145,7 @@ __all__ = [
 
 logger = logging.getLogger("curate_jobs")
 
-#: Classification a salvage row must carry to be carried over as a positive.
+#: Classification a reuse row must carry to be carried over as a positive.
 TRUE_POSITIVE = "true_positive"
 #: ...and as a negative.
 VALID_NON_INTERACTION = "valid_non_interaction"
@@ -211,7 +211,7 @@ _COMMON_RULES: Tuple[EvidenceRule, ...] = (
     ),
     EvidenceRule("smina_results", "exact", "smina/results.csv", False, "per-tool scores"),
     EvidenceRule("gnina_results", "exact", "gnina/results.csv", False, "per-tool scores"),
-    EvidenceRule("gold_results", "exact", "gold/results.csv", False, "per-tool scores"),
+    EvidenceRule("gexisting_results", "exact", "gold/results.csv", False, "per-tool scores"),
     EvidenceRule("ledock_results", "exact", "ledock/results.csv", False, "per-tool scores"),
     EvidenceRule("smina_poses", "exact", "smina/out.sdf", False, "native poses, unrounded scores"),
     EvidenceRule(
@@ -245,7 +245,7 @@ _COMMON_RULES: Tuple[EvidenceRule, ...] = (
 #:     already carried as ``input/receptor.mol2``), the cavity fitting points
 #:     (``fit_pts*.mol2`` 402 KB), 424 KB of GOLD logs and a duplicate pose set
 #:     (``ranked_*.sdf``, byte-for-byte the ``gold_soln`` poses re-sorted).
-#:     Total evidence ~4.52 MB/job = 9.1%: **62 GB** for 13,730 salvaged jobs
+#:     Total evidence ~4.52 MB/job = 9.1%: **62 GB** for 13,730 reused jobs
 #:     rather than 19 GB.
 GOLD_OUTPUT_MODES = ("poses", "all")
 
@@ -464,7 +464,7 @@ def _is_null(value: Any) -> bool:
 
 
 def build_plan(
-    salvage: "Any",
+    reuse: "Any",
     positives: "Any",
     drawn: "Any",
     index: IdentityIndex,
@@ -480,10 +480,10 @@ def build_plan(
     """
     plan = CurationPlan()
 
-    salvage_rows = salvage.to_dict("records")
+    reuse_rows = reuse.to_dict("records")
     by_old_dir: Dict[str, Dict[str, Any]] = {}
     duplicate_old_dirs: List[str] = []
-    for row in salvage_rows:
+    for row in reuse_rows:
         name = str(row["old_job_dir"])
         if name in by_old_dir:
             duplicate_old_dirs.append(name)
@@ -491,7 +491,7 @@ def build_plan(
             by_old_dir[name] = row
     if duplicate_old_dirs:
         raise CurationError(
-            "salvage map lists {0} old_job_dir value(s) more than once ({1}); it "
+            "reuse map lists {0} old_job_dir value(s) more than once ({1}); it "
             "is keyed on old_job_dir and a dict would silently keep the last "
             "row.".format(len(duplicate_old_dirs), sorted(set(duplicate_old_dirs))[:10])
         )
@@ -505,7 +505,7 @@ def build_plan(
     # (old_job_dir, sample_type, selected_by, row, fragment_id, fragment_source)
     candidates: List[Tuple[str, str, str, Dict[str, Any], str, str]] = []
 
-    for row in salvage_rows:
+    for row in reuse_rows:
         if str(row["classification"]) != TRUE_POSITIVE:
             continue
         name = str(row["old_job_dir"])
@@ -556,53 +556,53 @@ def build_plan(
                 )
             )
             continue
-        salvage_row = by_old_dir.get(name)
-        if salvage_row is None:
+        reuse_row = by_old_dir.get(name)
+        if reuse_row is None:
             plan.rejects.append(
                 Reject(
                     name,
                     "negative",
                     SEVERITY_ERROR,
-                    "drawn from the pool but absent from the salvage map",
+                    "drawn from the pool but absent from the reuse map",
                 )
             )
             continue
-        if str(salvage_row["classification"]) != VALID_NON_INTERACTION:
+        if str(reuse_row["classification"]) != VALID_NON_INTERACTION:
             plan.rejects.append(
                 Reject(
                     name,
                     "negative",
                     SEVERITY_ERROR,
-                    "drawn as a negative but the salvage map classifies it "
-                    "{0!r}".format(str(salvage_row["classification"])),
+                    "drawn as a negative but the reuse map classifies it "
+                    "{0!r}".format(str(reuse_row["classification"])),
                 )
             )
             continue
-        if any(_is_null(salvage_row[c]) for c in IDENTITY_COLUMNS):
+        if any(_is_null(reuse_row[c]) for c in IDENTITY_COLUMNS):
             plan.rejects.append(
                 Reject(
                     name,
                     "negative",
                     SEVERITY_ERROR,
-                    "drawn from the pool but its salvage row's identity is "
+                    "drawn from the pool but its reuse row's identity is "
                     "incomplete (drugbank_id/accession/cavity_index)",
                 )
             )
             continue
         fragment_id, fragment_source, error = _resolve_fragment(
-            salvage_row, assume_fragment
+            reuse_row, assume_fragment
         )
         if error is not None:
             plan.rejects.append(Reject(name, "negative", SEVERITY_ERROR, error))
             continue
-        if _key_tuple(row) != _key_tuple(salvage_row, fragment_id):
+        if _key_tuple(row) != _key_tuple(reuse_row, fragment_id):
             plan.rejects.append(
                 Reject(
                     name,
                     "negative",
                     SEVERITY_ERROR,
-                    "drawn pocket key {0} != salvage map pocket key {1}".format(
-                        _key_tuple(row), _key_tuple(salvage_row, fragment_id)
+                    "drawn pocket key {0} != reuse map pocket key {1}".format(
+                        _key_tuple(row), _key_tuple(reuse_row, fragment_id)
                     ),
                 )
             )
@@ -748,7 +748,7 @@ def build_plan(
     n_positive = sum(1 for j in plan.jobs if j.sample_type == "positive")
     n_assumed = sum(1 for j in plan.jobs if j.fragment_source != "manifest")
     plan.stats = {
-        "n_salvage_rows": int(len(salvage_rows)),
+        "n_reuse_rows": int(len(reuse_rows)),
         "n_positives_planned": int(len(positive_keys)),
         "n_drawn_rows": int(len(drawn)),
         "n_drawn_from_pool": int(len(drawn)) - n_new_negatives,
@@ -760,7 +760,7 @@ def build_plan(
         "n_rejected": len(plan.rejects),
         "n_rejected_error": plan.n_errors,
         "n_fragment_assumed": n_assumed,
-        "n_positives_planned_not_salvageable": int(
+        "n_positives_planned_not_reuseable": int(
             len(positive_keys)
             - sum(1 for j in plan.jobs if j.sample_type == "positive")
         ),
@@ -871,7 +871,7 @@ def copy_job(
             job.new_job_dir,
             job.old_job_dir,
             "failed",
-            reason="no final_results.csv; incomplete, not salvageable",
+            reason="no final_results.csv; incomplete, not reuseable",
         )
     if evidence_only:
         # Defended twice on purpose: select_evidence_files already filters, and
@@ -950,7 +950,7 @@ def job_provenance(job: JobPlan, base: Dict[str, Any]) -> Dict[str, Any]:
     """
     record = dict(base)
     record["sample_type"] = job.sample_type
-    record["provenance"] = "salvaged_from"
+    record["provenance"] = "reused_from"
     record["source_job"] = job.old_job_dir
     record["selected_by"] = job.selected_by
     record["fragment_source"] = job.fragment_source
@@ -1061,7 +1061,7 @@ def _manifest_frame(
             "fragment_id": [j.identity.fragment_id for j in rows],
             "cavity_index": [j.identity.cavity_index for j in rows],
             "sample_type": [j.sample_type for j in rows],
-            "provenance": ["salvaged_from"] * len(rows),
+            "provenance": ["reused_from"] * len(rows),
             "source_job": [j.old_job_dir for j in rows],
             "selected_by": [j.selected_by for j in rows],
         }
@@ -1130,7 +1130,7 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Run with --dry-run first. It writes nothing.",
     )
-    parser.add_argument("--salvage-map", required=True, help="manifests/salvage_map.csv")
+    parser.add_argument("--job-classification", required=True, help="manifests/job_classification.csv")
     parser.add_argument("--drawn", required=True, help="manifests/negatives_drawn.csv")
     parser.add_argument("--positives", required=True, help="manifests/positives_planned.csv")
     parser.add_argument(
@@ -1168,7 +1168,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--assume-fragment",
         default=None,
         help=(
-            "explicitly assume this fragment id (e.g. F1) for salvage rows whose "
+            "explicitly assume this fragment id (e.g. F1) for reuse rows whose "
             "fragment_id is null. Off by default: an inferred fragment is what "
             "made one pocket key match several pockets."
         ),
@@ -1218,14 +1218,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not os.path.isdir(args.src):
             raise CurationError("--src is not a directory: {0}".format(args.src))
         index = IdentityIndex.load(args.index, expect_sha256=args.index_sha256)
-        salvage = read_checked(args.salvage_map, "salvage_map")
+        reuse = read_checked(args.job_classification, "job_classification")
         positives = read_checked(args.positives, "positives_planned")
         drawn = read_checked(args.drawn, "negatives_drawn")
         assume_fragment = (
             normalize_fragment_id(args.assume_fragment) if args.assume_fragment else None
         )
         plan = build_plan(
-            salvage=salvage,
+            reuse=reuse,
             positives=positives,
             drawn=drawn,
             index=index,

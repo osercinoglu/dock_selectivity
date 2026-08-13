@@ -51,7 +51,7 @@ edits to `batch_dock.py`, `parse_prepare.py`, `extract_*.py`, `identify_required
 | `dock_selectivity/jobid.py` | `__`-delimited job-name codec, `job_identity.json` reader/writer, the right-anchored legacy parser | 2, 5, 7, 8 |
 | `build_identity_index.py` | Phase 0 — builds `identity_index.parquet`; the repo's **sole** network consumer | 0 |
 | `resolve_interactions.py` | Phase 1 — `interactions_resolved.csv`, resolved on Entrez, never on a symbol | 1 |
-| `salvage_scan.py` | Phase 2 — classifies all 24,173 old job dirs, read-only | 2 |
+| `classify_existing.py` | Phase 2 — classifies all 24,173 old job dirs, read-only | 2 |
 | `sample_negatives.py` | Phase 3 — balanced sampler in accession space. **Replaces `generate_negative_samples.py`**; the old script is untouched and is not used by this plan | 3 |
 | `curate_jobs.py` | Phase 5 — materialises `$NEW/docking_results` under the new naming scheme | 5 |
 | `audit.py` | every STOP gate: `identity`, `curated`, `run` | 0, 5, 8 |
@@ -63,7 +63,7 @@ edits to `batch_dock.py`, `parse_prepare.py`, `extract_*.py`, `identify_required
 | **0 — identity** | **Yes, in `REDUCED_LOCAL` mode** (verified end-to-end: 4,585 records, audit 12/12 PASS, exit 0). | The authoritative build needs a one-time UniProt fetch. `HUMAN_9606_idmapping.dat.gz`, `UP000005640_9606.fasta.gz` and `hgnc_complete_set.txt` are **absent** from `/opt/data` (checked). See §3 Phase 0. |
 | **1 — resolve interactions** | **No.** | `resolve_interactions.py` is tested, but it resolves the protein axis *only* through Entrez, and a `REDUCED_LOCAL` index built from the legacy file alone carries **0 Entrez ids**. Measured: **0 of 8,568 edges resolve, all 8,568 reject `UNKNOWN_ENTREZ`, and the script still exits 0 with an empty manifest.** Needs the authoritative files, or at minimum `hgnc_complete_set.txt` passed as `--hgnc` to the reduced build. |
 | **1b — `positives_planned.csv`** | **No — no producer exists.** | Nothing in the repo writes this manifest, and Phases 3 and 5 both require it. Either the `FIX_PLAN.md` §3.1 rewrite of `identify_required_structures.py`, or a new `plan_positives.py`. See §3 Phase 1b. |
-| **2 — salvage scan** | Script ready; blocked behind Phase 1. | A non-empty `interactions_resolved.csv`. With an empty one every job classifies as `valid_non_interaction` and the "pool" silently becomes 24,173. |
+| **2 — reuse scan** | Script ready; blocked behind Phase 1. | A non-empty `interactions_resolved.csv`. With an empty one every job classifies as `valid_non_interaction` and the "pool" silently becomes 24,173. |
 | **3 — balanced sampler** | Script ready; blocked behind Phase 1b. | `positives_planned.csv` — quotas are undefined without it. |
 | **4 — decision** | Yes (it is a decision, not code). | — |
 | **5 — curate** | Script ready; blocked behind 2 and 3. | Also **5b**: nothing assembles the full `run_manifest.csv`. `curate_jobs.py --manifest-out` emits only the jobs it materialised. |
@@ -388,7 +388,7 @@ New: **`DB00035__P30518__AVPR2__F1__cav2`**
  "fragment_id": "F1", "cavity_index": 2,
  "dir_name": "DB00035__P30518__AVPR2__F1__cav2",
  "sample_type": "positive",
- "provenance": "salvaged_from", "source_job": "DB00035_AVPR2_Q8NCT1_cavity_2",
+ "provenance": "reused_from", "source_job": "DB00035_AVPR2_Q8NCT1_cavity_2",
  "selected_by": "…", "fragment_source": "manifest",
  "retention": "evidence_only", "evidence_gold_output": "poses",
  "identity_index_sha256": "…", "code_revision": "…", "curated_by": "…",
@@ -418,7 +418,33 @@ DB00157_nan_P68363_cavity_3     ->  DB00157__P68363__TUBA1B__F2__cav3    (fragme
 
 ---
 
-## 2. New run directory layout
+## 2. Directory layout — inputs separate from outputs
+
+Inputs are small (~72 MB), shared across runs and versioned. Outputs are per-run
+and large. Keeping them in one directory is how the 2025-06-29 tree ended up
+holding 1.55 TB of mixed provenance with no way to tell what was source and what
+was product.
+
+```
+/media/onur/Elements/cavity_space_consensus_docking/
+├── inputs/                          # 72 MB, shared, read-mostly
+│   ├── 1_drug_to_protein.tsv
+│   ├── small_molecule_drug_links.csv
+│   ├── ligands/                     # 2,599 ligand SDFs
+│   └── uniprot/                     # idmapping + reference proteome
+└── runs/<YYYY_MM_DD>/               # outputs only, one per run
+    ├── identity/  manifests/  structures/  docking_results/  analysis/  logs/
+```
+
+Shared reference stores stay in `/opt/data` because they are too large to copy
+per run: `cavity_space/af_strong_cavities_data_all` (7.0 GB) and
+`alphafold2/UP000005640_9606_HUMAN_v4.tar` (4.8 GB).
+
+`run_full_workflow.py --inputs-dir` resolves every input from that layout; an
+explicit `--edges` / `--drugs` / `--ligands` / `--idmapping` / `--proteome` always
+overrides. A path that resolves to nothing is reported, never silently defaulted.
+
+### Old run directory layout (per-run internals)
 
 ```
 $NEW/
@@ -432,15 +458,15 @@ $NEW/
     interactions_resolved.csv       # (drugbank_id, entrez_id, accession, gene, selected_by)
     interactions_resolved.rejects.csv   # every edge that did NOT resolve, with a reason and an axis
     positives_planned.csv           # (drug, accession, fragment, cavity) positives wanted — NO PRODUCER YET
-    negatives_pool.csv              # the salvageable non-interaction jobs (16,873 minus the incomplete)
+    negatives_pool.csv              # the reuseable non-interaction jobs (16,873 minus the incomplete)
     negatives_pool_eligibility.csv  # every pool row + eligible(bool) + eligibility(reason)   §1.2
     negatives_drawn.csv             # what the balanced sampler actually selected
-    salvage_map.csv                 # old_job_dir -> new_job_dir, or a reason for exclusion (11 cols, strict)
-    salvage_map.evidence.csv        # per-job evidence the salvage_map schema does not declare
+    job_classification.csv                 # old_job_dir -> new_job_dir, or a reason for exclusion (11 cols, strict)
+    job_classification.evidence.csv        # per-job evidence the job_classification schema does not declare
     redock_queue.negatives.csv      # negative half — written by sample_negatives.py
     redock_queue.positives.csv      # positive half — NO PRODUCER YET
     redock_queue.csv                # the two halves concatenated
-    run_manifest.salvaged.csv       # written by curate_jobs.py --manifest-out (salvaged jobs only)
+    run_manifest.reused.csv       # written by curate_jobs.py --manifest-out (reused jobs only)
     run_manifest.csv                # every job that SHOULD exist. Discovery is checked against this.
   structures/
     cavities/                       # only the required cavities (~2,900, not 38,709)
@@ -451,7 +477,7 @@ $NEW/
   analysis/
     combined_results.parquet
     provenance.json                 # index SHA256 + code revision that produced it
-  logs/                             # salvage_scan_summary.json, sample_negatives_report.json,
+  logs/                             # classify_existing_summary.json, sample_negatives_report.json,
                                     # negatives_deficits.csv, curate_jobs_report.json, run logs
 ```
 
@@ -468,7 +494,7 @@ Three naming details that matter, because two artifacts would otherwise collide:
 - `sample_negatives.py --redock-queue` writes the **negative half only**. The positive half
   (10,866 jobs, §1.2.3) has no producer yet. Concatenate deliberately; do not let one half claim the
   `redock_queue.csv` name.
-- `curate_jobs.py --manifest-out` writes only the jobs it materialised (`provenance='salvaged_from'`).
+- `curate_jobs.py --manifest-out` writes only the jobs it materialised (`provenance='reused_from'`).
   The full `run_manifest.csv` is that file concatenated with the `newly_docked` rows derived from
   `redock_queue.csv`, and `audit.py run` asserts the result equals
   `positives_planned ∪ negatives_drawn` exactly.
@@ -486,9 +512,9 @@ with all output to scratch. Results and one correction:
 | `resolve_interactions.py` | 8,568 edges → **7,923 resolved**, 645 rejected with reasons; **229 resolved that carry a null `node_2_name`** (unreachable by the old symbol resolver) and 143 from `node_1` name slugs |
 | Identity spot checks | AVPR2→P30518, TUBA1B→P68363, IL2→P60568, BRAF→P15056, BCL2→P10415, ALK→Q9UM73 — every documented corruption case correct |
 | `extract_cavities.py --manifest-only` | 38,709 rows / 13,600 accessions in **0.4 s, nothing unpacked**; key set **identical** to the `cavity_mapping.csv` the old code produced by unpacking 76 GB |
-| `salvage_scan.py` | 24,173 dirs in 5.7 s: **7,279 true_positive, 16,600 valid_non_interaction, 294 incomplete, 0 unparseable** |
+| `classify_existing.py` | 24,173 dirs in 5.7 s: **7,279 true_positive, 16,600 valid_non_interaction, 294 incomplete, 0 unparseable** |
 
-The salvage split cross-validates the forensic estimate exactly: 7,300 + 16,873 =
+The reuse split cross-validates the forensic estimate exactly: 7,300 + 16,873 =
 24,173 (forensics) versus 7,279 + 16,600 + **294 incomplete** = 24,173 here — the
 difference is precisely the incomplete jobs the forensic pass folded into the two
 classes. `unparseable = 0` confirms the right-anchored parse handles every real name.
@@ -500,7 +526,7 @@ An earlier draft of this plan said the reduced index built from the legacy
 has no Entrez column, so the index carries **0 Entrez ids**, and since the
 corrected design resolves only on Entrez, `resolve_interactions.py` returns
 **8,568 in, 0 resolved, 8,568 rejected as UNKNOWN_ENTREZ**. The reduced index is
-useful for `accession → label` lookups (the salvage path) and nothing else.
+useful for `accession → label` lookups (the reuse path) and nothing else.
 
 Phase 0 therefore **requires** the authoritative UniProt inputs. Both are public
 and were fetched successfully:
@@ -526,7 +552,7 @@ Every phase of the runbook is now backed by implemented, tested code. The suite 
 | 1 | `resolve_interactions.py` | ✅ 7,923/8,568 real edges resolved |
 | 2 | `extract_cavities.py --manifest-only` | ✅ 38,709 rows in 0.4 s, key-identical to the 76 GB unpack |
 | 2b | `plan_positives.py` | ✅ |
-| 3 | `salvage_scan.py` | ✅ all 24,173 real dirs, 0 unparseable |
+| 3 | `classify_existing.py` | ✅ all 24,173 real dirs, 0 unparseable |
 | 4 | `sample_negatives.py` | ✅ |
 | 5 | `curate_jobs.py` | ✅ |
 | 6 | `build_run_manifest.py` | ✅ |
@@ -639,7 +665,7 @@ can mistake it for the authoritative index.
    protein is reachable through it; per `ASSESSMENT` §1c, only 1,567/1,958 genes (80.03%) are repairable
    from this file, 391 need external re-derivation and 12 are absent entirely. **The re-dock gap's
    canonical-accession choices therefore still require the real files** — a reduced index is fine for
-   re-deriving §1.2's salvage arithmetic (which was computed in exactly this universe) and useless for
+   re-deriving §1.2's reuse arithmetic (which was computed in exactly this universe) and useless for
    deciding which accession a *new* docking job should target.
 3. Without `--proteome`, `reviewed` is `False` on every row and means *unknown*, not *TrEMBL*. It is
    recorded as such in `meta["row_counts"]["review_status_source"]`; do not read that column as a
@@ -783,21 +809,21 @@ The same producer should emit `manifests/redock_queue.positives.csv` (schema `re
 
 ### Phase 2 — Classify every old job under correct identity (read-only)
 
-**Code prerequisite:** none — `salvage_scan.py` exists and is tested.
+**Code prerequisite:** none — `classify_existing.py` exists and is tested.
 
 ```bash
-python3 $REPO/salvage_scan.py \
-    --old-results  $OLD/consensus_docking_results \
+python3 $REPO/classify_existing.py \
+    --existing-results  $OLD/consensus_docking_results \
     --index        $IDX \
     --index-sha256 $IDX_SHA \
     --interactions $NEW/manifests/interactions_resolved.csv \
-    --out-map      $NEW/manifests/salvage_map.csv \
+    --out-map      $NEW/manifests/job_classification.csv \
     --out-pool     $NEW/manifests/negatives_pool.csv \
-    --out-summary  $NEW/logs/salvage_scan_summary.json \
-    --out-evidence $NEW/manifests/salvage_map.evidence.csv \
+    --out-summary  $NEW/logs/classify_existing_summary.json \
+    --out-evidence $NEW/manifests/job_classification.evidence.csv \
     --old-plan     $OLD/required_structures_with_negatives.csv \
     --default-fragment F1 \
-    --checkpoint   $NEW/logs/salvage_scan_checkpoint.jsonl
+    --checkpoint   $NEW/logs/classify_existing_checkpoint.jsonl
 ```
 
 Parses all 24,173 directory names **right-anchored** (strip trailing `_cavity_<N>`, strip optional
@@ -818,26 +844,26 @@ Flags worth knowing:
 - Every output path is checked against `$OLD` before a byte is written. Pointing an output inside the
   old run directory is refused.
 
-**STOP — verify** `salvage_map.csv` reproduces the expected classification (one row per directory,
+**STOP — verify** `job_classification.csv` reproduces the expected classification (one row per directory,
 always; `n_in == n_resolved + n_rejected` is asserted):
 
 | Expected | Count |
 |---|---:|
 | `true_positive` | 7,300 |
 | `valid_non_interaction` (→ `negatives_pool.csv`) | 16,579 |
-| `incomplete` — no `final_results.csv`, nothing to salvage | 294 |
+| `incomplete` — no `final_results.csv`, nothing to reuse | 294 |
 | `unparseable` | 0 |
 | **total** | **24,173** |
 
 **Reconciling 16,579 with §1.2's 16,873.** §1.2's pool arithmetic is over all 16,873 valid
 non-interactions. `negatives_pool.csv` carries **294 fewer** because `incomplete` outranks
-`valid_non_interaction`: a job with no `final_results.csv` has no payload to salvage whatever its DTI
+`valid_non_interaction`: a job with no `final_results.csv` has no payload to reuse whatever its DTI
 status (measured on the real campaign: 162 old-negative, 132 old-positive, **0** of the 7,300 true
 positives). Their DTI answer is preserved in the evidence file's `is_known_interaction`, and their
 pockets remain available as *fresh* jobs, so nothing is lost — but expect the drawable figure in Phase 3
 to move by up to those 294.
 
-Also check: `salvage_scan_summary.json` lists every non-directory entry by name (the campaign has one
+Also check: `classify_existing_summary.json` lists every non-directory entry by name (the campaign has one
 stray `docking_automation.log`) and every unparseable name with the parser's message. The scan refuses to
 run if any accession in `interactions_resolved.csv` is absent from the index — the two artifacts must be
 one universe, and there is no flag to bypass that.
@@ -845,7 +871,7 @@ one universe, and there is no flag to bypass that.
 One contract for Phase 5: `excluded_reason` is populated on every `valid_non_interaction` row (the
 schema forces exactly one of `new_job_dir` / `excluded_reason`), and it reads "carried over only if the
 balanced sampler draws it". **`curate_jobs.py` must take drawn negatives from `negatives_drawn.csv`, not
-by filtering `salvage_map` on `new_job_dir.notna()`** — that column is populated only for
+by filtering `job_classification` on `new_job_dir.notna()`** — that column is populated only for
 `true_positive` rows, and even there it is a proposal.
 
 ---
@@ -873,11 +899,11 @@ python3 $REPO/sample_negatives.py \
     --report           $NEW/logs/sample_negatives_report.json
 ```
 
-- `--prefer-pool` is salvage-first: phase 1 draws only from already-docked pool candidates, phase 2 tops
-  up with fresh jobs. Without it the sampler is design-first and salvages far less (though within a
+- `--prefer-pool` is reuse-first: phase 1 draws only from already-docked pool candidates, phase 2 tops
+  up with fresh jobs. Without it the sampler is design-first and reuses far less (though within a
   chosen pair an existing pool job is always used before a fresh one — re-docking a docked pocket is
-  never right). **Balance is the hard constraint and salvage is the optimisation**: the repair pass will
-  release a salvaged unit if that is the only way to close a deficit, and the trade is visible in
+  never right). **Balance is the hard constraint and reuse is the optimisation**: the repair pass will
+  release a reused unit if that is the only way to close a deficit, and the trade is visible in
   `report['repair']` and `report['drawn']['n_from_pool']`.
 - `--balance-unit pair` is the §1.2.4 recommendation. `job` reproduces what the old code did. **The unit
   is recorded in the report and in every `selected_by` string, because the STOP gate has to say which
@@ -932,7 +958,7 @@ protein.
 `redock_queue.csv` now exists. Three options; **B is still recommended, at roughly double its previously
 budgeted size.**
 
-| | A — salvage only | **B — salvage + fill the gap** | C — full re-run |
+| | A — reuse only | **B — reuse + fill the gap** | C — full re-run |
 |---|---|---|---|
 | New **positive** jobs | 0 | **10,866** (18,166 planned − 7,300 docked) | 18,166 |
 | New **negative** jobs | 0 | **11,736** job-balanced / ~10,607 pair-balanced | ~18,166 |
@@ -949,9 +975,9 @@ positives and the new ones. Under the joint per-drug **and** per-target quota, o
 The positive side is unchanged in kind: 18,166 planned − 7,300 already docked correctly = **10,866**.
 
 Arithmetic behind the two derived cells, at `ASSESSMENT` §3's measured rates:
-22,602 × 0.616–0.806 core-h/job = **13,920–18,220 core-h** ≈ 9–12 days on 64 cores (the salvage analysis
+22,602 × 0.616–0.806 core-h/job = **13,920–18,220 core-h** ≈ 9–12 days on 64 cores (the reuse analysis
 quotes 10–13; budget the wider band). Storage at 1.14 MB/job evidence-only:
-13,730 salvaged ≈ 15.3 GB + 22,602 new ≈ 25 GB ≈ **41 GB**.
+13,730 reused ≈ 15.3 GB + 22,602 new ≈ 25 GB ≈ **41 GB**.
 
 **Pair-balancing the negatives is the better design and it is also cheaper** (§1.2.4): ~10,607 negative
 jobs instead of 11,736, and the two classes become comparable per pair instead of 3.38 poses on
@@ -987,7 +1013,7 @@ Phase 7's problem, not this one.)
 # Dry run FIRST — prints what it would copy, writes nothing.
 # --dry-run with --report/--rejects/--manifest-out is an argparse error, not a silent no-write.
 python3 $REPO/curate_jobs.py --dry-run \
-    --salvage-map $NEW/manifests/salvage_map.csv \
+    --job-classification $NEW/manifests/job_classification.csv \
     --drawn       $NEW/manifests/negatives_drawn.csv \
     --positives   $NEW/manifests/positives_planned.csv \
     --index       $IDX \
@@ -997,7 +1023,7 @@ python3 $REPO/curate_jobs.py --dry-run \
     --evidence-only --gold-output poses
 
 python3 $REPO/curate_jobs.py \
-    --salvage-map $NEW/manifests/salvage_map.csv \
+    --job-classification $NEW/manifests/job_classification.csv \
     --drawn       $NEW/manifests/negatives_drawn.csv \
     --positives   $NEW/manifests/positives_planned.csv \
     --index       $IDX \
@@ -1005,7 +1031,7 @@ python3 $REPO/curate_jobs.py \
     --src $OLD/consensus_docking_results \
     --dst $NEW/docking_results \
     --evidence-only --gold-output poses \
-    --manifest-out $NEW/manifests/run_manifest.salvaged.csv \
+    --manifest-out $NEW/manifests/run_manifest.reused.csv \
     --report       $NEW/logs/curate_jobs_report.json \
     --rejects      $NEW/logs/curate_jobs_rejects.csv \
     --code-revision "$(git -C $REPO rev-parse --short HEAD)"
@@ -1018,7 +1044,7 @@ receptor. Taking the gene from a manifest column would reintroduce the defect.
 `--evidence-only` applies the 2.4% rule from §1.3: copies `final_results.csv`, the four `results.csv`,
 `out.sdf`/`out.dok`/`gold_soln_*.sdf` and `input/*.mol2`; **skips `complex_*.pdb` and the retry logs**
 (the deny-list is applied *after* rule expansion, so a tree rule cannot leak a `complex_*.pdb`). Writes
-`job_identity.json` into every new directory, with `provenance='salvaged_from'` and `source_job` naming
+`job_identity.json` into every new directory, with `provenance='reused_from'` and `source_job` naming
 the old directory, plus the evidence file list, the index SHA256, the code revision and the retention
 policy — and **no timestamp**, so two runs produce a byte-identical tree.
 
@@ -1036,23 +1062,23 @@ Flags worth knowing:
   tree; output ordering is plan order regardless. Expect ~70 evidence file stats per job (~1M over the
   run); a resume run does **zero** source I/O for already-complete jobs.
 - Error-severity rejects fail the run (exit 1) unless `--allow-errors`. Five classes: a pool draw absent
-  from the salvage map; a pool draw whose salvage row is not `valid_non_interaction`; a drawn-vs-salvage
+  from the reuse map; a pool draw whose reuse row is not `valid_non_interaction`; a drawn-vs-reuse
   pocket-key disagreement; a missing source directory; an accession absent from the index.
 
 Copy — never move, never hardlink. The module never calls `os.rename`, `os.link`, `shutil.move` or any
 unlink under `--src`, and refuses to run if `--dst` is inside `--src` or the reverse. `$OLD` must remain
 a complete, independent, untouched copy.
 
-Expected result: **13,730 directories ≈ 15.3 GB** — 7,300 salvaged positives + 6,430 drawn pool
+Expected result: **13,730 directories ≈ 15.3 GB** — 7,300 reused positives + 6,430 drawn pool
 negatives (§1.2).
 
 #### Phase 5b — assemble `run_manifest.csv` · **NO PRODUCER EXISTS**
 
 `--manifest-out` writes only the jobs `curate_jobs.py` materialised, all with
-`provenance='salvaged_from'` and `source_job` set. The authoritative `run_manifest.csv` is that file
+`provenance='reused_from'` and `source_job` set. The authoritative `run_manifest.csv` is that file
 concatenated with the `newly_docked` rows derived from `redock_queue.csv` (schema `run_manifest`;
 `provenance='newly_docked'` and `source_job` null — the schema's row check enforces
-`provenance=='salvaged_from'` **iff** `source_job` is set). `audit.py run` asserts the union equals
+`provenance=='reused_from'` **iff** `source_job` is set). `audit.py run` asserts the union equals
 `positives_planned ∪ negatives_drawn` exactly. This concatenation is currently a manual step; the fixture
 in `tests/test_audit.py` shows the shape it must have.
 
@@ -1068,9 +1094,9 @@ echo "exit=$?"
 - every directory contains `job_identity.json` and `final_results.csv`
 - `gene == index.label(accession)` for **100%** of jobs (the check the old pipeline never had), and
   `accession → gene` collapse factor is exactly 1
-- the directory name matches its own `job_identity.json`, and every salvaged job names its source
+- the directory name matches its own `job_identity.json`, and every reused job names its source
 - no `complex_*.pdb` or `log_*.log` leaked into the curated tree; no stray files
-- `--expect subset` (correct here): every `salvaged_from` row must be on disk, `newly_docked` rows need
+- `--expect subset` (correct here): every `reused_from` row must be on disk, `newly_docked` rows need
   not be yet, and **no directory may exist that is absent from the manifest**. `--expect exact` is the
   Phase 7/8 end-state gate ("directory count equals `run_manifest.csv` row count exactly").
 - `--limit N` gives a quick partial pass but reports SKIP → **exit 2**, so a partial audit can never read
@@ -1203,8 +1229,8 @@ python3 $REPO/parse_prepare.py --run-dir $NEW --out $NEW/analysis/combined_resul
 | | Old | New (Option B, job-balanced) |
 |---|---:|---:|
 | Run directory size | 1,550 GB | **~41 GB** |
-| Job dirs | 24,173 | **~36,300** (13,730 salvaged + 22,602 fresh) |
-| …salvaged | — | 7,300 positives + 6,430 pool negatives |
+| Job dirs | 24,173 | **~36,300** (13,730 reused + 22,602 fresh) |
+| …reused | — | 7,300 positives + 6,430 pool negatives |
 | …fresh | — | 10,866 positives + 11,736 negatives |
 | Jobs with correct identity | 13,128 (54.3%) | **100%** |
 | Jobs reaching the analysis | 10,000 (41.4%) | **100%** |

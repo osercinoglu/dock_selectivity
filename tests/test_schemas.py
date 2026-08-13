@@ -43,19 +43,20 @@ from dock_selectivity.schemas import (
 )
 
 # REBUILD_PLAN.md §2 names these seven manifests.
+#: schema_names() returns these sorted, so this list is sorted too.
 EXPECTED_SCHEMAS = [
     "interactions_resolved",
+    "job_classification",
     "negatives_drawn",
     "negatives_pool",
     "positives_planned",
     "redock_queue",
     "run_manifest",
-    "salvage_map",
 ]
 
 
 def run_manifest_rows():
-    """Two jobs: one salvaged from a corrupt-named directory, one fresh."""
+    """Two jobs: one reused from a corrupt-named directory, one fresh."""
     return pd.DataFrame(
         [
             {
@@ -66,7 +67,7 @@ def run_manifest_rows():
                 "fragment_id": "F1",
                 "cavity_index": 2,
                 "sample_type": "positive",
-                "provenance": "salvaged_from",
+                "provenance": "reused_from",
                 "source_job": "DB00035_AVPR2_Q8NCT1_cavity_2",
                 "selected_by": "entrez=554 via edge (DB00035,554)",
             },
@@ -86,7 +87,7 @@ def run_manifest_rows():
     )
 
 
-def salvage_rows():
+def reuse_rows():
     return pd.DataFrame(
         [
             {
@@ -284,23 +285,23 @@ class TestValidate(unittest.TestCase):
 
 
 class TestRowChecks(unittest.TestCase):
-    def test_a_salvage_row_with_no_outcome_is_rejected(self):
+    def test_a_reuse_row_with_no_outcome_is_rejected(self):
         """An excluded job must say why. Never a silent disappearance."""
-        rows = salvage_rows()
+        rows = reuse_rows()
         rows.loc[1, "excluded_reason"] = None  # and new_job_dir is already None
         with self.assertRaises(SchemaViolation) as ctx:
-            validate(coerce(rows, "salvage_map"), "salvage_map")
+            validate(coerce(rows, "job_classification"), "job_classification")
         self.assertIn("outcome_recorded", str(ctx.exception))
         self.assertIn("DB00091_nan_P68363_cavity_1", str(ctx.exception))
 
-    def test_a_salvage_row_claiming_both_outcomes_is_rejected(self):
-        rows = salvage_rows()
+    def test_a_reuse_row_claiming_both_outcomes_is_rejected(self):
+        rows = reuse_rows()
         rows.loc[1, "new_job_dir"] = "DB00091__P68363__TUBA1B__F1__cav1"
         with self.assertRaises(SchemaViolation):
-            validate(coerce(rows, "salvage_map"), "salvage_map")
+            validate(coerce(rows, "job_classification"), "job_classification")
 
-    def test_a_well_formed_salvage_map_validates(self):
-        self.assertTrue(validate(coerce(salvage_rows(), "salvage_map"), "salvage_map")["ok"])
+    def test_a_well_formed_job_classification_validates(self):
+        self.assertTrue(validate(coerce(reuse_rows(), "job_classification"), "job_classification")["ok"])
 
     def test_unparseable_rows_keep_their_reason_without_an_identity(self):
         rows = pd.DataFrame(
@@ -320,8 +321,8 @@ class TestRowChecks(unittest.TestCase):
                 }
             ]
         )
-        frame = coerce(rows, "salvage_map")
-        self.assertTrue(validate(frame, "salvage_map")["ok"])
+        frame = coerce(rows, "job_classification")
+        self.assertTrue(validate(frame, "job_classification")["ok"])
         self.assertEqual(str(frame["cavity_index"].dtype), "Int64")
 
     def test_negatives_drawn_pool_rows_must_name_their_source_job(self):
@@ -349,12 +350,12 @@ class TestRowChecks(unittest.TestCase):
             validate(coerce(rows, "negatives_drawn"), "negatives_drawn")["ok"]
         )
 
-    def test_run_manifest_salvaged_rows_must_name_their_source_job(self):
+    def test_run_manifest_reused_rows_must_name_their_source_job(self):
         rows = run_manifest_rows()
         rows.loc[0, "source_job"] = None
         with self.assertRaises(SchemaViolation) as ctx:
             validate(coerce(rows, "run_manifest"), "run_manifest")
-        self.assertIn("salvaged_rows_name_their_source", str(ctx.exception))
+        self.assertIn("reused_rows_name_their_source", str(ctx.exception))
 
     def test_a_custom_row_check_can_be_declared(self):
         schema = Schema(
@@ -417,14 +418,14 @@ class TestCoerce(unittest.TestCase):
         )
 
     def test_boolean_strings_are_understood_but_nonsense_is_not(self):
-        rows = salvage_rows()
+        rows = reuse_rows()
         rows["label_was_correct"] = ["False", "True"]
         self.assertEqual(
-            coerce(rows, "salvage_map")["label_was_correct"].tolist(), [False, True]
+            coerce(rows, "job_classification")["label_was_correct"].tolist(), [False, True]
         )
         rows["label_was_correct"] = ["maybe", "True"]
         with self.assertRaises(SchemaViolation):
-            coerce(rows, "salvage_map")
+            coerce(rows, "job_classification")
 
 
 class TestCheckedIO(unittest.TestCase):
@@ -470,12 +471,12 @@ class TestCheckedIO(unittest.TestCase):
 
     def test_literal_na_and_nan_strings_survive_a_round_trip(self):
         """pandas turns 'NA'/'nan'/'null' into NaN by default. Not here."""
-        rows = salvage_rows()
+        rows = reuse_rows()
         rows.loc[0, "old_gene_label"] = "NA"
         rows.loc[1, "old_gene_label"] = "nan"
-        path = self.path("salvage_map.csv")
-        write_checked(rows, path, "salvage_map")
-        back = read_checked(path, "salvage_map")
+        path = self.path("job_classification.csv")
+        write_checked(rows, path, "job_classification")
+        back = read_checked(path, "job_classification")
         self.assertEqual(back["old_gene_label"].tolist(), ["NA", "nan"])
         self.assertEqual(back["new_job_dir"].isna().tolist(), [False, True])
         self.assertEqual(back["excluded_reason"].isna().tolist(), [True, False])
@@ -548,7 +549,7 @@ class TestCheckedIO(unittest.TestCase):
     def test_an_allowed_superset_survives_a_write_read_round_trip(self):
         path = self.path("superset.csv")
         rows = run_manifest_rows()
-        rows["notes"] = ["salvaged in phase 5", "queued in phase 4"]
+        rows["notes"] = ["reused in phase 5", "queued in phase 4"]
         write_checked(rows, path, "run_manifest", allow_extra=True)
         with open(path) as handle:
             header = handle.readline().strip().split(",")

@@ -109,7 +109,7 @@ MANIFESTS: Tuple[Tuple[str, str], ...] = (
     ("positives_planned.csv", "positives_planned"),
     ("negatives_pool.csv", "negatives_pool"),
     ("negatives_drawn.csv", "negatives_drawn"),
-    ("salvage_map.csv", "salvage_map"),
+    ("job_classification.csv", "job_classification"),
     ("redock_queue.csv", "redock_queue"),
     ("run_manifest.csv", "run_manifest"),
 )
@@ -613,7 +613,7 @@ def audit_curated(
     """Every check ``REBUILD_PLAN.md`` Phase 5 asks for, plus the ones it implies.
 
     ``expect='subset'`` (default) requires every manifest row with
-    ``provenance == 'salvaged_from'`` to be on disk and forbids any directory
+    ``provenance == 'reused_from'`` to be on disk and forbids any directory
     that is not in the manifest -- the invariant that holds from Phase 5 until
     Phase 7 finishes docking the gap.  ``expect='exact'`` additionally requires
     the newly-docked rows, i.e. the end-state gate ("directory count equals
@@ -693,8 +693,8 @@ def audit_curated(
 
     # -- counts ------------------------------------------------------------
     manifest_ids = set(manifest["job_id"].astype(str))
-    salvaged_ids = set(
-        manifest.loc[manifest["provenance"].astype(str) == "salvaged_from", "job_id"]
+    reused_ids = set(
+        manifest.loc[manifest["provenance"].astype(str) == "reused_from", "job_id"]
         .astype(str)
         .tolist()
     )
@@ -702,10 +702,10 @@ def audit_curated(
     if expect == "exact":
         expected_ids = manifest_ids
     else:
-        # every salvaged row must be here; a newly-docked row may not be yet,
+        # every reused row must be here; a newly-docked row may not be yet,
         # but if it is, it counts. Anything on disk and not in the manifest is
         # caught by the set check below.
-        expected_ids = salvaged_ids | (manifest_ids & disk_ids)
+        expected_ids = reused_ids | (manifest_ids & disk_ids)
     pending = sorted(manifest_ids - expected_ids)
     results.append(
         _verdict(
@@ -915,14 +915,14 @@ def audit_curated(
         missing_provenance = [
             s.dir_name
             for s in usable
-            if s.record.get("provenance") == "salvaged_from" and not s.record.get("source_job")
+            if s.record.get("provenance") == "reused_from" and not s.record.get("source_job")
         ]
         results.append(
             _verdict(
-                name("salvaged_jobs_name_their_source"),
+                name("reused_jobs_name_their_source"),
                 not missing_provenance,
-                "every salvaged job records the old directory it came from",
-                "{0} salvaged job(s) have no source_job; the relabelling is not "
+                "every reused job records the old directory it came from",
+                "{0} reused job(s) have no source_job; the relabelling is not "
                 "traceable: {1}".format(
                     len(missing_provenance), _examples(missing_provenance)
                 ),
@@ -1165,26 +1165,26 @@ def audit_run(
         )
 
     # -- a pool draw must name a pool job ----------------------------------
-    if "negatives_drawn" in frames and "salvage_map" in frames:
+    if "negatives_drawn" in frames and "job_classification" in frames:
         drawn = frames["negatives_drawn"]
         pool_rows = drawn[drawn["source"].astype(str) == "pool"]
-        salvage = frames["salvage_map"]
+        reuse = frames["job_classification"]
         by_dir = {
             str(r["old_job_dir"]): str(r["classification"])
-            for r in salvage.to_dict("records")
+            for r in reuse.to_dict("records")
         }
         problems = []
         for value in pool_rows["old_job_dir"].astype(str).tolist():
             classification = by_dir.get(value)
             if classification is None:
-                problems.append("{0} (absent from salvage_map)".format(value))
+                problems.append("{0} (absent from job_classification)".format(value))
             elif classification != "valid_non_interaction":
                 problems.append("{0} (classified {1})".format(value, classification))
         results.append(
             _verdict(
                 "xstage.pool_draws_reference_pool_jobs",
                 not problems,
-                "all {0} pool draw(s) name a salvage-map job classified "
+                "all {0} pool draw(s) name a job-classification job classified "
                 "valid_non_interaction".format(len(pool_rows)),
                 "{0} problem(s): {1}".format(len(problems), _examples(problems)),
                 n_problems=len(problems),
@@ -1195,7 +1195,7 @@ def audit_run(
             _result(
                 "xstage.pool_draws_reference_pool_jobs",
                 SKIP,
-                "needs negatives_drawn.csv and salvage_map.csv",
+                "needs negatives_drawn.csv and job_classification.csv",
             )
         )
 
@@ -1435,7 +1435,7 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("subset", "exact"),
         default="subset",
         help=(
-            "subset (default): every salvaged manifest row must be on disk and "
+            "subset (default): every reused manifest row must be on disk and "
             "no directory may be missing from the manifest. exact: the "
             "newly-docked rows must be there too (the Phase 7/8 end state)."
         ),

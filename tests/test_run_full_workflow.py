@@ -50,9 +50,9 @@ class TestPhaseComposition(unittest.TestCase):
         keys = [p.key for p in plan(mode="positives-only")]
         self.assertNotIn("negatives", keys)
 
-    def test_salvage_runs_only_in_salvage_mode(self):
-        self.assertIn("salvage", [p.key for p in plan(mode="salvage-and-redock")])
-        self.assertNotIn("salvage", [p.key for p in plan(mode="full-redock")])
+    def test_reuse_runs_only_in_reuse_mode(self):
+        self.assertIn("reuse", [p.key for p in plan(mode="reuse-and-redock")])
+        self.assertNotIn("reuse", [p.key for p in plan(mode="full-redock")])
 
     def test_the_retired_script_is_never_invoked(self):
         for mode in wf.MODES:
@@ -70,7 +70,7 @@ class TestPhaseComposition(unittest.TestCase):
 
     def test_mode_is_explicit_not_inferred(self):
         self.assertEqual(
-            set(wf.MODES), {"positives-only", "salvage-and-redock", "full-redock"})
+            set(wf.MODES), {"positives-only", "reuse-and-redock", "full-redock"})
         parser = wf.build_parser()
         with self.assertRaises(SystemExit):  # an unknown mode is rejected outright
             parser.parse_args(["--run-dir", "/tmp/x", "--mode", "whatever-is-lying-around"])
@@ -128,3 +128,60 @@ class TestCli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestInputOutputSeparation(unittest.TestCase):
+    """Inputs are shared and versioned; outputs are per-run. Tangling them is how
+    the 2025-06-29 directory ended up holding 1.55 TB of mixed provenance."""
+
+    def _inputs(self, tmp):
+        os.makedirs(os.path.join(tmp, "uniprot"))
+        os.makedirs(os.path.join(tmp, "ligands"))
+        for rel in ("1_drug_to_protein.tsv", "small_molecule_drug_links.csv",
+                    os.path.join("uniprot", "HUMAN_9606_idmapping.dat.gz"),
+                    os.path.join("uniprot", "UP000005640_9606.fasta.gz")):
+            open(os.path.join(tmp, rel), "w").close()
+        return tmp
+
+    def test_inputs_dir_populates_every_declared_input(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._inputs(tmp)
+            args = wf.build_parser().parse_args(
+                ["--run-dir", "/tmp/out", "--inputs-dir", tmp])
+            wf.resolve_inputs(args)
+            for attr in wf.INPUT_LAYOUT:
+                with self.subTest(input=attr):
+                    self.assertTrue(getattr(args, attr), "%s unresolved" % attr)
+                    self.assertTrue(getattr(args, attr).startswith(tmp))
+
+    def test_an_explicit_flag_beats_the_inputs_dir(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._inputs(tmp)
+            args = wf.build_parser().parse_args(
+                ["--run-dir", "/tmp/out", "--inputs-dir", tmp,
+                 "--edges", "/elsewhere/edges.tsv"])
+            wf.resolve_inputs(args)
+            self.assertEqual(args.edges, "/elsewhere/edges.tsv")
+
+    def test_a_missing_input_is_reported_not_silently_defaulted(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "uniprot"))
+            args = wf.build_parser().parse_args(
+                ["--run-dir", "/tmp/out", "--inputs-dir", tmp])
+            wf.resolve_inputs(args)
+            self.assertIsNone(args.edges)  # absent stays absent; the phase will say so
+
+    def test_run_dir_is_output_only_and_distinct_from_inputs(self):
+        args = wf.build_parser().parse_args(
+            ["--run-dir", "/data/runs/r1", "--inputs-dir", "/data/inputs"])
+        self.assertNotEqual(args.run_dir, args.inputs_dir)
+        for phase in wf.build_phases(args):
+            for produced in phase.produces:
+                with self.subTest(phase=phase.key):
+                    self.assertTrue(
+                        produced.startswith(args.run_dir),
+                        "%s writes %s outside the output directory"
+                        % (phase.key, produced))

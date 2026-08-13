@@ -149,7 +149,7 @@ def make_job_dir(root, name, with_complex=True, with_logs=True, with_final=True)
     return job
 
 
-def salvage_row(old_dir, classification, drug, accession, gene, fragment, cavity, **extra):
+def reuse_row(old_dir, classification, drug, accession, gene, fragment, cavity, **extra):
     row = {
         "old_job_dir": old_dir,
         "classification": classification,
@@ -239,7 +239,7 @@ class CurationFixture(unittest.TestCase):
         self.index_path = os.path.join(self.root, "new", "identity", "identity_index.parquet")
         self.index = write_index(self.index_path)
 
-        # Two salvaged positives and two salvaged negatives.  The first one is
+        # Two reused positives and two reused negatives.  The first one is
         # the incident in miniature: the folder says AVPR2 but the receptor is
         # Q8NCT1 (ARRDC4).  The label is a lie; the accession is physical truth.
         self.jobs = {
@@ -259,9 +259,9 @@ class CurationFixture(unittest.TestCase):
 
     # -- manifest construction (overridable per test) ---------------------
 
-    def salvage_rows(self):
+    def reuse_rows(self):
         return [
-            salvage_row(
+            reuse_row(
                 "DB00035_AVPR2_Q8NCT1_cavity_2",
                 "true_positive",
                 "DB00035",
@@ -270,7 +270,7 @@ class CurationFixture(unittest.TestCase):
                 "F1",
                 2,
             ),
-            salvage_row(
+            reuse_row(
                 "DB00035_nan_P30518_cavity_1",
                 "true_positive",
                 "DB00035",
@@ -279,7 +279,7 @@ class CurationFixture(unittest.TestCase):
                 "F1",
                 1,
             ),
-            salvage_row(
+            reuse_row(
                 "DB00157_MT-ND1_P03886_cavity_1",
                 "valid_non_interaction",
                 "DB00157",
@@ -288,7 +288,7 @@ class CurationFixture(unittest.TestCase):
                 "F1",
                 1,
             ),
-            salvage_row(
+            reuse_row(
                 "DB00157_nan_P68363_cavity_3",
                 "valid_non_interaction",
                 "DB00157",
@@ -297,7 +297,7 @@ class CurationFixture(unittest.TestCase):
                 "F2",
                 3,
             ),
-            salvage_row(
+            reuse_row(
                 "DB00157_nan_Q13509_cavity_1",
                 "valid_non_interaction",
                 "DB00157",
@@ -326,10 +326,10 @@ class CurationFixture(unittest.TestCase):
         ]
 
     def write_manifests(self):
-        self.salvage_path = os.path.join(self.manifests, "salvage_map.csv")
+        self.reuse_path = os.path.join(self.manifests, "job_classification.csv")
         self.positives_path = os.path.join(self.manifests, "positives_planned.csv")
         self.drawn_path = os.path.join(self.manifests, "negatives_drawn.csv")
-        write_checked(pd.DataFrame(self.salvage_rows()), self.salvage_path, "salvage_map")
+        write_checked(pd.DataFrame(self.reuse_rows()), self.reuse_path, "job_classification")
         write_checked(
             pd.DataFrame(self.positive_rows()), self.positives_path, "positives_planned"
         )
@@ -339,7 +339,7 @@ class CurationFixture(unittest.TestCase):
 
     def make_plan(self, **kwargs):
         return build_plan(
-            salvage=read_checked(self.salvage_path, "salvage_map"),
+            reuse=read_checked(self.reuse_path, "job_classification"),
             positives=read_checked(self.positives_path, "positives_planned"),
             drawn=read_checked(self.drawn_path, "negatives_drawn"),
             index=self.index,
@@ -358,7 +358,7 @@ class CurationFixture(unittest.TestCase):
     def cli(self, *extra):
         return curate_jobs.main(
             [
-                "--salvage-map", self.salvage_path,
+                "--job-classification", self.reuse_path,
                 "--drawn", self.drawn_path,
                 "--positives", self.positives_path,
                 "--index", self.index_path,
@@ -486,7 +486,7 @@ class TestPlan(CurationFixture):
         )
 
     def test_the_gene_in_the_new_name_comes_from_the_index_not_the_manifest(self):
-        # The salvage row carries the corrupt label AVPR2 on accession Q8NCT1.
+        # The reuse row carries the corrupt label AVPR2 on accession Q8NCT1.
         # Q8NCT1 is ARRDC4.  The new name must say ARRDC4.
         plan = self.make_plan()
         job = next(j for j in plan.jobs if j.old_job_dir == "DB00035_AVPR2_Q8NCT1_cavity_2")
@@ -538,9 +538,9 @@ class TestPlan(CurationFixture):
 
     def test_a_docked_positive_the_design_does_not_want_is_recorded_not_dropped(self):
         plan = self.make_plan()
-        # every true_positive salvage row is in positives_planned here, so add one
-        rows = self.salvage_rows() + [
-            salvage_row(
+        # every true_positive reuse row is in positives_planned here, so add one
+        rows = self.reuse_rows() + [
+            reuse_row(
                 "DB00035_nan_P60568_cavity_9",
                 "true_positive",
                 "DB00035",
@@ -550,14 +550,14 @@ class TestPlan(CurationFixture):
                 9,
             )
         ]
-        write_checked(pd.DataFrame(rows), self.salvage_path, "salvage_map")
+        write_checked(pd.DataFrame(rows), self.reuse_path, "job_classification")
         plan = self.make_plan()
         reasons = [r.reason for r in plan.rejects if r.old_job_dir == "DB00035_nan_P60568_cavity_9"]
         self.assertEqual(len(reasons), 1)
         self.assertIn("positives_planned", reasons[0])
         self.assertEqual(plan.stats["n_planned"], 4)
 
-    def test_a_pool_draw_absent_from_the_salvage_map_is_an_error(self):
+    def test_a_pool_draw_absent_from_the_job_classification_is_an_error(self):
         rows = self.drawn_rows() + [
             drawn_row("DB00157", "P01589", "IL2RA", "F1", 7, "pool", "DB00157_nan_P01589_cavity_7")
         ]
@@ -565,7 +565,7 @@ class TestPlan(CurationFixture):
         plan = self.make_plan()
         self.assertEqual(plan.n_errors, 1)
         self.assertIn(
-            "absent from the salvage map",
+            "absent from the reuse map",
             next(r.reason for r in plan.rejects if r.severity == "error"),
         )
 
@@ -588,9 +588,9 @@ class TestPlan(CurationFixture):
         )
 
     def test_an_accession_absent_from_the_index_is_recorded_not_guessed(self):
-        rows = self.salvage_rows()
+        rows = self.reuse_rows()
         rows[0]["accession"] = "P99999"
-        write_checked(pd.DataFrame(rows), self.salvage_path, "salvage_map")
+        write_checked(pd.DataFrame(rows), self.reuse_path, "job_classification")
         positives = self.positive_rows()
         positives[0]["accession"] = "P99999"
         write_checked(pd.DataFrame(positives), self.positives_path, "positives_planned")
@@ -600,9 +600,9 @@ class TestPlan(CurationFixture):
         self.assertIn("not in the identity index", errors[0].reason)
 
     def test_a_null_fragment_is_never_inferred_silently(self):
-        rows = self.salvage_rows()
+        rows = self.reuse_rows()
         rows[0]["fragment_id"] = None
-        write_checked(pd.DataFrame(rows), self.salvage_path, "salvage_map")
+        write_checked(pd.DataFrame(rows), self.reuse_path, "job_classification")
         plan = self.make_plan()
         errors = [r for r in plan.rejects if r.severity == "error"]
         self.assertEqual(len(errors), 1)
@@ -610,9 +610,9 @@ class TestPlan(CurationFixture):
         self.assertIn("--assume-fragment", errors[0].reason)
 
     def test_assume_fragment_makes_the_inference_explicit_and_recorded(self):
-        rows = self.salvage_rows()
+        rows = self.reuse_rows()
         rows[0]["fragment_id"] = None
-        write_checked(pd.DataFrame(rows), self.salvage_path, "salvage_map")
+        write_checked(pd.DataFrame(rows), self.reuse_path, "job_classification")
         plan = self.make_plan(assume_fragment="F1")
         job = next(j for j in plan.jobs if j.old_job_dir == "DB00035_AVPR2_Q8NCT1_cavity_2")
         self.assertEqual(job.identity.fragment_id, "F1")
@@ -620,8 +620,8 @@ class TestPlan(CurationFixture):
         self.assertEqual(plan.stats["n_fragment_assumed"], 1)
 
     def test_two_old_dirs_claiming_one_new_name_fail_loudly(self):
-        rows = self.salvage_rows() + [
-            salvage_row(
+        rows = self.reuse_rows() + [
+            reuse_row(
                 "DB00035_ARRDC4_Q8NCT1_cavity_2",  # same pocket, different label
                 "true_positive",
                 "DB00035",
@@ -631,7 +631,7 @@ class TestPlan(CurationFixture):
                 2,
             )
         ]
-        write_checked(pd.DataFrame(rows), self.salvage_path, "salvage_map")
+        write_checked(pd.DataFrame(rows), self.reuse_path, "job_classification")
         make_job_dir(self.src, "DB00035_ARRDC4_Q8NCT1_cavity_2")
         with self.assertRaises(CurationError) as caught:
             self.make_plan()
@@ -639,8 +639,8 @@ class TestPlan(CurationFixture):
         self.assertIn("last-wins", str(caught.exception))
 
     def test_a_collision_may_be_skipped_but_never_arbitrarily_resolved(self):
-        rows = self.salvage_rows() + [
-            salvage_row(
+        rows = self.reuse_rows() + [
+            reuse_row(
                 "DB00035_ARRDC4_Q8NCT1_cavity_2",
                 "true_positive",
                 "DB00035",
@@ -650,7 +650,7 @@ class TestPlan(CurationFixture):
                 2,
             )
         ]
-        write_checked(pd.DataFrame(rows), self.salvage_path, "salvage_map")
+        write_checked(pd.DataFrame(rows), self.reuse_path, "job_classification")
         make_job_dir(self.src, "DB00035_ARRDC4_Q8NCT1_cavity_2")
         plan = self.make_plan(on_name_collision="skip")
         carried = {j.old_job_dir for j in plan.jobs}
@@ -662,12 +662,12 @@ class TestPlan(CurationFixture):
             "both sides of a collision must be recorded",
         )
 
-    def test_a_duplicated_salvage_key_is_refused_before_a_dict_is_built(self):
-        rows = self.salvage_rows() + [self.salvage_rows()[0]]
+    def test_a_duplicated_reuse_key_is_refused_before_a_dict_is_built(self):
+        rows = self.reuse_rows() + [self.reuse_rows()[0]]
         frame = pd.DataFrame(rows)
         # write past the schema's own primary-key check to simulate a producer
         # that emitted a duplicate; build_plan must still refuse it.
-        frame.to_csv(self.salvage_path, index=False, lineterminator="\n")
+        frame.to_csv(self.reuse_path, index=False, lineterminator="\n")
         with self.assertRaises(Exception) as caught:
             self.make_plan()
         self.assertIn("old_job_dir", str(caught.exception))
@@ -675,7 +675,7 @@ class TestPlan(CurationFixture):
     def test_planned_positives_with_no_docked_job_are_counted(self):
         plan = self.make_plan()
         self.assertEqual(plan.stats["n_positives_planned"], 3)
-        self.assertEqual(plan.stats["n_positives_planned_not_salvageable"], 1)
+        self.assertEqual(plan.stats["n_positives_planned_not_reuseable"], 1)
 
 
 # --------------------------------------------------------------------------
@@ -754,7 +754,7 @@ class TestCopy(CurationFixture):
         self.assertEqual(record["fragment_id"], "F1")
         self.assertEqual(record["cavity_index"], 2)
         self.assertEqual(record["sample_type"], "positive")
-        self.assertEqual(record["provenance"], "salvaged_from")
+        self.assertEqual(record["provenance"], "reused_from")
         self.assertEqual(record["source_job"], "DB00035_AVPR2_Q8NCT1_cavity_2")
         self.assertEqual(record["retention"], "evidence_only")
         self.assertEqual(record["identity_index_sha256"], self.index.source_sha256)
@@ -908,7 +908,7 @@ class TestCli(CurationFixture):
 
         manifest = read_checked(manifest_path, "run_manifest")
         self.assertEqual(len(manifest), 4)
-        self.assertEqual(set(manifest["provenance"]), {"salvaged_from"})
+        self.assertEqual(set(manifest["provenance"]), {"reused_from"})
         self.assertEqual(set(manifest["job_id"]), set(os.listdir(self.dst)))
         for row in manifest.to_dict("records"):
             self.assertEqual(row["gene"], self.index.label(row["accession"]))
@@ -937,7 +937,7 @@ class TestCli(CurationFixture):
     def test_a_wrong_index_pin_refuses_to_run(self):
         code = curate_jobs.main(
             [
-                "--salvage-map", self.salvage_path,
+                "--job-classification", self.reuse_path,
                 "--drawn", self.drawn_path,
                 "--positives", self.positives_path,
                 "--index", self.index_path,
@@ -965,7 +965,7 @@ class TestCli(CurationFixture):
                     args=", ".join(
                         repr(a)
                         for a in [
-                            "--salvage-map", self.salvage_path,
+                            "--job-classification", self.reuse_path,
                             "--drawn", self.drawn_path,
                             "--positives", self.positives_path,
                             "--index", self.index_path,

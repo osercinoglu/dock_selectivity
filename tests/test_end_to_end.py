@@ -6,7 +6,7 @@ universe small enough to reason about by hand:
 
     build_identity_index.py   ->  identity/identity_index.parquet
     resolve_interactions.py   ->  manifests/interactions_resolved.csv
-    salvage_scan.py           ->  manifests/salvage_map.csv, negatives_pool.csv
+    classify_existing.py           ->  manifests/job_classification.csv, negatives_pool.csv
     sample_negatives.py       ->  manifests/negatives_drawn.csv
     curate_jobs.py            ->  docking_results/  (--evidence-only)
     audit.py run              ->  the Phase 5 STOP gate
@@ -68,7 +68,7 @@ import audit  # noqa: E402
 import build_identity_index as bii  # noqa: E402
 import curate_jobs  # noqa: E402
 import resolve_interactions as ri  # noqa: E402
-import salvage_scan  # noqa: E402
+import classify_existing  # noqa: E402
 import sample_negatives  # noqa: E402
 from dock_selectivity.identity import IdentityIndex  # noqa: E402
 from dock_selectivity.jobid import JOB_IDENTITY_FILENAME, format_job_dir  # noqa: E402
@@ -189,7 +189,7 @@ OLD_JOB_DIRS = (
     ("DB11620_nan_P60568_cavity_2", True),
     ("DB00157_nan_P05023_cavity_1", True),
     ("DB00157_nan_P60568_cavity_1", True),
-    # no final_results.csv -> incomplete, not salvageable
+    # no final_results.csv -> incomplete, not reuseable
     ("DB00035_nan_P05023_cavity_1", False),
     # carries no known accession -> unparseable, recorded with a reason
     ("DB99999_FOO_NOTANACCESSION_cavity_1", True),
@@ -267,8 +267,8 @@ DETERMINISTIC_ARTIFACTS = (
     "identity/identity_index.parquet",
     "manifests/interactions_resolved.csv",
     "manifests/positives_planned.csv",
-    "manifests/salvage_map.csv",
-    "manifests/salvage_map.evidence.csv",
+    "manifests/job_classification.csv",
+    "manifests/job_classification.evidence.csv",
     "manifests/negatives_pool.csv",
     "manifests/negatives_drawn.csv",
     "manifests/negatives_drawn.deficits.csv",
@@ -378,7 +378,7 @@ def build_universe(root):
         ),
         "unresolved": os.path.join(new, "identity", "unresolved_targets.csv"),
         "positives": os.path.join(manifests, "positives_planned.csv"),
-        "salvage_map": os.path.join(manifests, "salvage_map.csv"),
+        "job_classification": os.path.join(manifests, "job_classification.csv"),
         "pool": os.path.join(manifests, "negatives_pool.csv"),
         "drawn": os.path.join(manifests, "negatives_drawn.csv"),
         "negative_queue": os.path.join(manifests, "redock_queue.negatives.csv"),
@@ -473,13 +473,13 @@ def run_chain(paths, code_revision="e2e-test"):
 
     # -- Phase 2: classify every old job under correct identity ------------
     stage(
-        "salvage_scan",
-        salvage_scan.main(
+        "classify_existing",
+        classify_existing.main(
             [
-                "--old-results", paths["old"],
+                "--existing-results", paths["old"],
                 "--index", paths["index"],
                 "--interactions", paths["interactions"],
-                "--out-map", paths["salvage_map"],
+                "--out-map", paths["job_classification"],
                 "--out-pool", paths["pool"],
                 "--log-level", "ERROR",
             ]
@@ -509,7 +509,7 @@ def run_chain(paths, code_revision="e2e-test"):
         "curate_jobs",
         curate_jobs.main(
             [
-                "--salvage-map", paths["salvage_map"],
+                "--job-classification", paths["job_classification"],
                 "--drawn", paths["drawn"],
                 "--positives", paths["positives"],
                 "--index", paths["index"],
@@ -533,21 +533,21 @@ def _write_run_manifest(paths):
     """``redock_queue.csv`` and ``run_manifest.csv``.
 
     ``sample_negatives --redock-queue`` writes the NEGATIVE half only, by
-    design; the positive half is every planned positive the salvage pass could
+    design; the positive half is every planned positive the reuse pass could
     not supply.  The two halves are concatenated here deliberately, which is
     what ``run_manifest.csv`` -- the authority on what should exist -- is built
     from.
     """
-    salvaged = read_checked(paths["curated_manifest"], "run_manifest")
+    reused = read_checked(paths["curated_manifest"], "run_manifest")
     positives = read_checked(paths["positives"], "positives_planned")
     negative_queue = read_checked(paths["negative_queue"], "redock_queue")
 
     on_disk = set(
         zip(
-            salvaged["drugbank_id"],
-            salvaged["accession"],
-            salvaged["fragment_id"],
-            salvaged["cavity_index"],
+            reused["drugbank_id"],
+            reused["accession"],
+            reused["fragment_id"],
+            reused["cavity_index"],
         )
     )
     fresh = []
@@ -581,7 +581,7 @@ def _write_run_manifest(paths):
     redock = pd.DataFrame(fresh + negative_queue.to_dict("records"))
     write_checked(redock, paths["redock_queue"], "redock_queue")
 
-    rows = salvaged.to_dict("records")
+    rows = reused.to_dict("records")
     for row in redock.to_dict("records"):
         record = dict(row)
         record["provenance"] = "newly_docked"
@@ -697,7 +697,7 @@ class EndToEndChain(unittest.TestCase):
         cls.interactions = read_checked(
             cls.paths["interactions"], "interactions_resolved"
         )
-        cls.salvage = read_checked(cls.paths["salvage_map"], "salvage_map")
+        cls.reuse = read_checked(cls.paths["job_classification"], "job_classification")
         cls.pool = read_checked(cls.paths["pool"], "negatives_pool")
         cls.positives = read_checked(cls.paths["positives"], "positives_planned")
         cls.drawn = read_checked(cls.paths["drawn"], "negatives_drawn")
@@ -711,16 +711,16 @@ class EndToEndChain(unittest.TestCase):
         ) as handle:
             cls.sampler_report = json.load(handle)[0]
         with open(
-            os.path.join(cls.paths["manifests"], "salvage_scan_summary.json"),
+            os.path.join(cls.paths["manifests"], "classify_existing_summary.json"),
             encoding="utf-8",
         ) as handle:
-            cls.salvage_summary = json.load(handle)
+            cls.reuse_summary = json.load(handle)
 
     # -- helpers ----------------------------------------------------------
 
     def classification(self, old_job_dir):
-        row = self.salvage[self.salvage["old_job_dir"] == old_job_dir]
-        self.assertEqual(1, len(row), "{0} is not in salvage_map".format(old_job_dir))
+        row = self.reuse[self.reuse["old_job_dir"] == old_job_dir]
+        self.assertEqual(1, len(row), "{0} is not in job_classification".format(old_job_dir))
         return row.iloc[0]
 
     def curated_dirs(self):
@@ -740,7 +740,7 @@ class EndToEndChain(unittest.TestCase):
             {
                 "build_identity_index": 0,
                 "resolve_interactions": 0,
-                "salvage_scan": 0,
+                "classify_existing": 0,
                 "sample_negatives": 0,
                 "curate_jobs": 0,
             },
@@ -843,16 +843,16 @@ class EndToEndChain(unittest.TestCase):
     # -- Phase 2 ----------------------------------------------------------
 
     def test_every_old_directory_is_classified_and_none_is_dropped(self):
-        self.assertEqual(len(OLD_JOB_DIRS), len(self.salvage))
+        self.assertEqual(len(OLD_JOB_DIRS), len(self.reuse))
         self.assertEqual(
             EXPECTED_CLASSIFICATION,
             {
                 row["old_job_dir"]: row["classification"]
-                for row in self.salvage.to_dict("records")
+                for row in self.reuse.to_dict("records")
             },
         )
         self.assertEqual(
-            ["docking_automation.log"], self.salvage_summary["non_directory_entries"]
+            ["docking_automation.log"], self.reuse_summary["non_directory_entries"]
         )
 
     def test_the_mislabelled_positive_is_reclassified_and_relabelled(self):
@@ -894,7 +894,7 @@ class EndToEndChain(unittest.TestCase):
         self.assertTrue(pd.isna(row["accession"]))
         reasons = {
             item["old_job_dir"]: item["reason"]
-            for item in self.salvage_summary["unparseable"]
+            for item in self.reuse_summary["unparseable"]
         }
         self.assertIn("DB99999_FOO_NOTANACCESSION_cavity_1", reasons)
         self.assertIn(
@@ -988,9 +988,9 @@ class EndToEndChain(unittest.TestCase):
 
     # -- Phase 5 ----------------------------------------------------------
 
-    def test_the_curated_tree_is_exactly_the_salvageable_design(self):
-        salvaged = self.run_manifest[self.run_manifest["provenance"] == "salvaged_from"]
-        self.assertEqual(sorted(salvaged["job_id"]), self.curated_dirs())
+    def test_the_curated_tree_is_exactly_the_reuseable_design(self):
+        reused = self.run_manifest[self.run_manifest["provenance"] == "reused_from"]
+        self.assertEqual(sorted(reused["job_id"]), self.curated_dirs())
         self.assertIn("DB00035__P30518__AVPR2__F1__cav1", self.curated_dirs())
 
     def test_the_wrong_receptor_job_never_reaches_the_destination(self):
@@ -1042,7 +1042,7 @@ class EndToEndChain(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             code = curate_jobs.main(
                 [
-                    "--salvage-map", self.paths["salvage_map"],
+                    "--job-classification", self.paths["job_classification"],
                     "--drawn", self.paths["drawn"],
                     "--positives", self.paths["positives"],
                     "--index", self.paths["index"],
@@ -1128,7 +1128,7 @@ class EndToEndChain(unittest.TestCase):
                 identity["gene"],
                 "gene must be index.label(accession), by construction",
             )
-            self.assertEqual("salvaged_from", identity["provenance"])
+            self.assertEqual("reused_from", identity["provenance"])
             self.assertTrue(identity["source_job"])
             self.assertEqual(
                 sha256_of(self.paths["index"]), identity["identity_index_sha256"]
@@ -1173,7 +1173,7 @@ class EndToEndChain(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             code = curate_jobs.main(
                 [
-                    "--salvage-map", self.paths["salvage_map"],
+                    "--job-classification", self.paths["job_classification"],
                     "--drawn", self.paths["drawn"],
                     "--positives", self.paths["positives"],
                     "--index", self.paths["index"],
@@ -1218,11 +1218,11 @@ class EndToEndChain(unittest.TestCase):
                      "--out", other_index, "--log-level", "CRITICAL"]
                 ),
             )
-        out_map = os.path.join(other, "salvage_map.csv")
+        out_map = os.path.join(other, "job_classification.csv")
         with quiet_logging(logging.CRITICAL):
-            code = salvage_scan.main(
+            code = classify_existing.main(
                 [
-                    "--old-results", self.paths["old"],
+                    "--existing-results", self.paths["old"],
                     "--index", other_index,
                     "--interactions", self.paths["interactions"],
                     "--out-map", out_map,
@@ -1238,11 +1238,11 @@ class EndToEndChain(unittest.TestCase):
         # G8. With the index deleted, Phase 2 must stop, not pick its own
         # identity universe.
         missing = os.path.join(self.tmp, "gone", "identity_index.parquet")
-        out_map = os.path.join(self.tmp, "gone", "salvage_map.csv")
+        out_map = os.path.join(self.tmp, "gone", "job_classification.csv")
         with quiet_logging(logging.CRITICAL):
-            code = salvage_scan.main(
+            code = classify_existing.main(
                 [
-                    "--old-results", self.paths["old"],
+                    "--existing-results", self.paths["old"],
                     "--index", missing,
                     "--interactions", self.paths["interactions"],
                     "--out-map", out_map,

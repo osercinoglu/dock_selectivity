@@ -22,9 +22,9 @@ The schemas below cover the manifests of ``REBUILD_PLAN.md`` §2::
 
     manifests/interactions_resolved.csv   corrected DTI edge list
     manifests/positives_planned.csv       positives the design wants
-    manifests/negatives_pool.csv          salvageable non-interaction jobs
+    manifests/negatives_pool.csv          reuseable non-interaction jobs
     manifests/negatives_drawn.csv         what the balanced sampler selected
-    manifests/salvage_map.csv             old job dir -> new job dir, or a reason
+    manifests/job_classification.csv             old job dir -> new job dir, or a reason
     manifests/redock_queue.csv            jobs that must be docked fresh
     manifests/run_manifest.csv            every job that SHOULD exist
 
@@ -96,9 +96,9 @@ CLASSIFICATIONS = (
     "true_positive",  # drug really does bind the accession that was docked
     "valid_non_interaction",  # real measurement, no annotated interaction
     "unparseable",  # directory name yielded no identity
-    "incomplete",  # no final_results.csv; not salvageable
+    "incomplete",  # no final_results.csv; not reuseable
 )
-PROVENANCES = ("salvaged_from", "newly_docked")
+PROVENANCES = ("reused_from", "newly_docked")
 NEGATIVE_SOURCES = ("pool", "new")
 
 
@@ -119,7 +119,7 @@ class RowCheck:
 
     ``predicate(df)`` returns a boolean Series that must be ``True`` for every
     row. Used for rules a per-column contract cannot express, such as "a
-    salvage row either names its new job directory or gives a reason for
+    reuse row either names its new job directory or gives a reason for
     exclusion — never neither".
     """
 
@@ -260,7 +260,7 @@ CLASSIFICATION = Column(
 # --------------------------------------------------------------------------
 
 
-def _salvage_outcome_recorded(df: pd.DataFrame) -> Any:
+def _reuse_outcome_recorded(df: pd.DataFrame) -> Any:
     """Exactly one of ``new_job_dir`` / ``excluded_reason`` must be set."""
     return df["new_job_dir"].notna() ^ df["excluded_reason"].notna()
 
@@ -270,9 +270,9 @@ def _pool_rows_name_their_source(df: pd.DataFrame) -> Any:
     return (df["source"] == "pool") == df["old_job_dir"].notna()
 
 
-def _salvaged_rows_name_their_source(df: pd.DataFrame) -> Any:
-    """``provenance == 'salvaged_from'`` iff ``source_job`` is set."""
-    return (df["provenance"] == "salvaged_from") == df["source_job"].notna()
+def _reused_rows_name_their_source(df: pd.DataFrame) -> Any:
+    """``provenance == 'reused_from'`` iff ``source_job`` is set."""
+    return (df["provenance"] == "reused_from") == df["source_job"].notna()
 
 
 # --------------------------------------------------------------------------
@@ -343,7 +343,7 @@ _SCHEMA_LIST: Tuple[Schema, ...] = (
         name="negatives_drawn",
         description=(
             "Negatives the balanced sampler actually selected, in accession "
-            "space. source='pool' rows are salvaged from an existing job; "
+            "space. source='pool' rows are reused from an existing job; "
             "source='new' rows become redock_queue entries."
         ),
         columns=(
@@ -357,11 +357,11 @@ _SCHEMA_LIST: Tuple[Schema, ...] = (
                 "source",
                 "string",
                 allowed=NEGATIVE_SOURCES,
-                description="'pool' = salvaged from an old job, 'new' = must be docked.",
+                description="'pool' = reused from an old job, 'new' = must be docked.",
             ),
             _nullable(
                 OLD_JOB_DIR,
-                "Old directory this negative is salvaged from; null when source='new'.",
+                "Old directory this negative is reused from; null when source='new'.",
             ),
             SELECTED_BY,
         ),
@@ -375,7 +375,7 @@ _SCHEMA_LIST: Tuple[Schema, ...] = (
         ),
     ),
     Schema(
-        name="salvage_map",
+        name="job_classification",
         description=(
             "One row per directory in $OLD/consensus_docking_results (expected "
             "24,173). Every row either names the new directory it becomes or "
@@ -423,14 +423,14 @@ _SCHEMA_LIST: Tuple[Schema, ...] = (
             RowCheck(
                 "outcome_recorded",
                 "exactly one of new_job_dir / excluded_reason is non-null",
-                _salvage_outcome_recorded,
+                _reuse_outcome_recorded,
             ),
         ),
     ),
     Schema(
         name="redock_queue",
         description=(
-            "Jobs that must be docked fresh because the salvage pool cannot "
+            "Jobs that must be docked fresh because the reuse pool cannot "
             "supply them. Also the required-set argument for every structure "
             "preparation step (REBUILD_PLAN Phase 6)."
         ),
@@ -466,22 +466,22 @@ _SCHEMA_LIST: Tuple[Schema, ...] = (
                 "provenance",
                 "string",
                 allowed=PROVENANCES,
-                description="Mirrors job_identity.json: salvaged_from | newly_docked.",
+                description="Mirrors job_identity.json: reused_from | newly_docked.",
             ),
             Column(
                 "source_job",
                 "string",
                 nullable=True,
-                description="Old directory a salvaged job came from; null if newly docked.",
+                description="Old directory a reused job came from; null if newly docked.",
             ),
             SELECTED_BY,
         ),
         primary_key=("job_id",),
         checks=(
             RowCheck(
-                "salvaged_rows_name_their_source",
-                "provenance == 'salvaged_from' if and only if source_job is set",
-                _salvaged_rows_name_their_source,
+                "reused_rows_name_their_source",
+                "provenance == 'reused_from' if and only if source_job is set",
+                _reused_rows_name_their_source,
             ),
         ),
     ),

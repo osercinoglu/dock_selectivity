@@ -1,4 +1,4 @@
-"""Tests for ``salvage_scan.py`` -- REBUILD_PLAN Phase 2.
+"""Tests for ``classify_existing.py`` -- REBUILD_PLAN Phase 2.
 
 Hermetic: every fixture is built in a ``tempfile.TemporaryDirectory()``. Nothing
 here touches ``/media/onur/Elements``, ``/opt/data`` or the network. Real
@@ -34,7 +34,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-import salvage_scan  # noqa: E402
+import classify_existing  # noqa: E402
 from dock_selectivity import schemas  # noqa: E402
 from dock_selectivity.identity import IdentityIndex, Protein  # noqa: E402
 from dock_selectivity.identity import (  # noqa: E402
@@ -133,7 +133,7 @@ def build_old_tree(root, dirs=CAMPAIGN_DIRS, stray=STRAY_ENTRY) -> str:
         # every job carries the engine subdirectories; only some finished
         os.makedirs(os.path.join(job, "smina"))
         if complete:
-            with open(os.path.join(job, salvage_scan.FINAL_RESULTS_FILENAME), "w") as fh:
+            with open(os.path.join(job, classify_existing.FINAL_RESULTS_FILENAME), "w") as fh:
                 fh.write("Tool1,Tool2,Score1,Score2,RMSD\nSMINA,GNINA,-6.5,-6.4,1.23\n")
     if stray:
         with open(os.path.join(old, stray), "w") as fh:
@@ -143,7 +143,7 @@ def build_old_tree(root, dirs=CAMPAIGN_DIRS, stray=STRAY_ENTRY) -> str:
 
 def observations(dirs=CAMPAIGN_DIRS):
     return [
-        salvage_scan.DirObservation(name=name, has_final_results=complete)
+        classify_existing.DirObservation(name=name, has_final_results=complete)
         for name, complete in sorted(dirs.items())
     ]
 
@@ -153,7 +153,7 @@ def interaction_pairs(edges=INTERACTIONS):
 
 
 def classify(dirs=CAMPAIGN_DIRS, proteins=PROTEINS, edges=INTERACTIONS, **kwargs):
-    return salvage_scan.classify_jobs(
+    return classify_existing.classify_jobs(
         observations(dirs),
         index=make_index(proteins),
         interaction_pairs=interaction_pairs(edges),
@@ -199,14 +199,14 @@ class ScanFixture:
         self.interactions = write_interactions(
             os.path.join(self.manifests, "interactions_resolved.csv"), edges
         )
-        self.out_map = os.path.join(self.manifests, "salvage_map.csv")
+        self.out_map = os.path.join(self.manifests, "job_classification.csv")
         self.out_pool = os.path.join(self.manifests, "negatives_pool.csv")
-        self.out_summary = os.path.join(self.manifests, "salvage_scan_summary.json")
-        self.out_evidence = os.path.join(self.manifests, "salvage_map.evidence.csv")
+        self.out_summary = os.path.join(self.manifests, "classify_existing_summary.json")
+        self.out_evidence = os.path.join(self.manifests, "job_classification.evidence.csv")
 
     def argv(self, *extra):
         return [
-            "--old-results", self.old,
+            "--existing-results", self.old,
             "--index", self.index,
             "--interactions", self.interactions,
             "--out-map", self.out_map,
@@ -218,13 +218,13 @@ class ScanFixture:
     def run(self, *extra, **kwargs):
         expect = kwargs.pop("expect", 0)
         assert not kwargs, kwargs
-        code = salvage_scan.main(self.argv(*extra))
+        code = classify_existing.main(self.argv(*extra))
         assert code == expect, "expected exit {0}, got {1}".format(expect, code)
         return code
 
     def read_map(self, allow_extra=False):
         """Strict by default: this is the contract curate_jobs.py reads with."""
-        frame = schemas.read_checked(self.out_map, "salvage_map", allow_extra=allow_extra)
+        frame = schemas.read_checked(self.out_map, "job_classification", allow_extra=allow_extra)
         if os.path.exists(self.out_evidence) and not allow_extra:
             evidence = pd.read_csv(
                 self.out_evidence, keep_default_na=False, na_values=[""]
@@ -243,7 +243,7 @@ class ScanFixture:
             return json.load(handle)
 
 
-class SalvageScanTestCase(unittest.TestCase):
+class ReuseScanTestCase(unittest.TestCase):
     """Base class providing a temporary directory and a built fixture."""
 
     def setUp(self):
@@ -260,10 +260,10 @@ class SalvageScanTestCase(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 
-class TestListing(SalvageScanTestCase):
+class TestListing(ReuseScanTestCase):
     def test_directories_and_non_directories_are_separated_and_sorted(self):
         old = build_old_tree(self.root)
-        job_dirs, others = salvage_scan.list_entries(old)
+        job_dirs, others = classify_existing.list_entries(old)
         self.assertEqual(job_dirs, sorted(CAMPAIGN_DIRS))
         self.assertEqual(others, [STRAY_ENTRY])
         # the campaign's own arithmetic: 24,174 listed = 24,173 dirs + 1 file
@@ -271,21 +271,21 @@ class TestListing(SalvageScanTestCase):
             len(job_dirs) + len(others), len(CAMPAIGN_DIRS) + 1
         )
 
-    def test_missing_old_results_raises_rather_than_scanning_nothing(self):
+    def test_missing_existing_results_raises_rather_than_scanning_nothing(self):
         with self.assertRaises(NotADirectoryError):
-            salvage_scan.list_entries(os.path.join(self.root, "does_not_exist"))
+            classify_existing.list_entries(os.path.join(self.root, "does_not_exist"))
 
     def test_final_results_must_be_present_and_non_empty(self):
         old = build_old_tree(self.root)
-        complete = salvage_scan.observe_job_dir(old, "DB00035_AVPR2_P30518_cavity_1")
+        complete = classify_existing.observe_job_dir(old, "DB00035_AVPR2_P30518_cavity_1")
         self.assertTrue(complete.has_final_results)
-        missing = salvage_scan.observe_job_dir(old, "DB00035_AVPR1B_P47901_cavity_8")
+        missing = classify_existing.observe_job_dir(old, "DB00035_AVPR1B_P47901_cavity_8")
         self.assertFalse(missing.has_final_results)
         # a zero-byte file is not a payload
         empty = os.path.join(old, "DB00035_AVPR1B_P47901_cavity_8", "final_results.csv")
         open(empty, "w").close()
         self.assertFalse(
-            salvage_scan.observe_job_dir(
+            classify_existing.observe_job_dir(
                 old, "DB00035_AVPR1B_P47901_cavity_8"
             ).has_final_results
         )
@@ -296,7 +296,7 @@ class TestListing(SalvageScanTestCase):
 # --------------------------------------------------------------------------
 
 
-class TestClassification(SalvageScanTestCase):
+class TestClassification(ReuseScanTestCase):
     def setUp(self):
         super().setUp()
         self.frame = classify()
@@ -309,7 +309,7 @@ class TestClassification(SalvageScanTestCase):
 
     def test_true_positive(self):
         row = row_for(self.frame, "DB00035_AVPR2_P30518_cavity_1")
-        self.assertEqual(row["classification"], salvage_scan.TRUE_POSITIVE)
+        self.assertEqual(row["classification"], classify_existing.TRUE_POSITIVE)
         self.assertEqual(row["accession"], "P30518")
         self.assertEqual(row["gene"], "AVPR2")
         self.assertTrue(row["is_known_interaction"])
@@ -320,7 +320,7 @@ class TestClassification(SalvageScanTestCase):
         # DB00035_AVPR2_Q8NCT1: labelled AVPR2, but Q8NCT1 is ARRDC4, and
         # DB00035 has no annotated interaction with ARRDC4.
         row = row_for(self.frame, "DB00035_AVPR2_Q8NCT1_cavity_2")
-        self.assertEqual(row["classification"], salvage_scan.VALID_NON_INTERACTION)
+        self.assertEqual(row["classification"], classify_existing.VALID_NON_INTERACTION)
         self.assertEqual(row["accession"], "Q8NCT1")
         self.assertEqual(row["gene"], "ARRDC4")  # relabelled from the index
         self.assertEqual(row["old_gene_label"], "AVPR2")  # kept as evidence
@@ -331,7 +331,7 @@ class TestClassification(SalvageScanTestCase):
 
     def test_incomplete_is_recorded_not_silently_skipped(self):
         row = row_for(self.frame, "DB00035_AVPR1B_P47901_cavity_8")
-        self.assertEqual(row["classification"], salvage_scan.INCOMPLETE)
+        self.assertEqual(row["classification"], classify_existing.INCOMPLETE)
         self.assertFalse(row["has_final_results"])
         # identity is still recovered, so the job is auditable
         self.assertEqual(row["accession"], "P47901")
@@ -341,7 +341,7 @@ class TestClassification(SalvageScanTestCase):
 
     def test_unparseable_is_recorded_with_a_reason(self):
         row = row_for(self.frame, "DB00035__P30518__AVPR2__F1__cav1")
-        self.assertEqual(row["classification"], salvage_scan.UNPARSEABLE)
+        self.assertEqual(row["classification"], classify_existing.UNPARSEABLE)
         for column in ("drugbank_id", "accession", "gene", "fragment_id", "cavity_index"):
             self.assertTrue(pd.isna(row[column]), column)
         self.assertTrue(row["excluded_reason"].startswith("unparseable directory name"))
@@ -352,13 +352,13 @@ class TestClassification(SalvageScanTestCase):
         # set is the authority: an unknown token yields a recorded rejection.
         frame = classify(dirs={"DB00035_FOO_P99999_cavity_1": True})
         row = row_for(frame, "DB00035_FOO_P99999_cavity_1")
-        self.assertEqual(row["classification"], salvage_scan.UNPARSEABLE)
+        self.assertEqual(row["classification"], classify_existing.UNPARSEABLE)
         self.assertIn("accession set is the authority", row["excluded_reason"])
 
     def test_classification_covers_all_four_outcomes(self):
         self.assertEqual(
             set(self.frame["classification"]),
-            set(salvage_scan.CLASSIFICATIONS),
+            set(classify_existing.CLASSIFICATIONS),
         )
 
     def test_totals_reconcile_to_the_directory_count(self):
@@ -367,14 +367,14 @@ class TestClassification(SalvageScanTestCase):
         self.assertEqual(len(self.frame), len(CAMPAIGN_DIRS))
 
 
-class TestNameParsing(SalvageScanTestCase):
+class TestNameParsing(ReuseScanTestCase):
     """The 1,777 directories the old regex rejected."""
 
     def test_multi_fragment_legacy_name(self):
         row = row_for(classify(), "DB00091_CAMLG_P08F94_-F13-model_v1_cavity_10")
         self.assertEqual(row["accession"], "P08F94")
         self.assertEqual(row["fragment_id"], "F13")
-        self.assertEqual(row["fragment_source"], salvage_scan.FRAGMENT_FROM_DIR_NAME)
+        self.assertEqual(row["fragment_source"], classify_existing.FRAGMENT_FROM_DIR_NAME)
         self.assertEqual(row["cavity_index"], 10)
         self.assertEqual(row["old_gene_label"], "CAMLG")
         self.assertEqual(row["gene"], "PKHD1")  # P08F94 is PKHD1, not CAMLG
@@ -386,7 +386,7 @@ class TestNameParsing(SalvageScanTestCase):
         self.assertEqual(row["old_gene_label"], "MT-ND1")
         self.assertEqual(row["gene"], "MT-ND1")
         self.assertTrue(row["label_was_correct"])
-        self.assertEqual(row["classification"], salvage_scan.TRUE_POSITIVE)
+        self.assertEqual(row["classification"], classify_existing.TRUE_POSITIVE)
         self.assertEqual(row["new_job_dir"], "DB00157__P03886__MT-ND1__F1__cav1")
 
     def test_nan_gene_token_becomes_a_null_label_never_the_string_nan(self):
@@ -399,7 +399,7 @@ class TestNameParsing(SalvageScanTestCase):
     def test_label_was_correct_is_null_only_when_there_was_no_label(self):
         frame = classify()
         labelled = frame["old_gene_label"].notna()
-        parsed = frame["classification"] != salvage_scan.UNPARSEABLE
+        parsed = frame["classification"] != classify_existing.UNPARSEABLE
         self.assertTrue(frame.loc[labelled & parsed, "label_was_correct"].notna().all())
         self.assertTrue(frame.loc[~labelled, "label_was_correct"].isna().all())
 
@@ -407,7 +407,7 @@ class TestNameParsing(SalvageScanTestCase):
         frame = classify()
         row = row_for(frame, "DB00035_AVPR2_P30518_cavity_1")
         self.assertEqual(row["fragment_id"], "F1")
-        self.assertEqual(row["fragment_source"], salvage_scan.FRAGMENT_FROM_DEFAULT)
+        self.assertEqual(row["fragment_source"], classify_existing.FRAGMENT_FROM_DEFAULT)
 
         other = classify(default_fragment="F7")
         self.assertEqual(
@@ -431,7 +431,7 @@ class TestNameParsing(SalvageScanTestCase):
 # --------------------------------------------------------------------------
 
 
-class TestNoIdentityCollapse(SalvageScanTestCase):
+class TestNoIdentityCollapse(ReuseScanTestCase):
     """A gene symbol may never select a protein, and may never collapse two."""
 
     def test_one_corrupt_gene_token_on_two_accessions_yields_two_independent_rows(self):
@@ -443,12 +443,12 @@ class TestNoIdentityCollapse(SalvageScanTestCase):
         # ...different proteins, different corrected labels, different verdicts
         self.assertEqual(p68363["gene"], "TUBA1B")
         self.assertEqual(q13509["gene"], "TUBB3")
-        self.assertEqual(p68363["classification"], salvage_scan.TRUE_POSITIVE)
-        self.assertEqual(q13509["classification"], salvage_scan.VALID_NON_INTERACTION)
+        self.assertEqual(p68363["classification"], classify_existing.TRUE_POSITIVE)
+        self.assertEqual(q13509["classification"], classify_existing.VALID_NON_INTERACTION)
 
     def test_directory_to_accession_has_collapse_factor_one(self):
         frame = classify()
-        parsed = frame[frame["classification"] != salvage_scan.UNPARSEABLE]
+        parsed = frame[frame["classification"] != classify_existing.UNPARSEABLE]
         report = assert_collapse_factor_one(
             parsed[["old_job_dir", "accession"]], name="test old_job_dir -> accession"
         )
@@ -471,7 +471,7 @@ class TestNoIdentityCollapse(SalvageScanTestCase):
     def test_gene_is_always_derived_from_the_accession(self):
         frame = classify()
         index = make_index()
-        parsed = frame[frame["classification"] != salvage_scan.UNPARSEABLE]
+        parsed = frame[frame["classification"] != classify_existing.UNPARSEABLE]
         for _, row in parsed.iterrows():
             self.assertEqual(row["gene"], index.label(row["accession"]))
             self.assertTrue(index.by_accession(row["accession"]).has_symbol(row["gene"]))
@@ -480,7 +480,7 @@ class TestNoIdentityCollapse(SalvageScanTestCase):
         edges = INTERACTIONS + (("DB00035", 91947, "Q8NCT1", "ARRDC4"),)
         frame = classify(edges=edges)
         row = row_for(frame, "DB00035_AVPR2_Q8NCT1_cavity_2")
-        self.assertEqual(row["classification"], salvage_scan.TRUE_POSITIVE)
+        self.assertEqual(row["classification"], classify_existing.TRUE_POSITIVE)
         self.assertEqual(row["new_job_dir"], "DB00035__Q8NCT1__ARRDC4__F1__cav2")
         self.assertNotIn("AVPR2", row["new_job_dir"])
 
@@ -494,7 +494,7 @@ class TestNoIdentityCollapse(SalvageScanTestCase):
             edges=(("DB00035", 554, "P30518", "AVPR2"),),
         )
         row = row_for(frame, "DB00035_AVPR2_P30518_cavity_1")
-        self.assertEqual(row["classification"], salvage_scan.TRUE_POSITIVE)
+        self.assertEqual(row["classification"], classify_existing.TRUE_POSITIVE)
         self.assertTrue(pd.isna(row["new_job_dir"]))
         self.assertIn("cannot build a new job directory name", row["excluded_reason"])
 
@@ -504,13 +504,13 @@ class TestNoIdentityCollapse(SalvageScanTestCase):
 # --------------------------------------------------------------------------
 
 
-class TestEndToEnd(SalvageScanTestCase):
+class TestEndToEnd(ReuseScanTestCase):
     def setUp(self):
         super().setUp()
         self.fx = self.fixture()
         self.fx.run()
 
-    def test_salvage_map_satisfies_its_declared_contract(self):
+    def test_job_classification_satisfies_its_declared_contract(self):
         frame = self.fx.read_map()  # read_checked validates on read
         self.assertEqual(len(frame), len(CAMPAIGN_DIRS))
         self.assertEqual(frame["old_job_dir"].nunique(), len(CAMPAIGN_DIRS))
@@ -526,7 +526,7 @@ class TestEndToEnd(SalvageScanTestCase):
         frame = self.fx.read_map()
         pool = self.fx.read_pool()
         expected = frame.loc[
-            frame["classification"] == salvage_scan.VALID_NON_INTERACTION,
+            frame["classification"] == classify_existing.VALID_NON_INTERACTION,
             "old_job_dir",
         ]
         self.assertEqual(sorted(pool["old_job_dir"]), sorted(expected))
@@ -596,7 +596,7 @@ class TestEndToEnd(SalvageScanTestCase):
 # --------------------------------------------------------------------------
 
 
-class TestDeterminism(SalvageScanTestCase):
+class TestDeterminism(ReuseScanTestCase):
     def test_rerunning_produces_byte_identical_manifests(self):
         fx = self.fixture()
         fx.run()
@@ -620,8 +620,8 @@ class TestDeterminism(SalvageScanTestCase):
         snippet = (
             "import hashlib, sys;"
             "sys.path.insert(0, {repo!r});"
-            "import salvage_scan;"
-            "rc = salvage_scan.main({argv!r});"
+            "import classify_existing;"
+            "rc = classify_existing.main({argv!r});"
             "assert rc == 0, rc;"
             "print(hashlib.sha256(open({m!r},'rb').read()).hexdigest());"
             "print(hashlib.sha256(open({p!r},'rb').read()).hexdigest());"
@@ -636,7 +636,7 @@ class TestDeterminism(SalvageScanTestCase):
             s=fx.out_summary,
         )
         report = assert_deterministic_across_hash_seeds(
-            snippet, name="salvage_scan outputs", seeds=(0, 1, 42), timeout=300
+            snippet, name="classify_existing outputs", seeds=(0, 1, 42), timeout=300
         )
         self.assertTrue(report["ok"])
         self.assertEqual(report["n_distinct_outputs"], 1)
@@ -655,7 +655,7 @@ class TestDeterminism(SalvageScanTestCase):
 # --------------------------------------------------------------------------
 
 
-class TestReadOnly(SalvageScanTestCase):
+class TestReadOnly(ReuseScanTestCase):
     def test_the_old_tree_is_byte_for_byte_unchanged(self):
         fx = self.fixture()
         before = snapshot_tree(fx.old)
@@ -665,11 +665,11 @@ class TestReadOnly(SalvageScanTestCase):
 
     def test_writing_a_manifest_into_the_old_tree_is_refused(self):
         fx = self.fixture()
-        target = os.path.join(fx.old, "salvage_map.csv")
+        target = os.path.join(fx.old, "job_classification.csv")
         before = snapshot_tree(fx.old)
-        code = salvage_scan.main(
+        code = classify_existing.main(
             [
-                "--old-results", fx.old,
+                "--existing-results", fx.old,
                 "--index", fx.index,
                 "--interactions", fx.interactions,
                 "--out-map", target,
@@ -685,8 +685,8 @@ class TestReadOnly(SalvageScanTestCase):
         fx = self.fixture()
         before = snapshot_tree(fx.old)
         with self.assertRaises(InvariantViolation):
-            salvage_scan.run_scan(
-                old_results=fx.old,
+            classify_existing.run_scan(
+                existing_results=fx.old,
                 index_path=fx.index,
                 interactions_path=fx.interactions,
                 out_map=fx.out_map,
@@ -698,8 +698,8 @@ class TestReadOnly(SalvageScanTestCase):
     def test_a_checkpoint_inside_the_old_tree_is_refused(self):
         fx = self.fixture()
         with self.assertRaises(InvariantViolation):
-            salvage_scan.run_scan(
-                old_results=fx.old,
+            classify_existing.run_scan(
+                existing_results=fx.old,
                 index_path=fx.index,
                 interactions_path=fx.interactions,
                 out_map=fx.out_map,
@@ -711,7 +711,7 @@ class TestReadOnly(SalvageScanTestCase):
         fx = self.fixture()
         sibling = os.path.join(os.path.dirname(fx.old), "consensus_docking_results_new")
         self.assertEqual(
-            salvage_scan.assert_not_under(
+            classify_existing.assert_not_under(
                 os.path.join(sibling, "map.csv"), fx.old, "--out-map"
             ),
             os.path.realpath(os.path.join(sibling, "map.csv")),
@@ -720,8 +720,8 @@ class TestReadOnly(SalvageScanTestCase):
     def test_out_map_and_out_pool_may_not_be_the_same_file(self):
         fx = self.fixture()
         with self.assertRaises(InvariantViolation):
-            salvage_scan.run_scan(
-                old_results=fx.old,
+            classify_existing.run_scan(
+                existing_results=fx.old,
                 index_path=fx.index,
                 interactions_path=fx.interactions,
                 out_map=fx.out_map,
@@ -734,10 +734,10 @@ class TestReadOnly(SalvageScanTestCase):
 # --------------------------------------------------------------------------
 
 
-class TestResume(SalvageScanTestCase):
+class TestResume(ReuseScanTestCase):
     def checkpoint_path(self, fx):
         return os.path.join(
-            os.path.dirname(fx.out_map), salvage_scan.DEFAULT_CHECKPOINT_NAME
+            os.path.dirname(fx.out_map), classify_existing.DEFAULT_CHECKPOINT_NAME
         )
 
     def test_a_checkpoint_is_written_and_reused(self):
@@ -760,19 +760,19 @@ class TestResume(SalvageScanTestCase):
         fx.run()
         os.remove(
             os.path.join(
-                fx.old, "DB00035_AVPR2_P30518_cavity_1", salvage_scan.FINAL_RESULTS_FILENAME
+                fx.old, "DB00035_AVPR2_P30518_cavity_1", classify_existing.FINAL_RESULTS_FILENAME
             )
         )
         fx.run()
         self.assertEqual(
             row_for(fx.read_map(), "DB00035_AVPR2_P30518_cavity_1")["classification"],
-            salvage_scan.TRUE_POSITIVE,
+            classify_existing.TRUE_POSITIVE,
         )
         # ...and --no-resume re-observes it
         fx.run("--no-resume")
         self.assertEqual(
             row_for(fx.read_map(), "DB00035_AVPR2_P30518_cavity_1")["classification"],
-            salvage_scan.INCOMPLETE,
+            classify_existing.INCOMPLETE,
         )
 
     def test_an_interrupted_scan_resumes_from_the_checkpoint(self):
@@ -784,9 +784,9 @@ class TestResume(SalvageScanTestCase):
             handle.write(
                 json.dumps(
                     {
-                        "tool": salvage_scan.CHECKPOINT_TOOL,
-                        "schema_version": salvage_scan.CHECKPOINT_SCHEMA_VERSION,
-                        "old_results": os.path.realpath(fx.old),
+                        "tool": classify_existing.CHECKPOINT_TOOL,
+                        "schema_version": classify_existing.CHECKPOINT_SCHEMA_VERSION,
+                        "existing_results": os.path.realpath(fx.old),
                     },
                     sort_keys=True,
                 )
@@ -807,9 +807,9 @@ class TestResume(SalvageScanTestCase):
             handle.write(
                 json.dumps(
                     {
-                        "tool": salvage_scan.CHECKPOINT_TOOL,
-                        "schema_version": salvage_scan.CHECKPOINT_SCHEMA_VERSION,
-                        "old_results": "/media/onur/Elements/some_other_campaign",
+                        "tool": classify_existing.CHECKPOINT_TOOL,
+                        "schema_version": classify_existing.CHECKPOINT_SCHEMA_VERSION,
+                        "existing_results": "/media/onur/Elements/some_other_campaign",
                     },
                     sort_keys=True,
                 )
@@ -817,7 +817,7 @@ class TestResume(SalvageScanTestCase):
             )
             handle.write(json.dumps({"d": "DB99999_X_P30518_cavity_1", "f": 1}) + "\n")
         with self.assertRaises(InvariantViolation) as caught:
-            salvage_scan.read_checkpoint(path, fx.old)
+            classify_existing.read_checkpoint(path, fx.old)
         self.assertIn("--no-resume", str(caught.exception))
         # the CLI reports it and exits non-zero rather than scanning anyway
         self.assertEqual(fx.run(expect=1), 1)
@@ -831,7 +831,7 @@ class TestResume(SalvageScanTestCase):
         # a process killed mid-write leaves a partial final record
         with open(path, "w") as handle:
             handle.write(text[: text.rstrip("\n").rfind("\n") + 12])
-        cached, report = salvage_scan.read_checkpoint(path, fx.old)
+        cached, report = classify_existing.read_checkpoint(path, fx.old)
         self.assertEqual(report["n_truncated_lines"], 1)
         self.assertEqual(len(cached), len(CAMPAIGN_DIRS) - 1)
         fx.run()  # and the run completes, re-observing the lost directory
@@ -847,7 +847,7 @@ class TestResume(SalvageScanTestCase):
         with open(path, "w") as handle:
             handle.write("\n".join(lines) + "\n")
         with self.assertRaises(InvariantViolation):
-            salvage_scan.read_checkpoint(path, fx.old)
+            classify_existing.read_checkpoint(path, fx.old)
 
     def test_no_checkpoint_writes_none(self):
         fx = self.fixture()
@@ -861,7 +861,7 @@ class TestResume(SalvageScanTestCase):
 # --------------------------------------------------------------------------
 
 
-class TestFailClosed(SalvageScanTestCase):
+class TestFailClosed(ReuseScanTestCase):
     def test_a_missing_identity_index_is_not_substituted(self):
         fx = self.fixture()
         os.remove(fx.index)
@@ -895,8 +895,8 @@ class TestFailClosed(SalvageScanTestCase):
             "dock_selectivity.identity must re-export invariants."
             "InvariantViolation, not declare its own",
         )
-        self.assertIn(InvariantViolation, salvage_scan.FATAL_ERRORS)
-        self.assertIn(IdentityInvariantViolation, salvage_scan.FATAL_ERRORS)
+        self.assertIn(InvariantViolation, classify_existing.FATAL_ERRORS)
+        self.assertIn(IdentityInvariantViolation, classify_existing.FATAL_ERRORS)
         self.assertTrue(issubclass(schemas.SchemaViolation, InvariantViolation))
         self.assertTrue(issubclass(schemas.SchemaViolation, IdentityInvariantViolation))
 
@@ -906,7 +906,7 @@ class TestFailClosed(SalvageScanTestCase):
         fx = self.fixture(edges=INTERACTIONS + (("DB00099", 1, "P99999", "FOO"),))
         self.assertEqual(fx.run(expect=1), 1)
         with self.assertRaises(InvariantViolation) as caught:
-            salvage_scan.load_interaction_pairs(fx.interactions, index=make_index())
+            classify_existing.load_interaction_pairs(fx.interactions, index=make_index())
         self.assertIn("P99999", str(caught.exception))
 
     def test_an_interaction_manifest_missing_a_column_is_rejected(self):
@@ -915,11 +915,11 @@ class TestFailClosed(SalvageScanTestCase):
         frame.to_csv(fx.interactions, index=False)
         self.assertEqual(fx.run(expect=1), 1)
 
-    def test_a_missing_old_results_directory_exits_non_zero(self):
+    def test_a_missing_existing_results_directory_exits_non_zero(self):
         fx = self.fixture()
-        code = salvage_scan.main(
+        code = classify_existing.main(
             [
-                "--old-results", os.path.join(self.root, "nope"),
+                "--existing-results", os.path.join(self.root, "nope"),
                 "--index", fx.index,
                 "--interactions", fx.interactions,
                 "--out-map", fx.out_map,
@@ -960,7 +960,7 @@ PLAN_ROWS = [
 ]
 
 
-class TestOldSampleType(SalvageScanTestCase):
+class TestOldSampleType(ReuseScanTestCase):
     def test_without_a_plan_the_gene_token_rule_is_used_and_recorded(self):
         fx = self.fixture()
         fx.run()
@@ -968,7 +968,7 @@ class TestOldSampleType(SalvageScanTestCase):
         nan_row = row_for(frame, "DB00035_nan_P08173_cavity_3")
         self.assertEqual(nan_row["old_sample_type"], "negative")
         self.assertEqual(
-            nan_row["old_sample_type_source"], salvage_scan.SOURCE_GENE_TOKEN
+            nan_row["old_sample_type_source"], classify_existing.SOURCE_GENE_TOKEN
         )
         labelled = row_for(frame, "DB00035_AVPR2_Q8NCT1_cavity_2")
         self.assertEqual(labelled["old_sample_type"], "positive")
@@ -981,12 +981,12 @@ class TestOldSampleType(SalvageScanTestCase):
         # the negative row's Fragment_ID is the bare integer 1 in the plan
         row = row_for(frame, "DB00035_nan_P08173_cavity_3")
         self.assertEqual(row["old_sample_type"], "negative")
-        self.assertEqual(row["old_sample_type_source"], salvage_scan.SOURCE_OLD_PLAN)
+        self.assertEqual(row["old_sample_type_source"], classify_existing.SOURCE_OLD_PLAN)
         self.assertEqual(
             row_for(frame, "DB00091_CAMLG_P08F94_-F13-model_v1_cavity_10")[
                 "old_sample_type_source"
             ],
-            salvage_scan.SOURCE_OLD_PLAN,
+            classify_existing.SOURCE_OLD_PLAN,
         )
 
     def test_the_plan_merge_does_not_change_the_row_count(self):
@@ -1013,7 +1013,7 @@ class TestOldSampleType(SalvageScanTestCase):
             os.path.join(self.root, "plan.csv"), PLAN_ROWS + [contradiction]
         )
         with self.assertRaises(InvariantViolation) as caught:
-            salvage_scan.load_old_plan(plan)
+            classify_existing.load_old_plan(plan)
         self.assertIn("many-to-one", str(caught.exception))
         self.assertEqual(fx.run("--old-plan", plan, expect=1), 1)
 
@@ -1023,18 +1023,18 @@ class TestOldSampleType(SalvageScanTestCase):
             PLAN_ROWS + [("P30518", "F1", 4, "AVPR2", "decoy", "DB00035")],
         )
         with self.assertRaises(InvariantViolation) as caught:
-            salvage_scan.load_old_plan(plan)
+            classify_existing.load_old_plan(plan)
         self.assertIn("decoy", str(caught.exception))
 
     def test_a_plan_missing_a_required_column_is_rejected(self):
         path = os.path.join(self.root, "bad_plan.csv")
         pd.DataFrame({"UniProt_ID": ["P30518"]}).to_csv(path, index=False)
         with self.assertRaises(InvariantViolation):
-            salvage_scan.load_old_plan(path)
+            classify_existing.load_old_plan(path)
 
     def test_a_missing_plan_file_raises_rather_than_falling_back(self):
         with self.assertRaises(FileNotFoundError):
-            salvage_scan.load_old_plan(os.path.join(self.root, "absent.csv"))
+            classify_existing.load_old_plan(os.path.join(self.root, "absent.csv"))
 
     def test_the_old_label_never_decides_the_corrected_classification(self):
         # The plan calls DB00035 x P30518 a positive and DB00035 x Q8NCT1 a
@@ -1050,7 +1050,7 @@ class TestOldSampleType(SalvageScanTestCase):
         frame = fx.read_map()
         self.assertEqual(
             row_for(frame, "DB00035_AVPR2_Q8NCT1_cavity_2")["classification"],
-            salvage_scan.VALID_NON_INTERACTION,
+            classify_existing.VALID_NON_INTERACTION,
         )
 
     def test_a_plan_row_with_a_null_key_cannot_label_an_unparseable_job(self):
@@ -1071,7 +1071,7 @@ class TestOldSampleType(SalvageScanTestCase):
         unparseable = row_for(frame, "DB00035__P30518__AVPR2__F1__cav1")
         self.assertTrue(pd.isna(unparseable["old_sample_type"]))
         self.assertEqual(
-            unparseable["old_sample_type_source"], salvage_scan.SOURCE_UNPARSEABLE
+            unparseable["old_sample_type_source"], classify_existing.SOURCE_UNPARSEABLE
         )
         self.assertEqual(fx.read_summary()["old_plan"]["n_dropped_null_key"], 2)
 
@@ -1081,7 +1081,7 @@ class TestOldSampleType(SalvageScanTestCase):
             PLAN_ROWS + [("P30518", "F1", "cavity_two", "AVPR2", "negative", "DB00035")],
         )
         with self.assertRaises(InvariantViolation):
-            salvage_scan.load_old_plan(plan)
+            classify_existing.load_old_plan(plan)
 
 
 # --------------------------------------------------------------------------
@@ -1089,14 +1089,14 @@ class TestOldSampleType(SalvageScanTestCase):
 # --------------------------------------------------------------------------
 
 
-class TestCommandLine(SalvageScanTestCase):
+class TestCommandLine(ReuseScanTestCase):
     def test_the_phase_2_command_from_the_rebuild_plan_runs_as_a_subprocess(self):
         fx = self.fixture()
         completed = subprocess.run(
             [
                 sys.executable,
-                os.path.join(REPO_ROOT, "salvage_scan.py"),
-                "--old-results", fx.old,
+                os.path.join(REPO_ROOT, "classify_existing.py"),
+                "--existing-results", fx.old,
                 "--index", fx.index,
                 "--interactions", fx.interactions,
                 "--out-map", fx.out_map,
@@ -1116,22 +1116,22 @@ class TestCommandLine(SalvageScanTestCase):
         self.assertTrue(os.path.exists(fx.out_pool))
         self.assertTrue(
             os.path.exists(
-                os.path.join(fx.manifests, salvage_scan.DEFAULT_SUMMARY_NAME)
+                os.path.join(fx.manifests, classify_existing.DEFAULT_SUMMARY_NAME)
             )
         )
 
     def test_required_arguments_are_required(self):
         with self.assertRaises(SystemExit):
-            salvage_scan.build_parser().parse_args([])
+            classify_existing.build_parser().parse_args([])
 
-    def test_salvage_map_is_strictly_conformant_for_curate_jobs(self):
-        # curate_jobs.py:1204 calls read_checked(path, "salvage_map") with no
+    def test_job_classification_is_strictly_conformant_for_curate_jobs(self):
+        # curate_jobs.py:1204 calls read_checked(path, "job_classification") with no
         # allow_extra. The default output must satisfy exactly that call.
         fx = self.fixture()
         fx.run()
-        declared = schemas.get_schema("salvage_map").column_names
+        declared = schemas.get_schema("job_classification").column_names
         self.assertEqual(list(pd.read_csv(fx.out_map, nrows=0).columns), declared)
-        strict = schemas.read_checked(fx.out_map, "salvage_map")
+        strict = schemas.read_checked(fx.out_map, "job_classification")
         self.assertEqual(len(strict), len(CAMPAIGN_DIRS))
 
     def test_the_evidence_companion_carries_the_undeclared_columns_one_to_one(self):
@@ -1139,7 +1139,7 @@ class TestCommandLine(SalvageScanTestCase):
         fx.run()
         evidence = fx.read_evidence()
         self.assertEqual(
-            list(evidence.columns), list(salvage_scan.EVIDENCE_COLUMNS)
+            list(evidence.columns), list(classify_existing.EVIDENCE_COLUMNS)
         )
         self.assertEqual(len(evidence), len(CAMPAIGN_DIRS))
         self.assertEqual(
@@ -1147,21 +1147,21 @@ class TestCommandLine(SalvageScanTestCase):
         )
         self.assertEqual(evidence["old_job_dir"].nunique(), len(CAMPAIGN_DIRS))
         self.assertEqual(
-            set(salvage_scan.EVIDENCE_COLUMNS)
-            - set(schemas.get_schema("salvage_map").column_names),
-            set(salvage_scan.SALVAGE_MAP_EXTRA_COLUMNS),
+            set(classify_existing.EVIDENCE_COLUMNS)
+            - set(schemas.get_schema("job_classification").column_names),
+            set(classify_existing.JOB_CLASSIFICATION_EXTRA_COLUMNS),
         )
 
     def test_inline_extras_folds_them_in_and_then_a_strict_read_fails(self):
         fx = self.fixture()
         fx.run("--inline-extras")
         written = list(pd.read_csv(fx.out_map, nrows=0).columns)
-        self.assertEqual(written, list(salvage_scan.SALVAGE_MAP_COLUMNS))
+        self.assertEqual(written, list(classify_existing.JOB_CLASSIFICATION_COLUMNS))
         self.assertFalse(os.path.exists(fx.out_evidence))
         with self.assertRaises(schemas.SchemaViolation):
-            schemas.read_checked(fx.out_map, "salvage_map")
+            schemas.read_checked(fx.out_map, "job_classification")
         self.assertEqual(
-            len(schemas.read_checked(fx.out_map, "salvage_map", allow_extra=True)),
+            len(schemas.read_checked(fx.out_map, "job_classification", allow_extra=True)),
             len(CAMPAIGN_DIRS),
         )
 

@@ -402,7 +402,7 @@ class TestJobIdentityJson(unittest.TestCase):
                 sample_type="positive",
                 identity_index_sha256="a" * 64,
                 code_revision="cad1ccb",
-                provenance="salvaged_from",
+                provenance="reused_from",
                 source_job="DB00035_AVPR2_Q8NCT1_cavity_2",
             )
             self.assertEqual(os.path.basename(path), JOB_IDENTITY_FILENAME)
@@ -413,7 +413,7 @@ class TestJobIdentityJson(unittest.TestCase):
             self.assertEqual(record["schema_version"], JOB_IDENTITY_SCHEMA_VERSION)
             self.assertEqual(record["dir_name"], self.identity.dir_name())
             self.assertEqual(record["source_job"], "DB00035_AVPR2_Q8NCT1_cavity_2")
-            self.assertEqual(record["provenance"], "salvaged_from")
+            self.assertEqual(record["provenance"], "reused_from")
             self.assertEqual(record["sample_type"], "positive")
 
             # An auditor reconstructs identity without parsing any name.

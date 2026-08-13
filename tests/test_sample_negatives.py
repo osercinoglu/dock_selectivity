@@ -416,7 +416,7 @@ class TestStructuralEligibility(SamplerTestCase):
         self.assertEqual({"True", "False"}, set(ledger["eligible"].astype(str)))
         self.assertTrue((ledger["eligibility"].astype(str).str.len() > 0).all())
 
-    def test_only_eligible_pool_rows_can_be_salvaged(self) -> None:
+    def test_only_eligible_pool_rows_can_be_reused(self) -> None:
         """Nothing the eligibility pass rejected may reach the output."""
         index = self.index_of()
         fixture = build_fixture(
@@ -436,12 +436,12 @@ class TestStructuralEligibility(SamplerTestCase):
         eligible = set(
             result.eligibility.loc[result.eligibility["eligible"], "old_job_dir"]
         )
-        salvaged = set(result.drawn["old_job_dir"].dropna())
-        self.assertTrue(salvaged)
+        reused = set(result.drawn["old_job_dir"].dropna())
+        self.assertTrue(reused)
         self.assertTrue(
-            salvaged <= eligible,
-            "these salvaged jobs were marked ineligible: {0}".format(
-                sorted(salvaged - eligible)
+            reused <= eligible,
+            "these reused jobs were marked ineligible: {0}".format(
+                sorted(reused - eligible)
             ),
         )
         self.assertEqual(1, len(eligible))
@@ -852,7 +852,7 @@ class TestPreferPool(SamplerTestCase):
             self.assertEqual(
                 len(pool),
                 preferred.report["drawn"]["n_from_pool"],
-                "--prefer-pool must salvage every eligible already-docked job "
+                "--prefer-pool must reuse every eligible already-docked job "
                 "before asking for a fresh one (seed {0})".format(seed),
             )
             self.assertLess(
@@ -865,27 +865,27 @@ class TestPreferPool(SamplerTestCase):
                 plain.report["drawn"]["n_new"],
                 "preferring the pool must shrink the re-dock queue",
             )
-            # ...and the salvage is not bought with balance
+            # ...and the reuse is not bought with balance
             self.assertTrue(plain.balance_ok)
             self.assertTrue(preferred.balance_ok)
 
-            salvaged = preferred.drawn[preferred.drawn["source"] == "pool"]
+            reused = preferred.drawn[preferred.drawn["source"] == "pool"]
             self.assertEqual(
-                eligible_pairs, set(zip(salvaged["drugbank_id"], salvaged["accession"]))
+                eligible_pairs, set(zip(reused["drugbank_id"], reused["accession"]))
             )
-            self.assertTrue(salvaged["old_job_dir"].notna().all())
+            self.assertTrue(reused["old_job_dir"].notna().all())
             self.assertTrue(
-                salvaged["selected_by"].str.contains("phase=pool_only").all(),
-                "a salvaged job must be drawn in the pool-first phase",
+                reused["selected_by"].str.contains("phase=pool_only").all(),
+                "a reused job must be drawn in the pool-first phase",
             )
 
-    def test_repair_may_sacrifice_a_salvaged_job_to_close_a_deficit(self) -> None:
-        """Balance is the hard constraint; salvage is the optimisation.
+    def test_repair_may_sacrifice_a_reused_job_to_close_a_deficit(self) -> None:
+        """Balance is the hard constraint; reuse is the optimisation.
 
         In this fixture the only way to serve the last drug is to move the one
         drug holding a pool job onto a different target. The sampler takes the
         trade and says so in the report, rather than quietly leaving a drug
-        unbalanced to protect a salvage.
+        unbalanced to protect a reuse.
         """
         fixture = prefer_pool_fixture(os.path.join(self.tmp, "in"))
         result = fixture.sample(prefer_pool=True, seed=4)
@@ -1268,7 +1268,7 @@ class TestOutputContract(SamplerTestCase):
         self.assertEqual(1, len(rows))
         self.assertEqual("DB00001_ADRA1A_P35348_cavity_1", rows["old_job_dir"].iloc[0])
 
-    def test_a_pool_job_without_final_results_is_re_docked_not_salvaged(self) -> None:
+    def test_a_pool_job_without_final_results_is_re_docked_not_reused(self) -> None:
         index = write_index(os.path.join(self.tmp, "identity_index.parquet"))
         fixture = build_fixture(
             os.path.join(self.tmp, "in"),
@@ -1495,8 +1495,8 @@ class TestHelpers(unittest.TestCase):
             "a target at quota must never be offered again",
         )
 
-    def test_repair_releases_a_fresh_unit_before_a_salvaged_one(self) -> None:
-        """Two donors could close the deficit; the salvaged one must survive.
+    def test_repair_releases_a_fresh_unit_before_a_reused_one(self) -> None:
+        """Two donors could close the deficit; the reused one must survive.
 
         ``DB00001`` holds an already-docked job and sorts first, so a
         first-match search would sacrifice it. ``DB00002`` holds a job that has
@@ -1519,13 +1519,13 @@ class TestHelpers(unittest.TestCase):
             ]
         )
         book = sn._JobBook(eligible_pool, pockets)
-        salvaged = book.take("DB00001", "P30518", allow_new=True)
+        reused = book.take("DB00001", "P30518", allow_new=True)
         fresh = book.take("DB00002", "P35348", allow_new=True)
-        self.assertEqual("keep_me", salvaged.old_job_dir)
+        self.assertEqual("keep_me", reused.old_job_dir)
         self.assertIsNone(fresh.old_job_dir)
 
         draws = [
-            sn._Draw("DB00001", "P30518", salvaged, sn.PHASE_OPEN),
+            sn._Draw("DB00001", "P30518", reused, sn.PHASE_OPEN),
             sn._Draw("DB00002", "P35348", fresh, sn.PHASE_OPEN),
         ]
         need_drug = {"DB00001": 0, "DB00002": 0, "DB00003": 1}

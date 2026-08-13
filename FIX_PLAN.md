@@ -35,7 +35,7 @@ retired) on their own schedule.
 | §5 `jobid.py` — `__`-delimited codec, `job_identity.json` I/O, right-anchored legacy parser | `dock_selectivity/jobid.py` | **I** |
 | §3.1 identity half — Entrez-only resolution of the edge list | **new** `resolve_interactions.py` | **I** (the edit to `identify_required_structures.py` itself is still **○**) |
 | §3.2 balanced sampler with an accession-space avoid-list | **new** `sample_negatives.py` | **I** (`generate_negative_samples.py` untouched, **○**) |
-| §2 relabel path / job classification | **new** `salvage_scan.py` | **I** |
+| §2 relabel path / job classification | **new** `classify_existing.py` | **I** |
 | §3.3 new naming scheme + `job_identity.json` writer (curation side) | **new** `curate_jobs.py` | **I** (`batch_dock.py` itself is still **○**) |
 | §5 read-only auditor (test tier 4) | **new** `audit.py` | **I** |
 | §2 delete `prepare_uniprot_mapping.py` + G6 lint (AST-based) | deleted; `tests/test_g6_no_freetext_resolution.py` | **I** |
@@ -189,7 +189,7 @@ other escape as a traceback. It is **fixed** — `identity.py:81` now reads
 now asserts rather than skips.
 
 Residual, harmless: three stage scripts still carry a two-class `except` tuple written while the split
-existed — `resolve_interactions.INVARIANT_ERRORS`, `salvage_scan.FATAL_ERRORS`,
+existed — `resolve_interactions.INVARIANT_ERRORS`, `classify_existing.FATAL_ERRORS`,
 `sample_negatives.IDENTITY_ERRORS`. They are now redundant, not wrong, and each has a test that keeps
 passing either way. Collapse them opportunistically; **`invariants.py` is the single canonical home**,
 and any new stage should import from there and nowhere else.
@@ -271,7 +271,7 @@ Three limitations, the first of which is decisive:
    Per `KNOWN_ISSUE`, that query list was the drug-target gene set, so no other protein is reachable
    through it; per `ASSESSMENT` §1c only 1,567/1,958 genes (80.03%) are repairable from this file, 391
    need external re-derivation and 12 are absent entirely. It is therefore adequate for re-deriving the
-   salvage arithmetic (which was computed in exactly this universe) and **inadequate for choosing the
+   reuse arithmetic (which was computed in exactly this universe) and **inadequate for choosing the
    canonical accession of a new docking job** — i.e. for the entire re-dock gap.
 3. Without `--proteome`, `reviewed` is `False` on every row and means *unknown*. It is recorded as such
    in `meta["row_counts"]["review_status_source"]`; do not read that column as a Swiss-Prot claim.
@@ -392,7 +392,7 @@ input and no "every cavity on disk" fallback (G8).
 - **Invalidates:** nothing existing — new jobs only. Existing jobs get `job_identity.json` backfilled by
   the relabel path (assessment §2), which is where the 24,173 completed jobs are rescued.
 
-**Delivered for the salvage path (new files, `batch_dock.py` untouched):** `dock_selectivity/jobid.py`
+**Delivered for the reuse path (new files, `batch_dock.py` untouched):** `dock_selectivity/jobid.py`
 is the codec — `format_job_dir` / `parse_job_dir` / `parse_legacy_job_dir` /
 `write_job_identity` / `read_job_identity` — and `curate_jobs.py` writes the curated tree. Decisions
 `batch_dock.py` must match when §3.3 finally lands:
@@ -401,7 +401,7 @@ is the codec — `format_job_dir` / `parse_job_dir` / `parse_legacy_job_dir` /
   blank-gene path produced 10,698 `*_nan_*` directories.
 - `fragment_id` is **required** to build a name, and `jobid.py` refuses to infer it. The "missing token
   means F1" inference is a caller's explicit, logged, per-row-recorded choice
-  (`curate_jobs.py --assume-fragment`, `salvage_scan.py --default-fragment`). An *inferred* fragment is
+  (`curate_jobs.py --assume-fragment`, `classify_existing.py --default-fragment`). An *inferred* fragment is
   the class of bug that caused the 410,087-row fan-out.
 - `parse_job_dir` will **not** fall back to `parse_legacy_job_dir` (or vice versa), and
   `read_job_identity` will **not** fall back to parsing the directory name. Callers choose the scheme.
@@ -538,7 +538,7 @@ Same class as 3.5/3.6: behaviour determined by file presence rather than by expl
 read-only auditor (test tier 4) is `audit.py`. **All five test tiers now exist** as 605 hermetic
 `unittest` tests (tempfile fixtures only; no network, no external drive, no `/opt/data`) — tier 3, the
 e2e smoke, is `tests/test_end_to_end.py`, which chains `build_identity_index` → `resolve_interactions`
-→ `salvage_scan` → `sample_negatives` → `curate_jobs` → `audit.py run` over a synthetic universe built
+→ `classify_existing` → `sample_negatives` → `curate_jobs` → `audit.py run` over a synthetic universe built
 from the incident's real identifiers. They cover the specific regression classes this incident demands:
 last-wins collapse impossible, byte-identical output across `PYTHONHASHSEED`, a silent fallback raising
 instead of widening, a merge not changing row count, a parse handling hyphenated symbols and legacy
@@ -556,7 +556,7 @@ multi-fragment names, and an unresolved input recorded with a reason rather than
    or a new `plan_positives.py` does. The same producer should emit the **positive half** of
    `redock_queue.csv` (10,866 jobs).
 2. **Nothing assembles `manifests/run_manifest.csv`.** `curate_jobs.py --manifest-out` writes only the
-   jobs it materialised (`provenance='salvaged_from'`); the `newly_docked` half has to be derived from
+   jobs it materialised (`provenance='reused_from'`); the `newly_docked` half has to be derived from
    `redock_queue.csv` and concatenated. `audit.py run` already asserts the union equals
    `positives_planned ∪ negatives_drawn`.
 3. ~~`identity.py` must adopt the canonical `InvariantViolation`.~~ **Done during this pass** (§1). The

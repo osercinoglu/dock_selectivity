@@ -248,7 +248,7 @@ def find_consensus_results_files_optimized(base_directory, max_workers=None):
         'final_results.csv',
         'results.csv',  # This will catch smina/gold/ledock results.csv
         'smina_results.csv', 
-        'gold_results.csv',
+        'gexisting_results.csv',
         'ledock_results.csv',
         'combined_'  # For combined results
     ]
@@ -362,7 +362,7 @@ def categorize_found_files(all_results):
     categorized = {
         'final_results': [],
         'smina_results': [],
-        'gold_results': [],
+        'gexisting_results': [],
         'ledock_results': [],
         'gnina_results': [],
         'combined_results': []
@@ -383,7 +383,7 @@ def categorize_found_files(all_results):
             elif 'smina' in dir_path and 'results.csv' in file_name:
                 categorized['smina_results'].append(file_path)
             elif 'gold' in dir_path and 'results.csv' in file_name:
-                categorized['gold_results'].append(file_path)
+                categorized['gexisting_results'].append(file_path)
             elif 'ledock' in dir_path and 'results.csv' in file_name:
                 categorized['ledock_results'].append(file_path)
             elif 'gnina' in dir_path and 'results.csv' in file_name:
@@ -391,7 +391,7 @@ def categorize_found_files(all_results):
             elif 'smina' in file_name:
                 categorized['smina_results'].append(file_path)
             elif 'gold' in file_name:
-                categorized['gold_results'].append(file_path)
+                categorized['gexisting_results'].append(file_path)
             elif 'ledock' in file_name:
                 categorized['ledock_results'].append(file_path)
     
@@ -454,7 +454,7 @@ def optimized_file_loader(file_info):
         elif '/smina/' in path_lower or 'smina' in os.path.basename(path_lower):
             metadata['source_type'] = 'smina_results'
         elif '/gold/' in path_lower or 'gold' in os.path.basename(path_lower):
-            metadata['source_type'] = 'gold_results'
+            metadata['source_type'] = 'gexisting_results'
         elif '/ledock/' in path_lower or 'ledock' in os.path.basename(path_lower):
             metadata['source_type'] = 'ledock_results'
         elif '/gnina/' in path_lower or 'gnina' in os.path.basename(path_lower):
@@ -642,7 +642,7 @@ def prioritize_files_for_loading(result_files):
         'final_results',
         'combined_results', 
         'smina_results',
-        'gold_results',
+        'gexisting_results',
         'ledock_results'
     ]
     
