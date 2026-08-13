@@ -109,7 +109,7 @@ def canonical_tool(value):
 
 
 def parse_job_dir_name(dir_name, known_accessions=None):
-    """Recover identity from a job directory name.
+    r"""Recover identity from a job directory name.
 
     DEFECT 2 (fixed). The old expression was::
 

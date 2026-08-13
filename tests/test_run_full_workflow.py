@@ -50,9 +50,17 @@ class TestPhaseComposition(unittest.TestCase):
         keys = [p.key for p in plan(mode="positives-only")]
         self.assertNotIn("negatives", keys)
 
-    def test_reuse_runs_only_in_reuse_mode(self):
-        self.assertIn("reuse", [p.key for p in plan(mode="reuse-and-redock")])
-        self.assertNotIn("reuse", [p.key for p in plan(mode="full-redock")])
+    def test_there_is_no_reuse_phase(self):
+        """Populating the output directory is a one-time bootstrap, not a phase.
+
+        Every stage already skips work that is already complete on disk (verified:
+        an evidence-only job directory with no complex_*.pdb reports complete on
+        all four tools and on final_results). So a pre-populated output directory
+        needs no special handling -- you just run the pipeline.
+        """
+        for mode in wf.MODES:
+            with self.subTest(mode=mode):
+                self.assertNotIn("reuse", [p.key for p in plan(mode=mode)])
 
     def test_the_retired_script_is_never_invoked(self):
         for mode in wf.MODES:
@@ -69,8 +77,7 @@ class TestPhaseComposition(unittest.TestCase):
                         "%s invokes %s which does not exist" % (phase.key, phase.script))
 
     def test_mode_is_explicit_not_inferred(self):
-        self.assertEqual(
-            set(wf.MODES), {"positives-only", "reuse-and-redock", "full-redock"})
+        self.assertEqual(set(wf.MODES), {"positives-only", "balanced"})
         parser = wf.build_parser()
         with self.assertRaises(SystemExit):  # an unknown mode is rejected outright
             parser.parse_args(["--run-dir", "/tmp/x", "--mode", "whatever-is-lying-around"])

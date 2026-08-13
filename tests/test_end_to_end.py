@@ -676,6 +676,14 @@ def quiet_logging(level=logging.WARNING):
 class EndToEndChain(unittest.TestCase):
     """The chain is run once; every test below reads its artifacts."""
 
+    # KNOWN FLAKY (observed once in five full-suite runs on 2026-08-13, not
+    # reproducible in four subsequent runs): this class shares ONE temp tree across
+    # all its tests via setUpClass, and some tests mutate it (see
+    # test_re_running_the_curator_changes_nothing). test_audit_cli_exits_zero reads
+    # that tree, so a mutation ordering issue can make it fail. The durable fix is a
+    # per-test fixture, or making the mutating tests operate on a copy. Recorded
+    # rather than papered over -- an intermittent failure in the suite that guards a
+    # data-integrity rebuild is worth fixing properly.
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp(prefix="dock_e2e_")

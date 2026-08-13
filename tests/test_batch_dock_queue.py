@@ -233,3 +233,58 @@ class TestComplexPdbCleanup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestResumeOverPrePopulatedOutput(unittest.TestCase):
+    """A pre-populated output directory needs no special pipeline handling.
+
+    Every stage skips work already complete on disk. That is what makes a
+    populated output directory just work: the queue is docked to completion and
+    whatever is already there is left alone. This test pins that behaviour for
+    directories carrying only the retained evidence -- no complex_*.pdb -- because
+    that is what the curation step produces and a completion check that looked for
+    pose complexes would silently re-dock everything.
+    """
+
+    def _evidence_only_job(self, tmp, name="DB00035__P30518__AVPR2__F1__cav1"):
+        job = os.path.join(tmp, name)
+        for tool in ("smina", "gnina", "gold", "ledock"):
+            os.makedirs(os.path.join(job, tool))
+            with open(os.path.join(job, tool, "results.csv"), "w") as fh:
+                fh.write("Tool,Pose,Score\nSMINA,1,-7.2\n")
+            with open(os.path.join(job, tool, "out.sdf"), "w") as fh:
+                fh.write("pose\n")
+        with open(os.path.join(job, "final_results.csv"), "w") as fh:
+            fh.write("Tool1,Tool2,PoseNumber1,PoseNumber2,Score1,Score2,File1,File2,RMSD\n")
+            fh.write("SMINA,GNINA,1,1,-7.2,-6.9,a,b,1.4\n" * 30)
+        return job
+
+    def test_evidence_only_job_counts_as_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = self._evidence_only_job(tmp)
+            self.assertFalse(
+                any(f.startswith("complex_")
+                    for f in os.listdir(os.path.join(job, "smina"))),
+                "fixture must have no complex_*.pdb or it proves nothing")
+            for tool in ("smina", "gnina", "gold", "ledock"):
+                self.assertTrue(batch_dock.check_tool_completion(job, tool), tool)
+            self.assertTrue(batch_dock.check_final_results_completion(job))
+            status = batch_dock.get_job_completion_status(job)
+            self.assertTrue(all(status.values()), status)
+
+    def test_an_absent_job_is_not_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "DB99999__P00000__NOPE__F1__cav1")
+            self.assertFalse(batch_dock.check_final_results_completion(missing))
+            self.assertFalse(batch_dock.check_tool_completion(missing, "smina"))
+
+    def test_a_half_finished_job_is_not_complete(self):
+        """smina done, the rest absent: the queue must still dock it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            job = os.path.join(tmp, "DB00035__P30518__AVPR2__F1__cav2")
+            os.makedirs(os.path.join(job, "smina"))
+            with open(os.path.join(job, "smina", "results.csv"), "w") as fh:
+                fh.write("Tool,Pose,Score\nSMINA,1,-7.2\n")
+            self.assertTrue(batch_dock.check_tool_completion(job, "smina"))
+            self.assertFalse(batch_dock.check_tool_completion(job, "gold"))
+            self.assertFalse(batch_dock.check_final_results_completion(job))

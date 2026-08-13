@@ -35,7 +35,7 @@ Usage
         --edges     1_drug_to_protein.tsv \\
         --tarballs  /opt/data/cavity_space/af_strong_cavities_data_all \\
         --ligands   $NEW/ligands \\
-        --mode      reuse-and-redock
+        --mode      balanced
 
     python3 run_full_workflow.py --run-dir $NEW --dry-run     # print the plan only
 """
@@ -54,7 +54,7 @@ LOG = logging.getLogger("workflow")
 REPO = os.path.dirname(os.path.abspath(__file__))
 
 #: Docking modes. Explicit -- never inferred from which files happen to exist.
-MODES = ("positives-only", "reuse-and-redock", "full-redock")
+MODES = ("positives-only", "balanced")
 
 
 class PhaseFailed(RuntimeError):
@@ -90,7 +90,6 @@ def build_phases(args):
     interactions = j(manifests, "interactions_resolved.csv")
     cavity_manifest = j(manifests, "cavity_manifest.csv")
     positives = j(manifests, "positives_planned.csv")
-    job_classification = j(manifests, "job_classification.csv")
     pool = j(manifests, "negatives_pool.csv")
     drawn = j(manifests, "negatives_drawn.csv")
     manifest = j(manifests, "run_manifest.csv")
@@ -121,38 +120,30 @@ def build_phases(args):
               produces=[positives], requires=[interactions, cavity_manifest]),
     ]
 
-    if args.mode in ("reuse-and-redock",):
-        phases.append(
-            Phase("reuse", "Phase 4 - classify the old campaign (read-only)",
-                  "classify_existing.py",
-                  ["--existing-results", args.existing_results or "", "--index", identity,
-                   "--interactions", interactions,
-                   "--out-map", job_classification, "--out-pool", pool],
-                  produces=[job_classification, pool], requires=[interactions]))
-
     sample_args = ["--index", identity, "--interactions", interactions,
                    "--positives", positives, "--out", drawn,
                    "--redock-queue", j(manifests, "negatives_redock_queue.csv")]
-    if args.mode == "reuse-and-redock":
-        sample_args += ["--pool", pool, "--prefer-pool"]
+    if args.pool:
+        sample_args += ["--pool", args.pool, "--prefer-pool"]
     if args.mode != "positives-only":
         phases.append(
             # The stage the old runner never called at all.
-            Phase("negatives", "Phase 5 - balanced negative sampling",
+            Phase("negatives", "Phase 4 - balanced negative sampling",
                   "sample_negatives.py", sample_args,
                   produces=[drawn], requires=[positives]))
 
     phases.append(
-        Phase("manifest", "Phase 6 - assemble the run manifest and redock queue",
+        Phase("manifest", "Phase 5 - assemble the run manifest and job queue",
               "build_run_manifest.py",
               ["--positives", positives,
                "--drawn", drawn if args.mode != "positives-only" else positives,
-               "--job-classification", job_classification,
-               "--out", manifest, "--redock-out", queue],
+               "--out", manifest, "--redock-out", queue]
+              + (["--job-classification", args.job_classification]
+                 if args.job_classification else []),
               produces=[manifest, queue], requires=[positives]))
 
     phases.append(
-        Phase("dock", "Phase 7 - dock the queue",
+        Phase("dock", "Phase 6 - dock the queue (skips jobs already complete in the output dir)",
               "batch_dock.py",
               ["--queue", queue, "--run-dir", run,
                "--complex-pdb", args.complex_pdb]
@@ -160,7 +151,7 @@ def build_phases(args):
               produces=[], requires=[queue]))
 
     phases.append(
-        Phase("parse", "Phase 8 - parse results into the analysis table",
+        Phase("parse", "Phase 7 - parse results into the analysis table",
               "parse_prepare.py", ["--run-dir", run],
               produces=[], requires=[manifest], optional=True))
 
@@ -260,7 +251,7 @@ def build_parser():
                               "from --run-dir so inputs are shared and versioned while "
                               "outputs are per-run. Individual --edges/--drugs/--ligands/"
                               "--idmapping/--proteome override what is found here."))
-    parser.add_argument("--mode", choices=MODES, default="reuse-and-redock",
+    parser.add_argument("--mode", choices=MODES, default="balanced",
                         help=("EXPLICIT docking mode (default: %(default)s). The old "
                               "runner inferred this from whether a file happened to "
                               "exist."))
@@ -272,8 +263,12 @@ def build_parser():
                               "when unset, else %s" % DEFAULT_DRUGS))
     parser.add_argument("--tarballs", default="/opt/data/cavity_space/af_strong_cavities_data_all")
     parser.add_argument("--ligands", default=None, help="prepared ligand SDF folder")
-    parser.add_argument("--existing-results", default=None,
-                        help="the OLD consensus_docking_results tree (read-only)")
+    parser.add_argument("--pool", default=None,
+                        help=("optional negatives_pool.csv: already-docked "
+                              "non-interaction jobs the sampler may draw from before "
+                              "queueing new work"))
+    parser.add_argument("--job-classification", default=None,
+                        help="optional job_classification.csv from bootstrap_output_dir.py")
     parser.add_argument("--complex-pdb", choices=("keep", "delete", "compress"),
                         default="delete")
     parser.add_argument("--skip", action="append", default=[],
