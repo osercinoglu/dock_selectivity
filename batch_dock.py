@@ -1723,6 +1723,16 @@ def run_single_rmsd_job(job_data):
         
         if returncode == 0:
             action_type = 'recalculated' if FORCE_RMSD_RECALCULATION else 'completed'
+            # The job is complete: final_results.csv holds the scientific payload, so
+            # the derived complex_*.pdb files (89% of the old campaign's 1.4 TB) can go.
+            try:
+                _mode = job_data.get('complex_pdb_mode', globals().get('COMPLEX_PDB_MODE', 'keep'))
+                _touched, _bytes = cleanup_complex_pdbs(current_outfolder, _mode)
+                if _touched:
+                    logging.info('Job %s: %sd %d complex_*.pdb (%.1f MB)',
+                                 job_idx, _mode, _touched, _bytes / 1e6)
+            except Exception as _exc:
+                logging.warning('Job %s: complex_*.pdb cleanup failed: %s', job_idx, _exc)
             return {
                 'success': True,
                 'job_idx': job_idx,
@@ -2581,6 +2591,185 @@ def save_job_preparation_summary(total_jobs, skipped_jobs, final_jobs):
     
     logging.info(f"Job preparation summary saved to: {summary_file}")
 
+# ---------------------------------------------------------------------------
+# REBUILD_PLAN Phase 7 -- queue-driven docking
+# ---------------------------------------------------------------------------
+#
+# The legacy planner resolves a gene SYMBOL to an accession with
+# ``dict(zip(uniprot_map_df['Mapped_Gene_Name'], uniprot_map_df['Entry']))``
+# (:2034) -- last-duplicate-wins over a corrupted column, and the sole reason
+# 633 of 979 docked proteins were not the protein their job name claimed.
+#
+# The queue path below never resolves anything. ``redock_queue.csv`` already
+# carries (drugbank_id, accession, gene, fragment_id, cavity_index), resolved
+# once at the ingest edge by ``resolve_interactions.py`` through the Entrez key.
+# This stage consumes accessions and treats the gene purely as a label written
+# from the identity index, so name and receptor cannot disagree.
+
+
+class QueueJobError(RuntimeError):
+    """Raised when a queue row cannot become a runnable job."""
+
+
+def cleanup_complex_pdbs(job_dir, mode="delete"):
+    """Drop or compress ``{tool}/complex_*.pdb`` once ``final_results.csv`` exists.
+
+    These are 89% of the old campaign's 1.4 TB. They are DERIVED -- receptor plus
+    pose, with the ligand coordinates reproducing ``out.sdf`` exactly -- and
+    99.75% byte-identical between poses of the same job. Without this hook the
+    new run directory grows back to the same size for no additional information.
+
+    Refuses to run before ``final_results.csv`` exists, so a crashed job keeps
+    everything needed to diagnose it.
+
+    Returns ``(files_touched, bytes_reclaimed)``.
+    """
+    if mode not in ("keep", "delete", "compress"):
+        raise ValueError("mode must be keep|delete|compress, got %r" % (mode,))
+    if mode == "keep":
+        return 0, 0
+
+    final_results = os.path.join(job_dir, "final_results.csv")
+    if not os.path.exists(final_results) or os.path.getsize(final_results) <= 0:
+        logging.debug("cleanup skipped for %s: no final_results.csv yet", job_dir)
+        return 0, 0
+
+    touched = 0
+    reclaimed = 0
+    for tool in ("smina", "gnina", "gold", "ledock"):
+        tool_dir = os.path.join(job_dir, tool)
+        if not os.path.isdir(tool_dir):
+            continue
+        for name in sorted(os.listdir(tool_dir)):
+            if not (name.startswith("complex_") and name.endswith(".pdb")):
+                continue
+            path = os.path.join(tool_dir, name)
+            try:
+                size = os.path.getsize(path)
+                if mode == "delete":
+                    os.remove(path)
+                else:
+                    import gzip as _gzip
+                    with open(path, "rb") as src, _gzip.open(path + ".gz", "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    os.remove(path)
+                    size -= os.path.getsize(path + ".gz")
+                touched += 1
+                reclaimed += max(0, size)
+            except OSError as exc:
+                logging.warning("could not clean %s: %s", path, exc)
+    if touched:
+        logging.debug("%s: %s %d complex_*.pdb, reclaimed %.1f MB",
+                      job_dir, mode + "d", touched, reclaimed / 1e6)
+    return touched, reclaimed
+
+
+def build_jobs_from_queue(queue_df, pdb_info_dict, ligand_folder, output_base_folder):
+    """Turn ``redock_queue.csv`` rows into docking jobs. No identity resolution.
+
+    Each row already names its accession. The job directory is built by
+    :func:`dock_selectivity.jobid.format_job_dir` from
+    ``(drugbank_id, accession, gene, fragment_id, cavity_index)``, so the gene in
+    the name is a label derived from the key rather than an independent value
+    that can drift -- the defect that produced ``DB00035_AVPR2_Q8NCT1_cavity_2``.
+
+    Returns ``(jobs, rejects)``; a row that cannot run is rejected with a reason
+    rather than dropped.
+    """
+    from dock_selectivity import jobid
+
+    jobs = []
+    rejects = []
+
+    for _, row in queue_df.iterrows():
+        drugbank_id = str(row["drugbank_id"]).strip()
+        accession = str(row["accession"]).strip()
+        gene = str(row["gene"]).strip()
+        fragment_id = jobid.normalize_fragment_id(row.get("fragment_id")) or "F1"
+        try:
+            cavity_index = int(row["cavity_index"])
+        except (TypeError, ValueError, KeyError):
+            rejects.append({"drugbank_id": drugbank_id, "accession": accession,
+                            "reason": "BAD_CAVITY_INDEX"})
+            continue
+
+        ligand_sdf = os.path.join(ligand_folder, "%s.sdf" % drugbank_id)
+        if not os.path.exists(ligand_sdf):
+            rejects.append({"drugbank_id": drugbank_id, "accession": accession,
+                            "reason": "NO_LIGAND_SDF"})
+            continue
+
+        entries = pdb_info_dict.get(accession)
+        if not entries:
+            rejects.append({"drugbank_id": drugbank_id, "accession": accession,
+                            "reason": "NO_RECEPTOR_FOR_ACCESSION"})
+            continue
+
+        match = None
+        for receptor_pdb, pocket_pdb, receptor_pdbqt in entries:
+            found = re.search(r"_cavity_(\d+)", Path(pocket_pdb).stem)
+            if found and int(found.group(1)) == cavity_index:
+                match = (receptor_pdb, pocket_pdb, receptor_pdbqt)
+                break
+        if match is None:
+            rejects.append({"drugbank_id": drugbank_id, "accession": accession,
+                            "reason": "CAVITY_%d_NOT_AVAILABLE" % cavity_index})
+            continue
+
+        receptor_pdb, pocket_pdb, receptor_pdbqt = match
+        job_name = jobid.format_job_dir(
+            drugbank_id=drugbank_id, accession=accession, gene=gene,
+            fragment_id=fragment_id, cavity_index=cavity_index,
+        )
+        jobs.append({
+            "drugbank_id": drugbank_id,
+            "uniprot_id": accession,
+            "gene_name": gene,
+            "fragment_id": fragment_id,
+            "cavity_index": cavity_index,
+            "sample_type": row.get("sample_type", ""),
+            "ligand_sdf": ligand_sdf,
+            "receptor_pdb": receptor_pdb,
+            "receptor_pdbqt": receptor_pdbqt,
+            "pocket_pdb": pocket_pdb,
+            "job_signature": job_name,
+            "current_outfolder": os.path.abspath(
+                os.path.join(output_base_folder, job_name)),
+        })
+
+    return jobs, rejects
+
+
+def write_queue_job_identities(jobs, index_sha256=None, code_revision=None):
+    """Write ``job_identity.json`` into every queued job directory.
+
+    The authoritative record. The directory name is a convenience; this file is
+    what downstream stages read, which is what removes the job-folder string from
+    the load-bearing path between batch_dock.py and parse_prepare.py.
+    """
+    from dock_selectivity import jobid
+
+    written = 0
+    for job in jobs:
+        os.makedirs(job["current_outfolder"], exist_ok=True)
+        identity = jobid.JobIdentity(
+            drugbank_id=job["drugbank_id"],
+            accession=job["uniprot_id"],
+            gene=job["gene_name"],
+            fragment_id=job["fragment_id"],
+            cavity_index=job["cavity_index"],
+        )
+        jobid.write_job_identity(
+            job["current_outfolder"], identity,
+            sample_type=job.get("sample_type") or None,
+            provenance="newly_docked",
+            identity_index_sha256=index_sha256,
+            code_revision=code_revision,
+        )
+        written += 1
+    return written
+
+
 # --- Main Execution Block ---
 if __name__ == "__main__":
     # 1. Import necessary modules
@@ -2606,9 +2795,80 @@ if __name__ == "__main__":
     except ImportError:
         logging.warning("psutil module not found - install with 'pip install psutil' for robust process termination")
         
-    # 2. Parse command-line arguments if needed
-    # (none for now, using config variables)
-    
+    # 2. Parse command-line arguments
+    import argparse as _argparse
+    _parser = _argparse.ArgumentParser(
+        description=('Batch consensus docking. Prefer --queue: it consumes a '
+                     'redock_queue.csv whose accessions were resolved once at the '
+                     'ingest edge, so this stage never resolves identity itself.'))
+    _parser.add_argument('--queue', default=None,
+                         help='redock_queue.csv to dock (REBUILD_PLAN Phase 7)')
+    _parser.add_argument('--run-dir', default=None,
+                         help='new-style run directory; results go to <run-dir>/docking_results')
+    _parser.add_argument('--output-base', default=None,
+                         help='explicit output folder (overrides --run-dir)')
+    _parser.add_argument('--ligands', default=PROCESSED_LIGAND_SDF_FOLDER,
+                         help='prepared ligand SDF folder (default: %(default)s)')
+    _parser.add_argument('--complex-pdb', choices=('keep', 'delete', 'compress'),
+                         default='delete',
+                         help=('what to do with complex_*.pdb once final_results.csv '
+                               'exists. They are 89%% of the old 1.4 TB and are derived '
+                               'from out.sdf + the receptor. Default: %(default)s'))
+    _parser.add_argument('--legacy-gene-resolution', action='store_true',
+                         help=('opt in to the OLD gene-symbol resolver at :2034. It is '
+                               'last-duplicate-wins over a corrupted column and sent '
+                               '633 of 979 targets to the wrong protein. Do not use.'))
+    _parser.add_argument('--test-mode', action='store_true')
+    _parser.add_argument('--max-jobs', type=int, default=MAX_TEST_JOBS)
+    _args = _parser.parse_args()
+
+    if _args.queue:
+        _out_base = _args.output_base or (
+            os.path.join(_args.run_dir, 'docking_results') if _args.run_dir
+            else OUTPUT_BASE_FOLDER)
+        logging.info('QUEUE MODE: %s -> %s', _args.queue, _out_base)
+        try:
+            from dock_selectivity import schemas as _schemas
+            _queue_df = _schemas.read_checked(_args.queue, 'redock_queue')
+        except Exception as _exc:
+            logging.critical('could not read queue %r: %s', _args.queue, _exc)
+            sys.exit(2)
+        if _args.test_mode:
+            _queue_df = _queue_df.head(_args.max_jobs)
+            logging.info('TEST MODE: limited to %d jobs', len(_queue_df))
+
+        _pdb_info_dict, _mapping_source = load_best_mapping_with_pdbqt()
+        _jobs, _rejects = build_jobs_from_queue(
+            _queue_df, _pdb_info_dict, _args.ligands, _out_base)
+        logging.info('queue: %d runnable job(s), %d rejected', len(_jobs), len(_rejects))
+        for _r in _rejects[:20]:
+            logging.warning('  rejected %s/%s: %s',
+                            _r['drugbank_id'], _r['accession'], _r['reason'])
+        if _rejects:
+            pd.DataFrame(_rejects).to_csv(
+                os.path.join(os.path.dirname(os.path.abspath(_args.queue)),
+                             'redock_queue_rejects.csv'), index=False)
+        if not _jobs:
+            logging.critical('no runnable jobs from the queue; nothing to do')
+            sys.exit(3)
+        write_queue_job_identities(_jobs)
+        globals()['COMPLEX_PDB_MODE'] = _args.complex_pdb
+        globals()['QUEUE_JOBS'] = _jobs
+        logging.info('job_identity.json written for %d job(s); complex_pdb=%s',
+                     len(_jobs), _args.complex_pdb)
+
+    if _args.legacy_gene_resolution:
+        logging.warning('*** --legacy-gene-resolution: using the CORRUPTED symbol '
+                        'resolver at :2034. 633 of 979 targets went to the wrong '
+                        'protein this way. ***')
+    elif not _args.queue:
+        logging.error(
+            'Refusing to run the legacy gene-symbol planner. It resolves identity with '
+            'dict(zip(Mapped_Gene_Name, Entry)), which is last-duplicate-wins over a '
+            'column that is 57.73% wrong. Pass --queue with a redock_queue.csv, or '
+            '--legacy-gene-resolution if you truly want the old behaviour.')
+        sys.exit(2)
+
     # 3. If docking tools are disabled, skip data loading and only compute RMSD from existing outputs
     if USE_RMSD_CALCULATION and not any([USE_SMINA, USE_GNINA, USE_GOLD, USE_LEDOCK]):
         try:
