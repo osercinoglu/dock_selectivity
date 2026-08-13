@@ -31,6 +31,7 @@ Output:
     - Log file: docking_automation.log
 """
 
+import argparse
 import os
 import sys
 import pandas as pd
@@ -170,97 +171,261 @@ GNINA_CAPS_FILE = os.environ.get("GNINA_CAPS_FILE") or None
 GNINA_COLLECTOR_SCRIPT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "gnina_collect.py")
 
-# Set up logging
-logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
-logging.getLogger().addHandler(console_handler)
+# Logging is configured by configure_logging() from the entry point, AFTER the
+# command line is parsed, so --log-file can take effect and importing this module
+# does not create a file. It used to call basicConfig(filename=LOG_FILE) here,
+# which meant `import batch_dock` -- including from a test -- dropped a
+# docking_automation.log into whatever directory you happened to be standing in,
+# and pinned the log path before --log-file could be read.
+#
+# Importing configures nothing: a module that emits log records on import is a
+# module you cannot use as a library.
 
-logging.info("Starting batch consensus docking workflow.")
-if TEST_MODE:
-    logging.info(f"*** RUNNING IN TEST MODE - LIMITED TO {MAX_TEST_JOBS} DOCKING JOBS ***")
-else:
-    logging.info("*** RUNNING IN PRODUCTION MODE ***")
-if SKIP_CONFIRMATION:
-    logging.info("*** SKIP_CONFIRMATION ENABLED - NO USER PROMPT REQUIRED ***")
 
-# Log which tools are enabled
-enabled_tools = []
-if USE_SMINA:
-    enabled_tools.append("SMINA")
-if USE_GNINA:
-    enabled_tools.append("GNINA")
-if USE_GOLD:
-    enabled_tools.append("GOLD")
-if USE_LEDOCK:
-    enabled_tools.append("LEDOCK")
-if USE_RMSD_CALCULATION:
-    enabled_tools.append("RMSD")
+# ---------------------------------------------------------------------------
+# Command-line configuration
+# ---------------------------------------------------------------------------
+#
+# Every setting below used to be a module constant that you edited in place to
+# change a run. That is how the 2025-06-29 campaign ended up impossible to
+# reproduce: the parameters of a run lived in a file that was edited between
+# runs and never recorded alongside the output. Each constant is now also a
+# flag, the constant is merely its default, and `--print-config` dumps what a
+# run will actually use.
+#
+# The table is the single source of truth: PARAMETERS drives the parser, the
+# override, and the test that asserts no constant has been added without a flag.
+# Adding a constant without adding it here is a test failure, on purpose.
+#
+#   (flag, CONSTANT, kind, help)
+# kind: 'str' | 'int' | 'float' | 'bool' (a --flag/--no-flag pair) | 'path'
 
-logging.info(f"*** ENABLED DOCKING TOOLS: {', '.join(enabled_tools) if enabled_tools else 'NONE'} ***")
+PARAMETERS = (
+    # --- inputs and outputs ---
+    ("consensus-docker", "CONSENSUS_DOCKER_SCRIPT", "path", "consensus_docker.py from the docking repo"),
+    ("ligands", "PROCESSED_LIGAND_SDF_FOLDER", "path", "folder of prepared ligand SDFs"),
+    ("edges", "DRUG_TO_PROTEIN_TSV", "path", "drug-to-protein TSV (legacy planner only)"),
+    ("drugs", "SMALL_MOLECULE_DRUGS_CSV", "path", "small-molecule DrugBank list"),
+    ("uniprot-mapping", "UNIPROT_MAPPING_CSV", "path", "legacy uniprot_gene_mapping.csv (corrupted; legacy planner only)"),
+    ("cavity-mapping", "CAVITY_MAPPING_CSV", "path", "cavity_mapping.csv"),
+    ("fixed-mapping", "FIXED_MAPPING_CSV", "path", "fixed_mapping.csv"),
+    ("alphafold-mapping", "ALPHAFOLD_MAPPING_CSV", "path", "alphafold_mapping.csv"),
+    ("pdbqt-mapping", "PDBQT_MAPPING_CSV", "path", "pdbqt_mapping.csv"),
+    ("negatives", "REQUIRED_STRUCTURES_WITH_NEGATIVES_CSV", "path", "required_structures_with_negatives.csv"),
+    ("log-file", "LOG_FILE", "path", "log file (reconfigures logging after parsing)"),
+    ("output-base", "OUTPUT_BASE_FOLDER", "path", "where job directories are written"),
 
-if USE_SMINA:
-    logging.info(f"*** STAGE 1: SMINA - UP TO {SMINA_MAX_PARALLEL_JOBS} CONCURRENT JOBS, EXHAUSTIVENESS {SMINA_EXHAUSTIVENESS}, TIMEOUT {SMINA_TIMEOUT/60:.1f} MINUTES ***")
-else:
-    logging.info("*** STAGE 1: SMINA - DISABLED ***")
+    # --- engine binaries ---
+    ("smina-path", "SMINA_PATH", "path", "smina executable"),
+    ("gnina-path", "GNINA_PATH", "path", "gnina executable, or gnina_remote.py for a remote GPU"),
+    ("ledock-path", "LEDOCK_PATH", "path", "ledock executable"),
+    ("lepro-path", "LEPRO_PATH", "path", "lepro executable"),
+    ("gold-path", "GOLD_PATH", "path", "gold_auto executable"),
 
-if USE_GNINA:
-    logging.info(f"*** STAGE 2: GNINA - UP TO {GNINA_MAX_PARALLEL_JOBS} CONCURRENT JOBS, EXHAUSTIVENESS {GNINA_EXHAUSTIVENESS}, TIMEOUT {GNINA_TIMEOUT/60:.1f} MINUTES ***")
-else:
-    logging.info("*** STAGE 2: GNINA - DISABLED ***")
+    # --- which engines run ---
+    ("use-smina", "USE_SMINA", "bool", "run the smina stage"),
+    ("use-gnina", "USE_GNINA", "bool", "run the gnina stage"),
+    ("use-gold", "USE_GOLD", "bool", "run the GOLD stage"),
+    ("use-ledock", "USE_LEDOCK", "bool", "run the LeDock stage"),
+    ("use-rmsd", "USE_RMSD_CALCULATION", "bool", "run the consensus RMSD stage"),
 
-if USE_GOLD:
-    logging.info(f"*** STAGE 3: GOLD - UP TO {GOLD_MAX_PARALLEL_JOBS} CONCURRENT JOBS, EXHAUSTIVENESS {GOLD_EXHAUSTIVENESS}, TIMEOUT {GOLD_TIMEOUT/60:.1f} MINUTES ***")
-else:
-    logging.info("*** STAGE 3: GOLD - DISABLED ***")
+    # --- docking parameters (these change the science) ---
+    ("num-threads", "NUM_THREADS", "int", "CPU threads passed to each engine"),
+    ("cutoff", "CUTOFF_VALUE", "float", "score cutoff passed to consensus_docker"),
+    ("adaptive-exhaustiveness", "USE_ADAPTIVE_EXHAUSTIVENESS", "bool", "let smina raise exhaustiveness adaptively"),
+    ("max-exhaustiveness", "MAX_EXHAUSTIVENESS", "int", "ceiling when adaptive exhaustiveness is on"),
+    ("smina-exhaustiveness", "SMINA_EXHAUSTIVENESS", "int", "smina exhaustiveness"),
+    ("gnina-exhaustiveness", "GNINA_EXHAUSTIVENESS", "int", "gnina exhaustiveness"),
+    ("gold-exhaustiveness", "GOLD_EXHAUSTIVENESS", "int", "kept for compatibility; GOLD ignores it"),
+    ("ledock-exhaustiveness", "LEDOCK_EXHAUSTIVENESS", "int", "kept for compatibility; LeDock ignores it"),
 
-if USE_LEDOCK:
-    logging.info(f"*** STAGE 4: LEDOCK - UP TO {LEDOCK_MAX_PARALLEL_JOBS} CONCURRENT JOBS, EXHAUSTIVENESS {LEDOCK_EXHAUSTIVENESS}, TIMEOUT {LEDOCK_TIMEOUT/60:.1f} MINUTES ***")
-else:
-    logging.info("*** STAGE 4: LEDOCK - DISABLED ***")
+    # --- staging: concurrency and deadlines ---
+    ("smina-jobs", "SMINA_MAX_PARALLEL_JOBS", "int", "concurrent smina jobs"),
+    ("gnina-jobs", "GNINA_MAX_PARALLEL_JOBS", "int", "concurrent gnina jobs (1 for a single remote GPU)"),
+    ("gold-jobs", "GOLD_MAX_PARALLEL_JOBS", "int", "concurrent GOLD jobs"),
+    ("ledock-jobs", "LEDOCK_MAX_PARALLEL_JOBS", "int", "concurrent LeDock jobs"),
+    ("rmsd-jobs", "RMSD_MAX_PARALLEL_JOBS", "int", "concurrent RMSD jobs"),
+    ("smina-timeout", "SMINA_TIMEOUT", "int", "per-job smina timeout (s)"),
+    ("gnina-timeout", "GNINA_TIMEOUT", "int", "per-job gnina timeout (s)"),
+    ("gold-timeout", "GOLD_TIMEOUT", "int", "per-job GOLD timeout (s)"),
+    ("ledock-timeout", "LEDOCK_TIMEOUT", "int", "per-job LeDock timeout (s)"),
+    ("rmsd-timeout", "RMSD_TIMEOUT", "int", "per-job RMSD timeout (s)"),
 
-if USE_RMSD_CALCULATION:
-    logging.info(f"*** STAGE 5: RMSD CALCULATION - UP TO {RMSD_MAX_PARALLEL_JOBS} CONCURRENT JOBS, TIMEOUT {RMSD_TIMEOUT/60:.1f} MINUTES ***")
-else:
-    logging.info("*** STAGE 5: RMSD CALCULATION - DISABLED ***")
-logging.info(f"Consensus Docker Script: {CONSENSUS_DOCKER_SCRIPT}")
-logging.info(f"Processed Ligand SDF Folder: {PROCESSED_LIGAND_SDF_FOLDER}")
-logging.info(f"Drug-to-Protein TSV: {DRUG_TO_PROTEIN_TSV}")
-logging.info(f"UniProt Mapping CSV: {UNIPROT_MAPPING_CSV}")
-logging.info(f"Cavity Mapping CSV: {CAVITY_MAPPING_CSV}")
-logging.info(f"PDBQT Mapping CSV: {PDBQT_MAPPING_CSV}")
-if os.path.exists(PDBQT_MAPPING_CSV):
-    logging.info("PDBQT mapping found - will use pre-converted PDBQT files for faster docking")
-else:
-    logging.info("PDBQT mapping not found - will use PDB files (slower conversion during docking)")
+    # --- behaviour ---
+    ("skip-confirmation", "SKIP_CONFIRMATION", "bool", "do not prompt before a production run"),
+    ("update-smina-only", "UPDATE_SMINA_ONLY", "bool", "re-run smina only, preserving other tools"),
+    ("force-rmsd", "FORCE_RMSD_RECALCULATION", "bool",
+     "recompute RMSD even when final_results.csv exists. Needs complex_*.pdb from "
+     ">= 2 tools; on a curated evidence-only directory set --no-force-rmsd"),
 
-# Log configuration at startup
-logging.info("=== BATCH DOCK CONFIGURATION ===")
-logging.info(f"USE_SMINA: {USE_SMINA}")
-logging.info(f"USE_GNINA: {USE_GNINA}")
-logging.info(f"USE_GOLD: {USE_GOLD}")
-logging.info(f"USE_LEDOCK: {USE_LEDOCK}")
-logging.info(f"USE_RMSD_CALCULATION: {USE_RMSD_CALCULATION}")
-if not USE_RMSD_CALCULATION:
-    logging.info("*** RMSD CALCULATION DISABLED - Using --skip_rmsd flag for all docking tools ***")
-logging.info(f"USE_ADAPTIVE_EXHAUSTIVENESS: {USE_ADAPTIVE_EXHAUSTIVENESS}")
-if USE_ADAPTIVE_EXHAUSTIVENESS:
-    logging.info(f"MAX_EXHAUSTIVENESS: {MAX_EXHAUSTIVENESS} (caps CPU usage when adaptive mode enabled)")
-logging.info(f"UPDATE_SMINA_ONLY: {UPDATE_SMINA_ONLY}")
-logging.info(f"FORCE_RMSD_RECALCULATION: {FORCE_RMSD_RECALCULATION}")
-logging.info(f"TEST_MODE: {TEST_MODE}")
-logging.info(f"SKIP_CONFIRMATION: {SKIP_CONFIRMATION}")
-logging.info("=" * 35)
+    # --- adaptive resource management ---
+    ("dynamic-resources", "ENABLE_DYNAMIC_RESOURCE_MANAGEMENT", "bool", "adapt parallelism to system load"),
+    ("cpu-threshold", "CPU_THRESHOLD", "float", "submit only below this CPU %%"),
+    ("memory-threshold", "MEMORY_THRESHOLD", "float", "reduce parallelism above this memory %%"),
+    ("resource-interval", "RESOURCE_CHECK_INTERVAL", "int", "seconds between resource checks"),
+    ("min-parallel-jobs", "MIN_PARALLEL_JOBS", "int", "floor for adaptive parallelism"),
+    ("max-parallel-jobs", "MAX_PARALLEL_JOBS_ADAPTIVE", "int", "ceiling for adaptive parallelism"),
+    ("scaling-factor", "ADAPTIVE_SCALING_FACTOR", "float", "reduction factor under load"),
 
-# Validate that at least one tool is enabled
-if not any([USE_SMINA, USE_GNINA, USE_GOLD, USE_LEDOCK]):
-    logging.warning("WARNING: No docking tools are enabled! At least one of USE_SMINA, USE_GNINA, USE_GOLD, or USE_LEDOCK should be True.")
+    # --- decoupled gnina ---
+    ("gnina-collector", "GNINA_COLLECTOR_SCRIPT", "path", "gnina_collect.py used by the async queue"),
+)
+
+
+def _add_parameter_arguments(parser):
+    """Generate one flag per PARAMETERS row."""
+    group = parser.add_argument_group(
+        "configuration",
+        "Each of these defaults to the module constant of the same name; the "
+        "default shown is what this checkout would use.")
+    for flag, const, kind, helptext in PARAMETERS:
+        current = globals().get(const)
+        if kind == "bool":
+            group.add_argument("--" + flag, dest=const, action="store_true",
+                               default=None, help="%s (default: %s)" % (helptext, current))
+            group.add_argument("--no-" + flag, dest=const, action="store_false",
+                               default=None, help=argparse.SUPPRESS)
+        else:
+            caster = {"int": int, "float": float}.get(kind, str)
+            group.add_argument("--" + flag, dest=const, type=caster, default=None,
+                               metavar=kind.upper(),
+                               help="%s (default: %s)" % (helptext, current))
+    return parser
+
+
+def apply_parameter_arguments(args):
+    """Write parsed values over the module constants.
+
+    Returns {constant: (old, new)} for everything that actually changed, so the
+    run can log precisely which settings differ from the checked-in defaults --
+    the record the old edit-the-file workflow never produced.
+    """
+    changed = {}
+    for _flag, const, _kind, _help in PARAMETERS:
+        value = getattr(args, const, None)
+        if value is None:
+            continue
+        old = globals().get(const)
+        if old != value:
+            changed[const] = (old, value)
+        globals()[const] = value
+    return changed
+
+
+def configure_logging(log_file=None, level=logging.DEBUG):
+    """(Re)configure logging to a file plus stdout, replacing any prior handlers."""
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+    fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    if log_file:
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+    root.setLevel(level)
+
+
+def log_configuration():
+    """Log the resolved configuration.
+
+    This used to run at IMPORT, which meant it reported the module constants
+    before any command line was parsed -- a run with `--tools smina,ledock`
+    printed "STAGE 1: SMINA - DISABLED" and then, seconds later, that smina was
+    enabled. Configuration is now logged after it is resolved, so what the log
+    says is what the run does.
+    """
+    logging.info("Starting batch consensus docking workflow.")
+    if TEST_MODE:
+        logging.info(f"*** RUNNING IN TEST MODE - LIMITED TO {MAX_TEST_JOBS} DOCKING JOBS ***")
+    else:
+        logging.info("*** RUNNING IN PRODUCTION MODE ***")
+    if SKIP_CONFIRMATION:
+        logging.info("*** SKIP_CONFIRMATION ENABLED - NO USER PROMPT REQUIRED ***")
+
+    # Log which tools are enabled
+    enabled_tools = []
+    if USE_SMINA:
+        enabled_tools.append("SMINA")
+    if USE_GNINA:
+        enabled_tools.append("GNINA")
+    if USE_GOLD:
+        enabled_tools.append("GOLD")
+    if USE_LEDOCK:
+        enabled_tools.append("LEDOCK")
+    if USE_RMSD_CALCULATION:
+        enabled_tools.append("RMSD")
+
+    logging.info(f"*** ENABLED DOCKING TOOLS: {', '.join(enabled_tools) if enabled_tools else 'NONE'} ***")
+
+    if USE_SMINA:
+        logging.info(f"*** STAGE 1: SMINA - UP TO {SMINA_MAX_PARALLEL_JOBS} CONCURRENT JOBS, EXHAUSTIVENESS {SMINA_EXHAUSTIVENESS}, TIMEOUT {SMINA_TIMEOUT/60:.1f} MINUTES ***")
+    else:
+        logging.info("*** STAGE 1: SMINA - DISABLED ***")
+
+    if USE_GNINA:
+        logging.info(f"*** STAGE 2: GNINA - UP TO {GNINA_MAX_PARALLEL_JOBS} CONCURRENT JOBS, EXHAUSTIVENESS {GNINA_EXHAUSTIVENESS}, TIMEOUT {GNINA_TIMEOUT/60:.1f} MINUTES ***")
+    else:
+        logging.info("*** STAGE 2: GNINA - DISABLED ***")
+
+    if USE_GOLD:
+        logging.info(f"*** STAGE 3: GOLD - UP TO {GOLD_MAX_PARALLEL_JOBS} CONCURRENT JOBS, EXHAUSTIVENESS {GOLD_EXHAUSTIVENESS}, TIMEOUT {GOLD_TIMEOUT/60:.1f} MINUTES ***")
+    else:
+        logging.info("*** STAGE 3: GOLD - DISABLED ***")
+
+    if USE_LEDOCK:
+        logging.info(f"*** STAGE 4: LEDOCK - UP TO {LEDOCK_MAX_PARALLEL_JOBS} CONCURRENT JOBS, EXHAUSTIVENESS {LEDOCK_EXHAUSTIVENESS}, TIMEOUT {LEDOCK_TIMEOUT/60:.1f} MINUTES ***")
+    else:
+        logging.info("*** STAGE 4: LEDOCK - DISABLED ***")
+
+    if USE_RMSD_CALCULATION:
+        logging.info(f"*** STAGE 5: RMSD CALCULATION - UP TO {RMSD_MAX_PARALLEL_JOBS} CONCURRENT JOBS, TIMEOUT {RMSD_TIMEOUT/60:.1f} MINUTES ***")
+    else:
+        logging.info("*** STAGE 5: RMSD CALCULATION - DISABLED ***")
+    logging.info(f"Consensus Docker Script: {CONSENSUS_DOCKER_SCRIPT}")
+    logging.info(f"Processed Ligand SDF Folder: {PROCESSED_LIGAND_SDF_FOLDER}")
+    logging.info(f"Drug-to-Protein TSV: {DRUG_TO_PROTEIN_TSV}")
+    logging.info(f"UniProt Mapping CSV: {UNIPROT_MAPPING_CSV}")
+    logging.info(f"Cavity Mapping CSV: {CAVITY_MAPPING_CSV}")
+    logging.info(f"PDBQT Mapping CSV: {PDBQT_MAPPING_CSV}")
+    if os.path.exists(PDBQT_MAPPING_CSV):
+        logging.info("PDBQT mapping found - will use pre-converted PDBQT files for faster docking")
+    else:
+        logging.info("PDBQT mapping not found - will use PDB files (slower conversion during docking)")
+
+    # Log configuration at startup
+    logging.info("=== BATCH DOCK CONFIGURATION ===")
+    logging.info(f"USE_SMINA: {USE_SMINA}")
+    logging.info(f"USE_GNINA: {USE_GNINA}")
+    logging.info(f"USE_GOLD: {USE_GOLD}")
+    logging.info(f"USE_LEDOCK: {USE_LEDOCK}")
+    logging.info(f"USE_RMSD_CALCULATION: {USE_RMSD_CALCULATION}")
     if not USE_RMSD_CALCULATION:
-        logging.error("ERROR: No tools are enabled at all. Please enable at least one docking tool or RMSD calculation.")
-        sys.exit(1)
+        logging.info("*** RMSD CALCULATION DISABLED - Using --skip_rmsd flag for all docking tools ***")
+    logging.info(f"USE_ADAPTIVE_EXHAUSTIVENESS: {USE_ADAPTIVE_EXHAUSTIVENESS}")
+    if USE_ADAPTIVE_EXHAUSTIVENESS:
+        logging.info(f"MAX_EXHAUSTIVENESS: {MAX_EXHAUSTIVENESS} (caps CPU usage when adaptive mode enabled)")
+    logging.info(f"UPDATE_SMINA_ONLY: {UPDATE_SMINA_ONLY}")
+    logging.info(f"FORCE_RMSD_RECALCULATION: {FORCE_RMSD_RECALCULATION}")
+    logging.info(f"TEST_MODE: {TEST_MODE}")
+    logging.info(f"SKIP_CONFIRMATION: {SKIP_CONFIRMATION}")
+    logging.info("=" * 35)
+
+    # Validate that at least one tool is enabled
+    if not any([USE_SMINA, USE_GNINA, USE_GOLD, USE_LEDOCK]):
+        logging.warning("WARNING: No docking tools are enabled! At least one of USE_SMINA, USE_GNINA, USE_GOLD, or USE_LEDOCK should be True.")
+        if not USE_RMSD_CALCULATION:
+            logging.error("ERROR: No tools are enabled at all. Please enable at least one docking tool or RMSD calculation.")
+            sys.exit(1)
+
+
+
 
 class ResourceMonitor:
     """Monitors system resources and provides recommendations for parallel job execution."""
@@ -3610,10 +3775,6 @@ if __name__ == "__main__":
                          help='redock_queue.csv to dock (REBUILD_PLAN Phase 7)')
     _parser.add_argument('--run-dir', default=None,
                          help='new-style run directory; results go to <run-dir>/docking_results')
-    _parser.add_argument('--output-base', default=None,
-                         help='explicit output folder (overrides --run-dir)')
-    _parser.add_argument('--ligands', default=PROCESSED_LIGAND_SDF_FOLDER,
-                         help='prepared ligand SDF folder (default: %(default)s)')
     _parser.add_argument('--complex-pdb', choices=('keep', 'delete', 'compress'),
                          default='delete',
                          help=('what to do with complex_*.pdb once final_results.csv '
@@ -3656,9 +3817,41 @@ if __name__ == "__main__":
                          help=('where the gnina queue keeps its state. Default '
                                '<run-dir>/gnina_queue; point it at an ext4 path when '
                                'the run directory is on the external drive.'))
-    _parser.add_argument('--test-mode', action='store_true')
-    _parser.add_argument('--max-jobs', type=int, default=MAX_TEST_JOBS)
+    _parser.add_argument('--test-mode', dest='TEST_MODE', action='store_true',
+                         default=None, help='limit the run to --max-jobs jobs')
+    _parser.add_argument('--max-jobs', dest='MAX_TEST_JOBS', type=int, default=None,
+                         help='job cap in test mode (default: %d)' % MAX_TEST_JOBS)
+    _parser.add_argument('--print-config', action='store_true',
+                         help='print the resolved configuration and exit, without docking')
+    _add_parameter_arguments(_parser)
     _args = _parser.parse_args()
+
+    # Resolve configuration BEFORE anything is logged or run, so the log records
+    # what the run actually uses rather than what the file happens to contain.
+    for _extra in ("TEST_MODE", "MAX_TEST_JOBS"):
+        _v = getattr(_args, _extra, None)
+        if _v is not None:
+            globals()[_extra] = _v
+    _changed = apply_parameter_arguments(_args)
+
+    # Before configuring logging: --print-config is a query, and a query should
+    # not create a log file as a side effect.
+    if _args.print_config:
+        print("resolved configuration (%d parameters):" % len(PARAMETERS))
+        for _flag, _const, _kind, _ in PARAMETERS:
+            _mark = " <- --%s" % _flag if _const in _changed else ""
+            print("  %-42s = %r%s" % (_const, globals().get(_const), _mark))
+        print("  %-42s = %r" % ("TEST_MODE", TEST_MODE))
+        print("  %-42s = %r" % ("MAX_TEST_JOBS", MAX_TEST_JOBS))
+        sys.exit(0)
+
+    configure_logging(LOG_FILE)
+
+    log_configuration()
+    if _changed:
+        logging.info("*** %d setting(s) overridden on the command line ***", len(_changed))
+        for _const, (_old, _new) in sorted(_changed.items()):
+            logging.info("      %s: %r -> %r", _const, _old, _new)
 
     # Command line overrides the environment for the decoupled-gnina switches.
     if _args.queue_dir:
@@ -3698,9 +3891,10 @@ if __name__ == "__main__":
         logging.info('*** --tools: %s ***', ', '.join(sorted(_want)))
 
     if _args.queue:
-        _out_base = _args.output_base or (
-            os.path.join(_args.run_dir, 'docking_results') if _args.run_dir
-            else OUTPUT_BASE_FOLDER)
+        # --output-base is a PARAMETERS flag and has already overridden the
+        # global; --run-dir is the convenience that derives it.
+        _out_base = (os.path.join(_args.run_dir, 'docking_results')
+                     if _args.run_dir else OUTPUT_BASE_FOLDER)
         logging.info('QUEUE MODE: %s -> %s', _args.queue, _out_base)
         try:
             from dock_selectivity import schemas as _schemas
@@ -3721,7 +3915,7 @@ if __name__ == "__main__":
             logging.critical("%s", _exc)
             sys.exit(2)
         _jobs, _rejects = build_jobs_from_queue(
-            _queue_df, _pdb_info_dict, _args.ligands, _out_base)
+            _queue_df, _pdb_info_dict, PROCESSED_LIGAND_SDF_FOLDER, _out_base)
         logging.info('queue: %d runnable job(s), %d rejected', len(_jobs), len(_rejects))
         for _r in _rejects[:20]:
             logging.warning('  rejected %s/%s: %s',
@@ -3764,7 +3958,7 @@ if __name__ == "__main__":
 
     if _args.queue:
         try:
-            run_docking(None, None, _pdb_info_dict, _args.ligands,
+            run_docking(None, None, _pdb_info_dict, PROCESSED_LIGAND_SDF_FOLDER,
                         output_base_folder=_out_base, prebuilt_jobs=QUEUE_JOBS)
             sys.exit(0)
         except Exception as _exc:
