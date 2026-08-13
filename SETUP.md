@@ -90,8 +90,35 @@ Then `docker pull gnina/gnina:v1.3.3` (23.6 GB download, ~37.5 GB on disk).
 
 Measured on an RTX 3060 Ti (8 GB): ~60 s per job at `--num_modes 5
 --exhaustiveness 8`, ~2.5 min at production settings, with ~300 KB up and ~1–2 MB
-down. Each job pulls its own results as it finishes, so the pipeline's
-skip-if-complete behaviour makes the remote stage resumable with no extra state.
+down.
+
+**Surviving a flaky link.** A campaign is thousands of jobs over days, so the
+connection will drop. Three mechanisms handle it:
+
+- The remote job runs **detached** (`setsid nohup`) and writes its exit code to a
+  marker file, so losing the connection mid-run does not kill the container. The
+  shim polls for that marker and keeps waiting through outages.
+- Every SSH operation **retries with exponential backoff**, but only for transient
+  failures (connection refused/reset/timeout, DNS, ssh exit 255). A missing input
+  or a non-zero gnina exit fails immediately instead of burning five retries.
+- The remote directory is **content-addressed** from the inputs and arguments, so
+  re-running a job finds finished work and collects it rather than docking again.
+
+Verified against the live host:
+
+| Scenario | Result |
+|---|---|
+| Cold run | 77.5 s |
+| Re-run, same inputs | **6.2 s**, byte-identical output |
+| Local process `SIGKILL`ed mid-run | remote `docker run` kept going; re-run collected the result in 43.4 s |
+
+Tuning: `GNINA_REMOTE_RETRIES` (default 5), `GNINA_REMOTE_TIMEOUT` (default 7200 s
+to wait for the detached job), `GNINA_REMOTE_KEEP=1` to leave remote job
+directories in place.
+
+If a job exceeds `GNINA_REMOTE_TIMEOUT` the shim exits non-zero but leaves the
+remote directory intact, and says so — re-running that job collects the result.
+Remote directories are removed only after a successful download.
 
 ## Reference data
 

@@ -92,6 +92,132 @@ class TestRefusals(unittest.TestCase):
             self.assertEqual(gr.main(["-r", r, "-l", l]), 2)
 
 
+class TestTransientClassification(unittest.TestCase):
+    """Retry the network; never retry a real error.
+
+    Retrying a permanent failure wastes minutes per job across thousands of jobs
+    and buries the message that would have explained it.
+    """
+
+    def test_network_failures_are_transient(self):
+        for text in ("ssh: connect to host x port 50000: Connection refused",
+                     "Connection timed out",
+                     "client_loop: send disconnect: Broken pipe",
+                     "ssh: Could not resolve hostname x: Temporary failure in name resolution",
+                     "kex_exchange_identification: read: Connection reset by peer",
+                     "Network is unreachable"):
+            with self.subTest(text=text):
+                self.assertTrue(gr.is_transient(255, text), text)
+
+    def test_ssh_exit_255_alone_is_transient(self):
+        self.assertTrue(gr.is_transient(255, ""))
+
+    def test_real_errors_are_not_transient(self):
+        for code, text in ((1, "gnina: unrecognised option '--nope'"),
+                           (125, "docker: invalid reference format"),
+                           (1, "scp: /x/y: No such file or directory"),
+                           (2, "Permission denied (publickey)")):
+            with self.subTest(text=text):
+                self.assertFalse(gr.is_transient(code, text), text)
+
+
+class TestRetryBehaviour(unittest.TestCase):
+    def test_a_permanent_failure_is_raised_immediately(self):
+        """One attempt, not five, and the original stderr survives."""
+        with self.assertRaises(gr.RemoteGninaError) as ctx:
+            gr.run_resilient(["sh", "-c", "echo 'No such file or directory' >&2; exit 1"],
+                             "probe", retries=5)
+        self.assertNotIsInstance(ctx.exception, gr.TransientError)
+        self.assertIn("No such file", str(ctx.exception))
+
+    def test_a_transient_failure_is_retried_then_gives_up(self):
+        seen = []
+        original = gr.time.sleep
+        gr.time.sleep = lambda s: seen.append(s)        # no real waiting
+        try:
+            with self.assertRaises(gr.TransientError):
+                gr.run_resilient(
+                    ["sh", "-c", "echo 'Connection refused' >&2; exit 255"],
+                    "probe", retries=3)
+        finally:
+            gr.time.sleep = original
+        self.assertEqual(len(seen), 2, "3 attempts means 2 waits")
+        self.assertGreater(seen[1], seen[0], "backoff must grow")
+
+    def test_success_returns_without_sleeping(self):
+        original = gr.time.sleep
+        gr.time.sleep = lambda s: self.fail("must not sleep on success")
+        try:
+            proc = gr.run_resilient(["sh", "-c", "echo ok"], "probe", retries=5)
+        finally:
+            gr.time.sleep = original
+        self.assertEqual(proc.stdout.strip(), "ok")
+
+
+class TestContentAddressedResume(unittest.TestCase):
+    """Same inputs -> same remote directory, so a re-run collects instead of re-docking."""
+
+    def _pair(self, tmp, receptor=b"REC", ligand=b"LIG"):
+        r = os.path.join(tmp, "r.pdb"); open(r, "wb").write(receptor)
+        l = os.path.join(tmp, "l.sdf"); open(l, "wb").write(ligand)
+        return r, l
+
+    def test_identical_inputs_give_the_same_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r, l = self._pair(tmp)
+            self.assertEqual(gr.job_key(r, l, ["--seed", "42"]),
+                             gr.job_key(r, l, ["--seed", "42"]))
+
+    def test_different_arguments_give_a_different_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r, l = self._pair(tmp)
+            self.assertNotEqual(gr.job_key(r, l, ["--seed", "42"]),
+                                gr.job_key(r, l, ["--seed", "99"]))
+
+    def test_different_content_gives_a_different_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r1, l1 = self._pair(tmp)
+            r2 = os.path.join(tmp, "r2.pdb"); open(r2, "wb").write(b"OTHER")
+            self.assertNotEqual(gr.job_key(r1, l1, []), gr.job_key(r2, l1, []))
+
+
+class TestDetachedLaunch(unittest.TestCase):
+    """The job must outlive its SSH session, or an outage destroys the run."""
+
+    def test_launch_command_detaches_and_records_its_exit_code(self):
+        cmd = gr.build_remote_command("/abs/dir", "r.pdb", "l.sdf",
+                                      ["--seed", "42"], "img:tag", None)
+        self.assertIn("setsid", cmd)
+        self.assertIn("nohup", cmd)
+        self.assertIn("exit_code", cmd)
+        self.assertTrue(cmd.rstrip().endswith("echo launched"))
+        self.assertIn("&", cmd)
+
+    def test_container_mount_uses_an_absolute_path(self):
+        """docker -v rejects a relative path with exit 125."""
+        cmd = gr.build_remote_command("/abs/dir", "r.pdb", "l.sdf", [], "img:tag", None)
+        self.assertIn("-v /abs/dir:/w", cmd.replace("'", ""))
+
+    def test_native_mode_skips_the_container(self):
+        cmd = gr.build_remote_command("/abs/dir", "r.pdb", "l.sdf", [],
+                                      "img:tag", "/opt/gnina")
+        self.assertNotIn("docker", cmd)
+        self.assertIn("/opt/gnina", cmd)
+
+    def test_passthrough_flags_reach_the_binary(self):
+        cmd = gr.build_remote_command("/d", "r.pdb", "l.sdf",
+                                      ["--exhaustiveness", "32"], "img", None)
+        self.assertIn("--exhaustiveness", cmd)
+
+
+class TestKeepAlives(unittest.TestCase):
+    def test_ssh_sets_keepalives(self):
+        """A quiet multi-minute run must not be culled by a NAT idle timeout."""
+        joined = " ".join(gr.ssh_base("u@h", None, None))
+        self.assertIn("ServerAliveInterval", joined)
+        self.assertIn("ServerAliveCountMax", joined)
+
+
 class TestRemotePathHandling(unittest.TestCase):
     def test_tilde_is_stripped_not_quoted(self):
         """shlex.quote('~/x') is literal to the remote shell: it made a dir named '~'."""
