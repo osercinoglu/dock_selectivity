@@ -520,9 +520,9 @@ Same class as 3.5/3.6: behaviour determined by file presence rather than by expl
 |---|---|:--:|---|:--:|
 | Job-folder name is a load-bearing data contract | `batch_dock.py:2211` writes, `parse_prepare.py:359` reads | ✅ | **Highest** — fixed by `job_identity.json` (§3.3) | partly: the codec and the curated tree exist; `batch_dock.py`/`parse_prepare.py` still on the old contract **○** |
 | Universe-widening fallbacks | `extract_alphafold_models.py:214`, `extract_cavities.py:65`, `run_full_workflow.py` (F-C) | ✅ | High — fixed by G8 | **○** in the old scripts; every new script fails closed |
-| `pocketmatch_clustering.py:426` | `help='...'tmux` — stray token; file **does not parse** | ✅ | Medium — the script cannot have run since that edit | **○** |
-| `fix_pdb_files.py` | 0 bytes | ✅ | Low — delete; live script is `fix_required_pdbs.py` | **○** |
-| Duplicated import block | `batch_dock.py:34-47` — `os, sys, pandas, subprocess, re, time, logging` imported twice | ✅ | Low (cosmetic, but a marker of unreviewed edits) | **○** |
+| `pocketmatch_clustering.py:426` | stray `tmux`; file did not parse | ✅ | **FIXED** — G6 lint now asserts every production file parses | **I** |
+| `fix_pdb_files.py` | 0 bytes | ✅ | **DELETED** | **I** |
+| Duplicated import block | `batch_dock.py:34-47` | ✅ | **FIXED** | **I** |
 | Module-level config constants, no CLI | every *old* pipeline script — `extract_cavities.py`, `extract_alphafold_models.py`, `fix_required_pdbs.py`, `convert_pdb_to_pdbqt.py`, `batch_dock.py`, `parse_prepare.py`, `identify_required_structures.py`, `generate_negative_samples.py` have **0 `add_argument` calls between them** | ✅ | Medium — `config.py`/`RunConfig` | **○**; every new script has a full CLI, pins the index by SHA256 and exits non-zero on a missing prerequisite |
 | Absolute paths to one external drive | `parse_prepare.py:39`, `batch_dock.py:77`, `create_ic50_mapping.py:27-31` | ✅ | Medium | **○** |
 | No dependency pinning | no lockfile in repo | ✅ | Medium — compounds F-B | **○** |
