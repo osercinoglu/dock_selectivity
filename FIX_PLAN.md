@@ -1,6 +1,11 @@
 # FIX_PLAN — execution-ready global repository fix
 
-**Status:** pass 2 of N (self-paced hardening loop) — §1–4 specified, §5 outstanding
+**Status:** pass 3 (2026-08-13) — **§1 IMPLEMENTED** (identity module, invariants, checked joins,
+schemas, jobid codec, index builder, and the four new stage scripts). §2 and every §3 edit to an
+**existing** pipeline script remain **outstanding**; §5's support-module list is now largely done and
+its remaining items are named below. `python3 -m unittest discover -s tests -t .` → **605 tests, OK**
+(no failures, no skips), including an end-to-end test that chains Phase 0 → 5 of `REBUILD_PLAN.md`.
+The suite was still growing while this pass was written; re-run it rather than trusting the count.
 **Operational counterpart:** `REBUILD_PLAN.md` — which of these changes must land before each phase of
 the clean-slate rebuild, and the manual runbook for executing it in a new experiment directory.
 **Source:** the *Global Repository Fix Plan* section of `ASSESSMENT_blast_radius_2026_08_12.md`
@@ -9,7 +14,46 @@ against the working tree and the change is specified to the point where it could
 who has not read the assessment.
 
 Legend — **V** verified against code · **S** specified (signature + edit site + invariant + acceptance
-criterion + invalidation) · **○** not yet done in this loop.
+criterion + invalidation) · **I** implemented and tested in the working tree · **○** not yet done.
+
+---
+
+## Implementation ledger — what exists in the tree as of 2026-08-13
+
+Everything below is **new code**. **No existing pipeline script has been modified.** The strategy that
+emerged: rather than patch the old scripts in place for the identity fix, the rebuild path is carried by
+new stage scripts that consume and produce declared schemas, and the old scripts are edited later (or
+retired) on their own schedule.
+
+| Item | Where | Status |
+|---|---|:--:|
+| §1 `IdentityIndex` / `Protein` / `Resolution` | `dock_selectivity/identity.py` | **I** |
+| §1 index builder, G1–G5/G7 asserted at build, sole network consumer | `build_identity_index.py` | **I** |
+| §5 `invariants.py` — collapse-factor, total-accounting, no-row-growth, determinism, self-consistent-labels, unique-key | `dock_selectivity/invariants.py` | **I** |
+| §5 `checked_merge()` | `dock_selectivity/joins.py` | **I** |
+| §5 `schemas.py` — the seven manifests + `read_checked`/`write_checked` | `dock_selectivity/schemas.py` | **I** |
+| §5 `jobid.py` — `__`-delimited codec, `job_identity.json` I/O, right-anchored legacy parser | `dock_selectivity/jobid.py` | **I** |
+| §3.1 identity half — Entrez-only resolution of the edge list | **new** `resolve_interactions.py` | **I** (the edit to `identify_required_structures.py` itself is still **○**) |
+| §3.2 balanced sampler with an accession-space avoid-list | **new** `sample_negatives.py` | **I** (`generate_negative_samples.py` untouched, **○**) |
+| §2 relabel path / job classification | **new** `salvage_scan.py` | **I** |
+| §3.3 new naming scheme + `job_identity.json` writer (curation side) | **new** `curate_jobs.py` | **I** (`batch_dock.py` itself is still **○**) |
+| §5 read-only auditor (test tier 4) | **new** `audit.py` | **I** |
+| §2 delete `prepare_uniprot_mapping.py` + G6 grep lint | — | **○** |
+| §3.1 `identify_required_structures.py` | — | **○** |
+| §3.2 `generate_negative_samples.py` | — | **○** |
+| §3.3 `batch_dock.py` (`:2034`, `:2211`, post-job cleanup hook) | — | **○** |
+| §3.4 `parse_prepare.py` (all five defects) | — | **○** |
+| §3.5 `extract_cavities.py` | — | **○** |
+| §3.6 `extract_alphafold_models.py` | — | **○** |
+| §3.7 `create_ic50_mapping.py` (coverage lift only; not corrupt) | — | **○** |
+| §3.8 `run_full_workflow.py` | — | **○** |
+| **`positives_planned.csv` producer** — nothing writes it; blocks `REBUILD_PLAN` Phases 3 and 5 | — | **○ (new gap, see §5)** |
+| **`run_manifest.csv` assembler** — `curate_jobs.py --manifest-out` covers salvaged jobs only | — | **○ (new gap, see §5)** |
+
+**Consequence for the rebuild:** `REBUILD_PLAN.md` Phases 0–5 are carried by implemented code; **Phases
+6, 7 and 8 are blocked purely on the ○ rows above** — `extract_*.py`, `batch_dock.py` and
+`parse_prepare.py` have **zero `add_argument` calls between them** and cannot accept the `--required` /
+`--queue` / `--run-dir` arguments those phases pass.
 
 ---
 
@@ -68,7 +112,7 @@ first act of any rebuild is to record the revision that produced it.
 
 ---
 
-## 1. Root fix — `IdentityIndex` **V/S**
+## 1. Root fix — `IdentityIndex` **V/S/I — IMPLEMENTED**
 
 ### The law
 
@@ -114,42 +158,131 @@ class IdentityIndex:
 `Resolution` is the load-bearing type: it makes `.get(gene)` + `if not x: continue` (items 5 and 7)
 impossible to write without also deciding where the rejected row is recorded.
 
+**As implemented** (`dock_selectivity/identity.py`), with Python 3.9 syntax (`Optional`/`Tuple`, no
+`X | Y` unions) and four additions to the sketch above:
+
+- `Protein.has_symbol(symbol)` — the `(accession, gene)` pair-validity check, i.e. the `KNOWN_ISSUE`
+  regression assertion as a method.
+- `Resolution` carries `key` (the echoed input, so a reject row identifies itself) and `candidates`
+  (the accessions, when `AMBIGUOUS`). Both default, so positional construction per the sketch still
+  works. `__post_init__` rejects the incoherent states: non-`OK` without a reason, non-`OK` carrying a
+  protein, `OK` without one. `as_reject_row()` emits the `unresolved_targets.csv` row.
+- `IdentityIndex.load(path, expect_sha256=...)` implements the pin; `file_sha256()` is exported for the
+  builder and the auditor. `from_frame`/`to_frame` give a canonical, order-stable frame.
+- `by_entrez` raises **`InvariantViolation`, not `KeyError`**, when an Entrez id carries more than one
+  accession — deliberately, so a caller's `except KeyError: continue` cannot swallow a broken index.
+  `resolve_entrez` reports the same situation as `status='AMBIGUOUS'` with `candidates` populated.
+
+`OBSOLETE` needs input the parquet schema does not carry: pass `obsolete_entrez={id: reason}` to
+`load`/`from_frame`. Without it a retired id resolves as `UNKNOWN` — still recorded with a reason, never
+dropped.
+
+**A defect found and closed during this pass.** `identity.py` originally declared its *own*
+`class InvariantViolation(Exception)` instead of importing the canonical one from `invariants.py`, so
+`identity.InvariantViolation is not invariants.InvariantViolation`: a stage catching only one let the
+other escape as a traceback. It is **fixed** — `identity.py:81` now reads
+`from .invariants import InvariantViolation`, verified
+(`identity.InvariantViolation is invariants.InvariantViolation` → `True`), and the self-clearing test
+`tests/test_invariants.py::TestExceptionHierarchy::test_identity_module_shares_the_canonical_exception`
+now asserts rather than skips.
+
+Residual, harmless: three stage scripts still carry a two-class `except` tuple written while the split
+existed — `resolve_interactions.INVARIANT_ERRORS`, `salvage_scan.FATAL_ERRORS`,
+`sample_negatives.IDENTITY_ERRORS`. They are now redundant, not wrong, and each has a test that keeps
+passing either way. Collapse them opportunistically; **`invariants.py` is the single canonical home**,
+and any new stage should import from there and nowhere else.
+
 ### Invariants established (asserted at index build, not aspirations)
 
-| ID | Guarantee | Enforcement |
-|---|---|---|
-| G1 | One row per accession | assert at build |
-| G2 | No silent drops: `n_in == n_resolved + n_rejected`, rejects written to `unresolved_targets.csv` with a reason | assert at build |
-| G3 | Deterministic — no `set()` iteration, no insertion-order dependence, no `drop_duplicates` over an unordered concat; all tie-breaks total (reviewed > unreviewed → in-AF-proteome > not → lowest accession) | subprocess test under 3 `PYTHONHASHSEED` values |
-| G4 | `primary_symbol ∈ symbols`; `entrez(accession(e)) == e` | assert at build |
-| G5 | `entrez → accession` collapse factor **exactly 1** | assert `max_collapse == 1` |
-| G6 | No free-text identifier search anywhere in the codebase | grep lint in CI |
-| G7 | Isoform accessions (`P12345-2`) and non-human excluded | assert at build |
+| ID | Guarantee | Enforcement | Status |
+|---|---|---|:--:|
+| G1 | One row per accession | `assert_unique_key(frame, ['accession'])` at build | **I** |
+| G2 | No silent drops: `n_in == n_resolved + n_rejected`, rejects written to `unresolved_targets.csv` with a reason | `assert_total_accounting` on **both** axes; `n_in` counted from the *source*, never from the output | **I** |
+| G3 | Deterministic — no `set()` iteration, no insertion-order dependence, no `drop_duplicates` over an unordered concat; all tie-breaks total (reviewed > unreviewed → in-AF-proteome > not → lowest accession) | `assert_deterministic` in-process; `--check-determinism` re-runs the whole build under `PYTHONHASHSEED` 0/1/42 | **I** |
+| G4 | `primary_symbol ∈ symbols`; `entrez(accession(e)) == e` | `assert_self_consistent_labels` against the **raw source symbols** (independent of the frame) + an explicit round-trip | **I** |
+| G5 | `entrez → accession` collapse factor **exactly 1** | `assert_collapse_factor_one` on the *pairs*, before any dict is built | **I** |
+| G6 | No free-text identifier search anywhere in the codebase | grep lint in CI | **○** — the new code issues no search and imports no `bioservices`, but the lint itself does not exist |
+| G7 | Isoform accessions (`P12345-2`) and non-human excluded | at parse *and* at assembly; plus `IdentityIndex.assert_self_consistent` | **I** |
+| G8 | No `except` / `if not exists` branch may widen a stage's input set | per-stage; a missing prerequisite raises | **I** in every new script |
 
 G5 is the specific guarantee whose absence caused the incident: the old map had mean collapse 2.55, max 9.
 
-### Acceptance criteria
+**Two build-time subtleties worth carrying forward.** (a) An Entrez collision does **not** fail the build
+by default — it is *resolved* by the documented total tie-break and every demotion is recorded;
+`--on-entrez-collision fail` is the strict mode, and it would refuse every real build, because UniProt
+genuinely contains TrEMBL twins of Swiss-Prot entries. (b) The two ledgers are separate on purpose:
+`unresolved_targets.csv` lists only what is **not** in the index (so `n_rejected == len(that file)` is
+satisfiable), while decisions about rows that **are** in it — an accession demoted to a null
+`entrez_id`, an orphaned GeneID, an accession-fallback label — go to `identity_index.notes.csv`.
 
-- `AVPR2 → P30518` (not Q8NCT1); `TUBA1B → P68363` (not Q13509); `IL2 → P60568` (not P01589).
-- `cardinality_report()['max_collapse'] == 1`.
-- Two builds under different `PYTHONHASHSEED` produce byte-identical `identity_index.parquet`.
-- The regression assertion from `KNOWN_ISSUE.md` passes on the emitted index.
+### Acceptance criteria — all met
+
+- `AVPR2 → P30518` (not Q8NCT1); `TUBA1B → P68363` (not Q13509); `IL2 → P60568` (not P01589). ✅ verified by `audit.py identity`, which also asserts the *impostors no longer claim those symbols*.
+- `cardinality_report()['max_collapse'] == 1`. ✅ — note the auditor asserts `<= 1`, because a `REDUCED_LOCAL` index carries no Entrez ids at all and reports 0.
+- Two builds under different `PYTHONHASHSEED` produce byte-identical `identity_index.parquet`. ✅ (`--check-determinism`; the unit tests assert it directly).
+- The regression assertion from `KNOWN_ISSUE.md` passes on the emitted index. ✅ — and is re-applied downstream to `interactions_resolved.csv`, `positives_planned.csv`, `negatives_pool.csv` and every curated job directory.
 
 ### Inputs to obtain (one manual fetch, checksummed, then offline forever)
 
-`ls /opt/data` confirms no id-mapping file exists locally today.
+**Re-checked 2026-08-13: none of the three authoritative inputs is present locally.** `/opt/data`
+contains `alphafold2/`, `cavity_space/`, `drugbank/`, `experiments/`, `multiscale_interactome_data/`,
+`ttd/` — no id-mapping file, no proteome FASTA, no HGNC table. **The fetch is still the operator's one
+manual step, and it is the single thing blocking `REBUILD_PLAN` Phase 1.**
 
 | File | Source | Provides | Status |
 |---|---|---|---|
-| `HUMAN_9606_idmapping.dat.gz` | UniProt FTP `knowledgebase/idmapping/by_organism/` | accession ↔ GeneID, Gene_Name, Gene_Synonym | **required** |
-| `UP000005640_9606.fasta.gz` | UniProt reference proteomes | review status, canonical one-per-gene set | **required** (tie-break) |
-| `hgnc_complete_set.txt` | HGNC | prev/alias symbols, withdrawn detection, cross-check | recommended |
-| `/opt/data/alphafold2/UP000005640_9606_HUMAN_v4.tar` | already local | dockable-accession universe | present |
+| `HUMAN_9606_idmapping.dat.gz` | UniProt FTP `knowledgebase/idmapping/by_organism/` | accession ↔ GeneID, Gene_Name, Gene_Synonym | **required — ABSENT** |
+| `UP000005640_9606.fasta.gz` | UniProt reference proteomes | review status, canonical one-per-gene set | **required** (tie-break) — **ABSENT** |
+| `hgnc_complete_set.txt` | HGNC | prev/alias symbols, withdrawn detection, cross-check | recommended — **ABSENT** |
+| `/opt/data/alphafold2/UP000005640_9606_HUMAN_v4.tar` | already local | dockable-accession universe | present (structures, **not** the proteome FASTA) |
+
+`build_identity_index.py --fetch` downloads them (URLs are in `SOURCE_SPECS`), or they can be fetched by
+hand and passed with `--idmapping` / `--proteome` / `--hgnc`; an explicitly supplied path is never
+fetched over, and a cached file is reused unless `--refresh`. A **required** input that cannot be
+downloaded is fatal; the declared-optional HGNC is a recorded note, because it contributes only
+synonyms, a tie-break hint and a cross-check and cannot add or remove an accession.
 
 `build_identity_index.py` is the **sole network consumer**, run manually, refusing to re-fetch without
 `--refresh`. It emits `identity_index.parquet` + `identity_index.meta.json` (source URLs, UniProt
-release, per-file SHA256, row counts, build timestamp, invariant report). Every downstream entrypoint
-pins that SHA256 and refuses to run against an unexpected index.
+release, per-file SHA256, row counts, accounting, invariant report — and no build timestamp inside the
+parquet, so the artifact stays byte-reproducible). Provenance is stamped **inside the parquet itself**,
+not only in the sidecar, because downstream code calls `IdentityIndex.load(path)` and may never open the
+meta; `read_index_provenance(path)` returning `None` means *untrusted*, not authoritative. Every
+downstream entrypoint pins the SHA256 and refuses to run against an unexpected index.
+
+#### `REDUCED_LOCAL` — the offline path, and exactly what it cannot do
+
+`--from-legacy-gene-names $OLD/uniprot_gene_mapping.csv` builds an index from the **trustworthy**
+`Gene Names` column of the legacy file. The corrupt `Mapped_Gene_Name` column is not in the loader's
+column list, so it is never read. **Verified end-to-end on the real file (2026-08-13): 4,585 records,
+0 rejects, 2 recorded notes, `max_collapse = 0`, and `audit.py identity` reports 12/12 PASS, exit 0.**
+It is stamped `REDUCED_LOCAL` in the parquet so it cannot be mistaken for the real thing.
+
+Three limitations, the first of which is decisive:
+
+1. **It carries no Entrez ids** (0 of 4,585) unless `--hgnc` is supplied — and reduced mode never
+   fetches, so HGNC must be downloaded by hand. Since §3.1's whole point is that resolution runs on
+   Entrez, `resolve_interactions.py` against such an index resolves **0 of 8,568 edges** (measured; all
+   `UNKNOWN_ENTREZ`) **and still exits 0 with an empty manifest**. Any stage consuming that manifest
+   would treat the entire campaign as non-interactions. Assert a non-empty output, not an exit code.
+2. **The universe is capped at the 4,585 accessions the corrupt free-text search happened to return.**
+   Per `KNOWN_ISSUE`, that query list was the drug-target gene set, so no other protein is reachable
+   through it; per `ASSESSMENT` §1c only 1,567/1,958 genes (80.03%) are repairable from this file, 391
+   need external re-derivation and 12 are absent entirely. It is therefore adequate for re-deriving the
+   salvage arithmetic (which was computed in exactly this universe) and **inadequate for choosing the
+   canonical accession of a new docking job** — i.e. for the entire re-dock gap.
+3. Without `--proteome`, `reviewed` is `False` on every row and means *unknown*. It is recorded as such
+   in `meta["row_counts"]["review_status_source"]`; do not read that column as a Swiss-Prot claim.
+
+163 of the 4,585 legacy rows have an empty `Gene Names`; where no source names the gene, `primary_symbol`
+falls back to the accession itself and the row is recorded in `identity_index.notes.csv` (2 rows on the
+real file: P0DOX5, Q96FB2). A blank label is what lets a join match the wrong thing, so it is never left
+blank.
+
+**Not verified against the real UniProt files.** The idmapping/proteome/HGNC parsers are exercised only
+against synthetic fixtures of the documented formats. Run the first authoritative build **without**
+`--strict-cross-check`, read `meta["invariants"]`, then decide whether to make the `GN=` cross-check
+fatal.
 
 ### Invalidates
 
@@ -159,7 +292,7 @@ recovered from the accession in the folder name, which is physical truth.
 
 ---
 
-## 2. `prepare_uniprot_mapping.py` — retire, do not patch **V/S**
+## 2. `prepare_uniprot_mapping.py` — retire, do not patch **V/S ○ — NOT DONE**
 
 Three independent defects, none patchable in place, because the *direction* of resolution is wrong:
 
@@ -177,8 +310,11 @@ the commit message. Add the G6 grep lint so a free-text resolver cannot reappear
 ## 3. Item-by-item change list
 
 Specified in pass 1: items 3, 5, 6, 7 (identity call sites), 8, 9, 10, 11, 12 (parse_prepare defects).
+**Pass 3 note:** for the clean-slate rebuild, 3.1's identity half, 3.2 and 3.3's curation half are
+delivered as **new scripts** rather than as edits to the old ones (see the implementation ledger). The
+edits below remain owed by the old scripts themselves, which are still on the legacy path.
 
-### 3.1 `identify_required_structures.py` **V/S**
+### 3.1 `identify_required_structures.py` **V/S ○** — identity half delivered as `resolve_interactions.py` **I**
 
 - **`:170`** — replace `gene_to_uniprot.get(gene)` with `index.resolve_entrez(row.node_2)`; branch on
   `Resolution.status`; append every non-`OK` to `unresolved_targets.csv` with its reason. Iterate the
@@ -189,7 +325,27 @@ Specified in pass 1: items 3, 5, 6, 7 (identity call sites), 8, 9, 10, 11, 12 (p
   pair satisfies `Gene_Name ∈ index.by_accession(UniProt_ID).symbols` — currently false for 65.11% of rows.
 - **Invalidates:** `required_structures.csv` and everything downstream of it.
 
-### 3.2 `generate_negative_samples.py` **V/S**
+**Delivered instead (new file, old script untouched):** `resolve_interactions.py` emits
+`manifests/interactions_resolved.csv` (schema `interactions_resolved`) plus a rejects ledger with an
+`axis` column, resolving the protein axis **only** through `resolve_entrez`. Three things it added
+beyond the spec, all of which the old script would also need:
+
+- **The compound axis, which was never verified at all.** 222 of the 8,568 `node_1` values are name
+  slugs. A `CompoundIndex` resolves them by *normalised exact* matching against DrugBank's own
+  vocabulary and returns `AMBIGUOUS` — never a pick — when a name belongs to more than one entry
+  (`L-Arginine` is DB17289's common name *and* DB00125's synonym). Name tiers are **pooled, not ranked**;
+  `--prefer-common-name` opts into ranking explicitly.
+- **Accounting has three terms, not two.** `n_in == n_resolved + n_rejected` **and**
+  `n_output_rows == n_resolved − n_duplicate_edges_collapsed`; 38 real edges name the same compound twice
+  (`DB00155` and `L-Citrulline`) and collapse onto the declared primary key, with the survivor's
+  `selected_by` naming every contributing edge row.
+- **`NOT_SMALL_MOLECULE` is a reject, not a flag** — 554 edges / 156 DrugBank IDs. `--drugs` is required
+  and must carry `Drug Type`, so a plain id list cannot silently widen the compound universe.
+
+**Still owed by this item:** the *structure-planning* half — `positives_planned.csv`, the demand-side
+expansion of the resolved edges over cavities and ligand availability. See §5.
+
+### 3.2 `generate_negative_samples.py` **V/S ○** — delivered as `sample_negatives.py` **I**
 
 - **`:190`** — same `Resolution` conversion as above.
 - **`:303-319`** — the known-interaction avoid-list must be built in accession space from Entrez, not from
@@ -201,7 +357,26 @@ Specified in pass 1: items 3, 5, 6, 7 (identity call sites), 8, 9, 10, 11, 12 (p
   *accession* space, not label space.
 - **Invalidates:** `required_structures_with_negatives.csv`.
 
-### 3.3 `batch_dock.py` **V/S**
+**Delivered instead (new file, old script untouched):** `sample_negatives.py`. Four defects of the old
+sampler are structurally absent rather than patched:
+
+- **`:561-566` is gone.** That branch, once no target still needed negatives, drew from *any* available
+  target — silently abandoning the target-side quota. It is the same universe-widening pattern G8 bans,
+  and including it inflates apparent feasibility. There is no equivalent.
+- **Eligibility is computed, not assumed.** A target (or drug) with zero corrected positives must receive
+  zero negatives, so the pool is filtered to structurally eligible entries *before* drawing, with every
+  exclusion written out with its reason. At real scale only **8,063 of 16,873** pool jobs (47.8%) are
+  eligible — see `REBUILD_PLAN.md` §1.2.
+- **No duplicate pockets.** `np.random.choice` over cavities could emit the same job twice; a pair is now
+  handed each pocket at most once, so the primary key is unique by construction.
+- **The balance unit is explicit** (`--balance-unit job|pair`) and recorded in the report and in every
+  `selected_by`. The old code balanced cavity rows, which produced 3.38 cavities/pair on positives
+  against 1.36 on negatives (`REBUILD_PLAN.md` §1.2.4).
+
+The pocket universe is `positives_planned ∪ pool` per accession — deliberately no `cavity_mapping.csv`
+input and no "every cavity on disk" fallback (G8).
+
+### 3.3 `batch_dock.py` **V/S ○** — curation half delivered as `curate_jobs.py` **I**
 
 - **`:2034`** — delete the `dict(zip(...))` fallback resolver. `batch_dock.py` must consume a plan that
   already carries accessions and must never resolve identity itself.
@@ -215,7 +390,30 @@ Specified in pass 1: items 3, 5, 6, 7 (identity call sites), 8, 9, 10, 11, 12 (p
 - **Invalidates:** nothing existing — new jobs only. Existing jobs get `job_identity.json` backfilled by
   the relabel path (assessment §2), which is where the 24,173 completed jobs are rescued.
 
-### 3.4 `parse_prepare.py` **V/S**
+**Delivered for the salvage path (new files, `batch_dock.py` untouched):** `dock_selectivity/jobid.py`
+is the codec — `format_job_dir` / `parse_job_dir` / `parse_legacy_job_dir` /
+`write_job_identity` / `read_job_identity` — and `curate_jobs.py` writes the curated tree. Decisions
+`batch_dock.py` must match when §3.3 finally lands:
+
+- Name is `DB00035__P30518__AVPR2__F1__cav2`; the null-gene sentinel is `-`, **never** `nan`. The old
+  blank-gene path produced 10,698 `*_nan_*` directories.
+- `fragment_id` is **required** to build a name, and `jobid.py` refuses to infer it. The "missing token
+  means F1" inference is a caller's explicit, logged, per-row-recorded choice
+  (`curate_jobs.py --assume-fragment`, `salvage_scan.py --default-fragment`). An *inferred* fragment is
+  the class of bug that caused the 410,087-row fan-out.
+- `parse_job_dir` will **not** fall back to `parse_legacy_job_dir` (or vice versa), and
+  `read_job_identity` will **not** fall back to parsing the directory name. Callers choose the scheme.
+- `job_identity.json` carries no timestamp, so a curated tree is byte-identical across runs.
+- A new-name collision fails the run by default. Two old directories can claim one new name when they
+  differ only in the gene token (`DB00035_AVPR2_Q8NCT1_cavity_2` vs `DB00035_ARRDC4_Q8NCT1_cavity_2`);
+  picking one would be the last-wins collapse this whole plan exists to eliminate.
+
+**Still owed by this item:** everything on the *docking* side — deleting the `:2034` resolver, consuming
+a plan that already carries accessions, writing `job_identity.json` at job creation, an actual CLI, and
+the post-job hook that discards or `xz`-compresses `complex_*.pdb` once `final_results.csv` exists.
+`batch_dock.py` has **no `argparse` at all** today, which is why `REBUILD_PLAN` Phase 7 cannot run.
+
+### 3.4 `parse_prepare.py` **V/S ○**
 
 | Site | Change | Invariant | Acceptance |
 |---|---|---|---|
@@ -228,9 +426,17 @@ Specified in pass 1: items 3, 5, 6, 7 (identity call sites), 8, 9, 10, 11, 12 (p
 **Invalidates:** `combined_filtered_annotated_docking_results.parquet` — rebuild required. Note F-B: do
 not expect the rebuild to reproduce the current file.
 
+**Tools now available for these five edits, so none of them needs new machinery:**
+`dock_selectivity.joins.checked_merge()` for `:1171`; `dock_selectivity.jobid.parse_job_dir` /
+`parse_legacy_job_dir` for `:359`; `dock_selectivity.schemas.read_checked` against the `run_manifest`
+schema for `:146`; `invariants.assert_no_row_growth` and `assert_unique_key` for the rest. **Do not call
+`checked_merge` inside a per-job loop** — it costs roughly 2× a bare merge (measured 3.9 s vs 1.8 s on
+2M rows × 4 key columns), which is fine per stage and not fine per job. Likewise
+`assert_self_consistent_labels` iterates rows in Python: correct at 8k rows, wrong at 16.5M.
+
 ---
 
-### 3.5 `extract_cavities.py` — the 76.6 GB over-extraction **V/S**
+### 3.5 `extract_cavities.py` — the 76.6 GB over-extraction **V/S ○**
 
 **Verified:** `:34` `CAVITY_TARBALL_FOLDER = "/opt/data/cavity_space/af_strong_cavities_data_all"`;
 `:65` `tar_files = [f for f in os.listdir(cavity_tarball_folder) if f.endswith(".tar.gz")]`.
@@ -250,7 +456,7 @@ mapping must exist before the required set can be computed. But the mapping need
   `cavity_mapping.csv` is byte-identical to the manifest built without unpacking.
 - **Invalidates:** nothing. Existing `extracted_cavities/` is a superset and stays usable.
 
-### 3.6 `extract_alphafold_models.py` — the 5,661-vs-979 over-extraction **V/S**
+### 3.6 `extract_alphafold_models.py` — the 5,661-vs-979 over-extraction **V/S ○**
 
 **Verified:** `load_required_structures()` at `:194`. Correction to the draft plan: the fallback is
 **not silent** — `:230` logs `logging.warning("Using all cavity structures - for efficiency, run
@@ -275,7 +481,7 @@ that *silently substitutes a different scientific universe* when its preferred i
 pattern — a missing prerequisite is an error, never a fallback. G8: no `except`/`if not exists` branch may
 widen a stage's input set.
 
-### 3.7 `create_ic50_mapping.py` — clean, keep **V/S**
+### 3.7 `create_ic50_mapping.py` — clean, keep **V/S ○**
 
 **Verified `:84`:** `mapping = dict(zip(df['Entry Name'].to_list(), df['Entry'].to_list()))`. It uses the
 `Entry Name → Entry` bijection (4,585 → 4,585, zero collisions) and never touches `Mapped_Gene_Name`.
@@ -287,7 +493,7 @@ widen a stage's input set.
   ceiling; the 118 entries with multi-value separators are parsed rather than discarded.
 - **Invalidates:** nothing. Regeneration is additive — existing rows keep their values.
 
-### 3.8 `run_full_workflow.py` **V/S**
+### 3.8 `run_full_workflow.py` **V/S ○**
 
 **Verified — new finding F-C:** the runner invokes seven scripts (`:95, :103, :111, :119, :127, :135,
 :167`). **`generate_negative_samples.py` is not among them.** A repo-wide grep finds it referenced only
@@ -308,22 +514,67 @@ Same class as 3.5/3.6: behaviour determined by file presence rather than by expl
 
 ## 4. Structural debt — verified **V**
 
-| Item | Citation | Verified | Risk |
-|---|---|:--:|---|
-| Job-folder name is a load-bearing data contract | `batch_dock.py:2211` writes, `parse_prepare.py:359` reads | ✅ | **Highest** — fixed by `job_identity.json` (§3.3) |
-| Universe-widening fallbacks | `extract_alphafold_models.py:214`, `extract_cavities.py:65`, `run_full_workflow.py` (F-C) | ✅ | High — fixed by G8 |
-| `pocketmatch_clustering.py:426` | `help='...'tmux` — stray token; file **does not parse** | ✅ | Medium — the script cannot have run since that edit |
-| `fix_pdb_files.py` | 0 bytes | ✅ | Low — delete; live script is `fix_required_pdbs.py` |
-| Duplicated import block | `batch_dock.py:34-47` — `os, sys, pandas, subprocess, re, time, logging` imported twice | ✅ | Low (cosmetic, but a marker of unreviewed edits) |
-| Module-level config constants, no CLI | every pipeline script | ✅ | Medium — `config.py`/`RunConfig` |
-| Absolute paths to one external drive | `parse_prepare.py:39`, `batch_dock.py:77`, `create_ic50_mapping.py:27-31` | ✅ | Medium |
-| No dependency pinning | no lockfile in repo | ✅ | Medium — compounds F-B |
+| Item | Citation | Verified | Risk | Status |
+|---|---|:--:|---|:--:|
+| Job-folder name is a load-bearing data contract | `batch_dock.py:2211` writes, `parse_prepare.py:359` reads | ✅ | **Highest** — fixed by `job_identity.json` (§3.3) | partly: the codec and the curated tree exist; `batch_dock.py`/`parse_prepare.py` still on the old contract **○** |
+| Universe-widening fallbacks | `extract_alphafold_models.py:214`, `extract_cavities.py:65`, `run_full_workflow.py` (F-C) | ✅ | High — fixed by G8 | **○** in the old scripts; every new script fails closed |
+| `pocketmatch_clustering.py:426` | `help='...'tmux` — stray token; file **does not parse** | ✅ | Medium — the script cannot have run since that edit | **○** |
+| `fix_pdb_files.py` | 0 bytes | ✅ | Low — delete; live script is `fix_required_pdbs.py` | **○** |
+| Duplicated import block | `batch_dock.py:34-47` — `os, sys, pandas, subprocess, re, time, logging` imported twice | ✅ | Low (cosmetic, but a marker of unreviewed edits) | **○** |
+| Module-level config constants, no CLI | every *old* pipeline script — `extract_cavities.py`, `extract_alphafold_models.py`, `fix_required_pdbs.py`, `convert_pdb_to_pdbqt.py`, `batch_dock.py`, `parse_prepare.py`, `identify_required_structures.py`, `generate_negative_samples.py` have **0 `add_argument` calls between them** | ✅ | Medium — `config.py`/`RunConfig` | **○**; every new script has a full CLI, pins the index by SHA256 and exits non-zero on a missing prerequisite |
+| Absolute paths to one external drive | `parse_prepare.py:39`, `batch_dock.py:77`, `create_ic50_mapping.py:27-31` | ✅ | Medium | **○** |
+| No dependency pinning | no lockfile in repo | ✅ | Medium — compounds F-B | **○** |
+| **No `.gitignore`** | repo root | ✅ | Low — `__pycache__/` appears untracked after every test run | **○** (new) |
 
 ---
 
-## 5. Remaining for subsequent passes ○
+## 5. Remaining work ○
 
-- Support modules: `checked_merge()`, `invariants.py`, `schemas.py`, `config.py`, `jobid.py` — API specs.
-- Test tiers 0–4 (mechanical gates → pure-function units → golden files → e2e smoke → read-only auditor).
+### 5.1 Done since pass 2 (was: "support modules")
+
+`checked_merge()`, `invariants.py`, `schemas.py`, `jobid.py` are **implemented and tested**, and the
+read-only auditor (test tier 4) is `audit.py`. **All five test tiers now exist** as 605 hermetic
+`unittest` tests (tempfile fixtures only; no network, no external drive, no `/opt/data`) — tier 3, the
+e2e smoke, is `tests/test_end_to_end.py`, which chains `build_identity_index` → `resolve_interactions`
+→ `salvage_scan` → `sample_negatives` → `curate_jobs` → `audit.py run` over a synthetic universe built
+from the incident's real identifiers. They cover the specific regression classes this incident demands:
+last-wins collapse impossible, byte-identical output across `PYTHONHASHSEED`, a silent fallback raising
+instead of widening, a merge not changing row count, a parse handling hyphenated symbols and legacy
+multi-fragment names, and an unresolved input recorded with a reason rather than dropped.
+
+`config.py` / `RunConfig` is **not** done and is the one support module still owed from that list.
+
+### 5.2 New gaps found while implementing — these block the rebuild
+
+1. **Nothing produces `manifests/positives_planned.csv`.** `sample_negatives.py` and `curate_jobs.py`
+   both require it; without it Phases 3 and 5 cannot run. It is the demand-side expansion of
+   `interactions_resolved.csv` over cavities and ligand availability — schema `positives_planned`, key
+   `(drugbank_id, accession, fragment_id, cavity_index)`, `gene` non-null and `= index.label(accession)`,
+   `selected_by` non-null. Expected size 5,287 pairs → **18,166 rows**. Either the §3.1 rewrite emits it,
+   or a new `plan_positives.py` does. The same producer should emit the **positive half** of
+   `redock_queue.csv` (10,866 jobs).
+2. **Nothing assembles `manifests/run_manifest.csv`.** `curate_jobs.py --manifest-out` writes only the
+   jobs it materialised (`provenance='salvaged_from'`); the `newly_docked` half has to be derived from
+   `redock_queue.csv` and concatenated. `audit.py run` already asserts the union equals
+   `positives_planned ∪ negatives_drawn`.
+3. ~~`identity.py` must adopt the canonical `InvariantViolation`.~~ **Done during this pass** (§1). The
+   three redundant two-class `except` tuples can be collapsed opportunistically.
+4. **G6's grep lint does not exist.** No new code imports `bioservices` or issues a free-text search, but
+   nothing prevents one reappearing. `grep -rn "get_df\|bioservices" *.py` returning nothing outside
+   tests is the check; it needs a home.
+5. **`schemas.py`'s `negatives_pool` docstring still quotes 16,868 / 11,796.** The correct figures are
+   **16,873 / 11,801** (`REBUILD_PLAN.md` §1.1). Cosmetic — the schema itself is unaffected — but it is a
+   number a reader will trust.
+
+### 5.3 Still outstanding from pass 2
+
 - Full sequencing with the artifact-invalidation matrix.
-- The compound axis: 222 rows in `1_drug_to_protein.tsv` `node_1` are name slugs, not DrugBank IDs — needs its own verification pass.
+- The compound axis: 222 rows in `1_drug_to_protein.tsv` `node_1` are name slugs, not DrugBank IDs.
+  **Partly closed** — `resolve_interactions.py` resolves 143 of them against the DrugBank vocabulary and
+  rejects the rest with a reason; the 35 unresolved are salt/ester forms (`fludrocortisone-acetate`,
+  `omeprazole-magnesium`, `haloperidol-decanoate`, `gentamycin`, `ftorafur`) that need a **curated alias
+  table**, not a looser matcher. Every one is in the rejects ledger with its normalised form, which is the
+  input to building that table. Note also `jobid.parse_legacy_job_dir` splits a legacy directory name on
+  `_` and takes token[0] as the drug; a name-slug drug containing `_` would bleed into the gene label. No
+  such directory exists in `$OLD`, but if the compound axis ever produces one, the parser needs a
+  `known_drug_ids` longest-prefix match.
