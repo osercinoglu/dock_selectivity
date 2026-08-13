@@ -19,6 +19,7 @@ Output:
     - cavity_mapping.csv: CSV file mapping UniProt IDs to extracted cavities
 """
 
+import argparse
 import os
 import sys
 import pandas as pd
@@ -147,6 +148,237 @@ def extract_cavity_paths_from_tarballs(cavity_tarball_folder, extract_base_dir="
     logging.info(f"Extraction statistics: {extracted_count} tarballs extracted, {skipped_count} tarballs skipped (already present)")
     return cavity_info
 
+TARBALL_RE = re.compile(
+    r'^AF-(?P<accession>[A-Z0-9]+)-F(?P<fragment>\d+)-model_v\d+_cavity_result_(?P<cavity>\d+)\.tar\.gz$'
+)
+
+
+def parse_tarball_name(filename):
+    """Derive ``(accession, fragment_id, cavity_index)`` from a tarball's NAME.
+
+    ``AF-B4DS77-F1-model_v1_cavity_result_2.tar.gz`` describes cavity 2 of
+    fragment F1 of B4DS77, and the member it holds is
+    ``AF-B4DS77-F1-model_v1_cavity_2.pdb``. The campaign's own log confirms the
+    relation is one-to-one: 38,709 tarballs produced 38,709 cavity rows.
+
+    That is what makes :func:`build_cavity_manifest` possible without unpacking,
+    which is the whole 76.6 GB saving -- the old code unpacked all 38,709 tarballs
+    because the required set could not be computed until the mapping existed, and
+    the mapping was (wrongly) believed to require unpacking.
+
+    Returns ``None`` for a name that does not match, so the caller can count and
+    report unparseable tarballs rather than silently skipping them.
+    """
+    match = TARBALL_RE.match(os.path.basename(filename))
+    if not match:
+        return None
+    return (
+        match.group('accession'),
+        'F%s' % int(match.group('fragment')),
+        int(match.group('cavity')),
+    )
+
+
+def build_cavity_manifest(cavity_tarball_folder, verify_members=False):
+    """Build the cavity manifest from tarball NAMES. Unpacks nothing.
+
+    Args:
+        cavity_tarball_folder: folder of ``*.tar.gz`` cavity archives.
+        verify_members: open each archive and confirm it really holds the cavity
+            the name advertises. Correct but slow (38,709 gzip opens); off by
+            default because the naming relation is one-to-one and verified.
+
+    Returns:
+        ``(DataFrame, stats)`` where the frame carries UniProt_ID, Fragment_ID,
+        Cavity_Index, Tarball, Pocket_PDB (the path extraction *would* produce),
+        sorted so the output is byte-identical across runs and hash seeds.
+    """
+    if not os.path.isdir(cavity_tarball_folder):
+        raise NotADirectoryError(
+            "cavity tarball folder not found: %r" % cavity_tarball_folder
+        )
+
+    names = sorted(f for f in os.listdir(cavity_tarball_folder) if f.endswith('.tar.gz'))
+    rows = []
+    unparseable = []
+    mismatched = []
+
+    for name in names:
+        parsed = parse_tarball_name(name)
+        if parsed is None:
+            unparseable.append(name)
+            continue
+        accession, fragment_id, cavity_index = parsed
+        stem = name[: -len('.tar.gz')]
+        member = '%s_cavity_%d.pdb' % (stem[: stem.rindex('_cavity_result_')], cavity_index)
+
+        if verify_members:
+            try:
+                with tarfile.open(os.path.join(cavity_tarball_folder, name), 'r:gz') as tar:
+                    holds = [
+                        m.name for m in tar.getmembers()
+                        if re.search(r'_cavity_(\d+)\.pdb$', m.name)
+                    ]
+                if not any(m.endswith('_cavity_%d.pdb' % cavity_index) for m in holds):
+                    mismatched.append((name, holds))
+                    continue
+            except (tarfile.ReadError, OSError) as exc:
+                mismatched.append((name, str(exc)))
+                continue
+
+        rows.append({
+            'UniProt_ID': accession,
+            'Fragment_ID': fragment_id,
+            'Cavity_Index': cavity_index,
+            'Tarball': name,
+            'Pocket_PDB': os.path.join(EXTRACT_BASE_DIR, stem, member),
+        })
+
+    df = pd.DataFrame(
+        rows,
+        columns=['UniProt_ID', 'Fragment_ID', 'Cavity_Index', 'Tarball', 'Pocket_PDB'],
+    )
+    if not df.empty:
+        df = df.sort_values(
+            ['UniProt_ID', 'Fragment_ID', 'Cavity_Index'], kind='mergesort'
+        ).reset_index(drop=True)
+
+    stats = {
+        'tarballs_seen': len(names),
+        'rows': len(df),
+        'accessions': int(df['UniProt_ID'].nunique()) if not df.empty else 0,
+        'unparseable': unparseable,
+        'mismatched': mismatched,
+    }
+    return df, stats
+
+
+def _normalize_fragment(value):
+    """``1``, ``'1'`` and ``'F1'`` all mean fragment F1.
+
+    The old campaign wrote ``'F1'`` for positives and bare ``'1'`` for negatives;
+    that mismatch is what made the sample-type merge non-unique.
+    """
+    text = str(value).strip().upper()
+    if text.startswith('F'):
+        text = text[1:]
+    try:
+        return 'F%d' % int(text)
+    except (TypeError, ValueError):
+        return 'F1'
+
+
+def required_keys_from_frame(df):
+    """``{(accession, fragment_id, cavity_index)}`` from any manifest-shaped frame.
+
+    Accepts either the new column names or the schema's lowercase ones, so a
+    ``redock_queue.csv`` and a ``cavity_manifest.csv`` can both be passed as the
+    required set.
+    """
+    cols = {c.lower(): c for c in df.columns}
+    acc = cols.get('uniprot_id') or cols.get('accession')
+    frag = cols.get('fragment_id')
+    cav = cols.get('cavity_index')
+    if not acc or not cav:
+        raise ValueError(
+            'required-set frame needs an accession column (UniProt_ID or accession) '
+            'and a Cavity_Index column; got %s' % list(df.columns)
+        )
+    keys = set()
+    for _, row in df.iterrows():
+        if pd.isna(row[acc]) or pd.isna(row[cav]):
+            continue
+        fragment = _normalize_fragment(row[frag]) if frag else 'F1'
+        keys.add((str(row[acc]).strip(), fragment, int(row[cav])))
+    return keys
+
+
+def extract_required_cavities(cavity_tarball_folder, manifest, required_keys,
+                              extract_base_dir=EXTRACT_BASE_DIR):
+    """Unpack ONLY the cavities in ``required_keys``.
+
+    ``required_keys`` is mandatory. There is deliberately no default and no
+    fallback to "everything": a stage that silently substitutes a wider universe
+    when its input is missing is the exact defect that produced 5,661 extracted
+    AlphaFold directories for 979 needed ones, and 38,709 cavities for 2,829.
+
+    Asserts on return that the number of cavities present equals the number
+    required, so a partial extraction is loud rather than silent.
+    """
+    if required_keys is None:
+        raise ValueError(
+            'extract_required_cavities() requires an explicit required_keys set. '
+            'A missing prerequisite is an error, never a fallback.'
+        )
+    required_keys = set(required_keys)
+    os.makedirs(extract_base_dir, exist_ok=True)
+
+    wanted = manifest[
+        manifest.apply(
+            lambda r: (str(r['UniProt_ID']), _normalize_fragment(r['Fragment_ID']),
+                       int(r['Cavity_Index'])) in required_keys,
+            axis=1,
+        )
+    ] if not manifest.empty else manifest
+
+    missing_from_manifest = required_keys - (
+        set() if manifest.empty else {
+            (str(r['UniProt_ID']), _normalize_fragment(r['Fragment_ID']), int(r['Cavity_Index']))
+            for _, r in manifest.iterrows()
+        }
+    )
+
+    rows = []
+    extracted = 0
+    reused = 0
+    failed = []
+
+    iterator = wanted.iterrows() if not wanted.empty else iter([])
+    for _, row in tqdm(list(iterator), desc='Extracting required cavities', unit='cavity'):
+        stem = row['Tarball'][: -len('.tar.gz')]
+        target_dir = os.path.join(extract_base_dir, stem)
+        pocket = os.path.join(target_dir, os.path.basename(row['Pocket_PDB']))
+
+        if os.path.exists(pocket):
+            reused += 1
+        else:
+            os.makedirs(target_dir, exist_ok=True)
+            try:
+                with tarfile.open(
+                    os.path.join(cavity_tarball_folder, row['Tarball']), 'r:gz'
+                ) as tar:
+                    for member in tar.getmembers():
+                        if re.search(
+                            r'_cavity_%d\.pdb$' % int(row['Cavity_Index']), member.name
+                        ):
+                            tar.extract(member, path=target_dir)
+                            break
+                extracted += 1
+            except (tarfile.ReadError, OSError) as exc:
+                failed.append((row['Tarball'], str(exc)))
+                continue
+
+        rows.append({
+            'UniProt_ID': row['UniProt_ID'],
+            'Fragment_ID': row['Fragment_ID'],
+            'Cavity_Index': int(row['Cavity_Index']),
+            'Pocket_PDB': pocket,
+        })
+
+    out = pd.DataFrame(
+        rows, columns=['UniProt_ID', 'Fragment_ID', 'Cavity_Index', 'Pocket_PDB']
+    )
+    stats = {
+        'required': len(required_keys),
+        'extracted': extracted,
+        'reused': reused,
+        'present': len(out),
+        'failed': failed,
+        'missing_from_manifest': sorted(missing_from_manifest),
+    }
+    return out, stats
+
+
 def save_cavity_mapping_to_csv(cavity_info_dict, output_csv):
     """
     Save the cavity mapping information to a CSV file for later use.
@@ -214,67 +446,104 @@ def load_cavity_mapping_from_csv(input_csv):
         logging.error(f"Error loading cavity mapping file: {e}")
         return {}
 
-def main():
-    """Main function to extract cavities and save mapping."""
-    start_time = time.time()
-    
-    logging.info("Starting cavity extraction workflow.")
-    logging.info(f"Cavity Tarball Folder: {CAVITY_TARBALL_FOLDER}")
-    logging.info(f"Extract Base Directory: {EXTRACT_BASE_DIR}")
-    logging.info(f"Output CSV: {OUTPUT_CSV}")
-    
-    # Validate input folder
-    if not os.path.exists(CAVITY_TARBALL_FOLDER):
-        logging.critical(f"Error: Cavity tarball folder not found at '{CAVITY_TARBALL_FOLDER}'. Please correct the path.")
-        sys.exit(1)
-    
-    # Check if extraction was already done
-    if os.path.exists(OUTPUT_CSV):
-        logging.info(f"Found existing cavity mapping file: {OUTPUT_CSV}")
-        response = input("Cavity mapping already exists. Do you want to regenerate it? (y/N): ").strip().lower()
-        if response not in ['y', 'yes']:
-            logging.info("Using existing cavity mapping. Exiting.")
-            # Load and display summary
-            cavity_info = load_cavity_mapping_from_csv(OUTPUT_CSV)
-            total_cavities = sum(len(cavities) for cavities in cavity_info.values())
-            logging.info(f"Summary: {len(cavity_info)} UniProt IDs with {total_cavities} total cavity files.")
-            return
-        else:
-            logging.info("Will regenerate cavity mapping. Existing extracted files will be reused to save time.")
-    else:
-        logging.info("No existing cavity mapping found. Will extract cavities and create mapping.")
-    
+
+# ---------------------------------------------------------------------------
+# CLI -- REBUILD_PLAN Phase 6
+# ---------------------------------------------------------------------------
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description=(
+            'Build the cavity manifest from tarball names, and unpack only the '
+            'cavities an explicit required set asks for.'
+        ),
+        epilog=(
+            'Two-step usage:\n'
+            '  1. --manifest-only --tarballs DIR --out cavity_manifest.csv\n'
+            '  2. --manifest cavity_manifest.csv --required redock_queue.csv '
+            '--tarballs DIR --out-dir structures/cavities\n'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('--tarballs', default=CAVITY_TARBALL_FOLDER,
+                        help='folder of *.tar.gz cavity archives (default: %(default)s)')
+    parser.add_argument('--manifest-only', action='store_true',
+                        help='derive the manifest from tarball NAMES and exit. Unpacks nothing.')
+    parser.add_argument('--verify-members', action='store_true',
+                        help='with --manifest-only, open each archive to confirm its cavity (slow)')
+    parser.add_argument('--manifest', default=None,
+                        help='cavity_manifest.csv produced by --manifest-only')
+    parser.add_argument('--required', default=None,
+                        help=(
+                            'CSV naming the cavities to unpack (redock_queue.csv, '
+                            'positives_planned.csv, or any frame with an accession + '
+                            'Cavity_Index column). MANDATORY for extraction.'
+                        ))
+    parser.add_argument('--out', default=OUTPUT_CSV,
+                        help='where to write the manifest (default: %(default)s)')
+    parser.add_argument('--out-dir', default=EXTRACT_BASE_DIR,
+                        help='extraction destination (default: %(default)s)')
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    start = time.time()
+
+    if args.manifest_only:
+        manifest, stats = build_cavity_manifest(args.tarballs, verify_members=args.verify_members)
+        manifest.to_csv(args.out, index=False)
+        logging.info('manifest: %d rows over %d accessions from %d tarballs (nothing unpacked)',
+                     stats['rows'], stats['accessions'], stats['tarballs_seen'])
+        if stats['unparseable']:
+            logging.warning('%d tarball name(s) did not parse, e.g. %s',
+                            len(stats['unparseable']), stats['unparseable'][:3])
+        if stats['mismatched']:
+            logging.warning('%d tarball(s) did not hold the cavity their name advertises',
+                            len(stats['mismatched']))
+        logging.info('wrote %s in %.1fs', args.out, time.time() - start)
+        return 0
+
+    if not args.required:
+        logging.error(
+            '--required is mandatory for extraction. Without it this script would '
+            'unpack every tarball in the folder -- 38,709 archives and 76.6 GB for a '
+            'campaign that needed 2,829. Run with --manifest-only first, compute the '
+            'required set, then pass it here. A missing prerequisite is an error, '
+            'never a fallback.'
+        )
+        return 2
+    if not args.manifest:
+        logging.error('--manifest is required for extraction; produce it with --manifest-only.')
+        return 2
+
     try:
-        # Extract cavities
-        cavity_data = extract_cavity_paths_from_tarballs(CAVITY_TARBALL_FOLDER, EXTRACT_BASE_DIR)
-        
-        if not cavity_data:
-            logging.warning("No cavity data extracted. Exiting.")
-            sys.exit(0)
-        
-        # Save mapping to CSV
-        df = save_cavity_mapping_to_csv(cavity_data, OUTPUT_CSV)
-        
-        # Summary statistics
-        total_cavities = len(df)
-        unique_uniprots = len(cavity_data)
-        avg_cavities_per_protein = total_cavities / unique_uniprots if unique_uniprots > 0 else 0
-        
-        elapsed_time = time.time() - start_time
-        
-        logging.info(f"\n--- Extraction Summary ---")
-        logging.info(f"Total UniProt IDs processed: {unique_uniprots}")
-        logging.info(f"Total cavity files found: {total_cavities}")
-        logging.info(f"Average cavities per protein: {avg_cavities_per_protein:.2f}")
-        logging.info(f"Tarballs processed: {len([f for f in os.listdir(CAVITY_TARBALL_FOLDER) if f.endswith('.tar.gz')])}")
-        logging.info(f"Time saved by reusing existing files: Significant!")
-        logging.info(f"Extraction completed in {elapsed_time:.2f} seconds")
-        logging.info(f"Results saved to: {OUTPUT_CSV}")
-        logging.info(f"Extracted files location: {EXTRACT_BASE_DIR}")
-        
-    except Exception as e:
-        logging.critical(f"Error during cavity extraction: {e}")
-        sys.exit(1)
+        manifest = pd.read_csv(args.manifest)
+        required = required_keys_from_frame(pd.read_csv(args.required))
+    except (OSError, ValueError) as exc:
+        logging.error('%s', exc)
+        return 2
+
+    out, stats = extract_required_cavities(
+        args.tarballs, manifest, required, extract_base_dir=args.out_dir
+    )
+    out.to_csv(args.out, index=False)
+
+    logging.info('required %d cavities: %d newly extracted, %d already present, %d on disk',
+                 stats['required'], stats['extracted'], stats['reused'], stats['present'])
+    if stats['missing_from_manifest']:
+        logging.error('%d required cavit(ies) are not in the manifest at all, e.g. %s',
+                      len(stats['missing_from_manifest']), stats['missing_from_manifest'][:3])
+    if stats['failed']:
+        logging.error('%d tarball(s) failed to extract', len(stats['failed']))
+    if stats['present'] != stats['required']:
+        logging.error('INVARIANT: %d cavities required but %d present on disk',
+                      stats['required'], stats['present'])
+        return 3
+    logging.info('wrote %s in %.1fs', args.out, time.time() - start)
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
