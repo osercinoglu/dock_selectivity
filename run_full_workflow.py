@@ -1,201 +1,284 @@
 #!/usr/bin/env python3
+"""Run the corrected rebuild pipeline, REBUILD_PLAN.md Phases 0-8.
+
+What this replaces
+------------------
+
+The previous runner invoked seven scripts and had three structural problems, all
+of which this version fixes:
+
+1. **It never called the negative-sampling stage.** A repo-wide grep found
+   ``generate_negative_samples.py`` referenced only in two ``batch_dock.py``
+   comments. So the automated workflow could not produce the balanced dataset the
+   study depends on -- whether negatives existed at all depended on someone having
+   run that script by hand.
+2. **The docking mode was inferred from file presence.** ``batch_dock.py`` silently
+   switched between "dock the listed triples" and "dock every cavity of every known
+   target" depending on whether ``required_structures_with_negatives.csv`` happened
+   to exist. Behaviour determined by leftovers is not behaviour anyone chose.
+3. **It started with the corrupted identity stage.** Step 1 was
+   ``prepare_uniprot_mapping.py``, whose free-text search produced the mapping in
+   which 57.73% of rows name a different protein.
+
+This runner drives the new stages, gates on the identity index, and makes every
+choice explicit. Each phase is skippable, and every phase verifies its own
+prerequisite rather than degrading when one is missing.
+
+Usage
+-----
+
+::
+
+    python3 run_full_workflow.py --run-dir $NEW \\
+        --idmapping HUMAN_9606_idmapping.dat.gz \\
+        --proteome  UP000005640_9606.fasta.gz \\
+        --edges     1_drug_to_protein.tsv \\
+        --tarballs  /opt/data/cavity_space/af_strong_cavities_data_all \\
+        --ligands   $NEW/ligands \\
+        --mode      salvage-and-redock
+
+    python3 run_full_workflow.py --run-dir $NEW --dry-run     # print the plan only
 """
-Complete Workflow Runner
-This script runs the entire consensus docking workflow in the correct order.
 
-Usage:
-    python run_full_workflow.py [--skip-uniprot] [--skip-extract] [--skip-identify] [--skip-alphafold] [--skip-fixing] [--skip-convert]
+from __future__ import annotations
 
-Example:
-    # Run full workflow
-    python run_full_workflow.py
-    
-    # Skip UniProt mapping generation (if already done)
-    python run_full_workflow.py --skip-uniprot
-    
-    # Skip cavity extraction (if already done)  
-    python run_full_workflow.py --skip-extract
-    
-    # Skip required structures identification (if already done)
-    python run_full_workflow.py --skip-identify
-    
-    # Skip AlphaFold download
-    python run_full_workflow.py --skip-alphafold
-    
-    # Skip PDB fixing
-    python run_full_workflow.py --skip-fixing
-    
-    # Skip PDBQT conversion
-    python run_full_workflow.py --skip-convert
-"""
-
-import os
-import sys
 import argparse
-import subprocess
 import logging
+import os
+import subprocess
+import sys
 import time
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+LOG = logging.getLogger("workflow")
 
-def run_script(script_name, description):
-    """Run a Python script and handle errors."""
-    logging.info(f"Starting: {description}")
-    start_time = time.time()
-    
-    try:
-        result = subprocess.run([sys.executable, script_name], 
-                              capture_output=True, text=True, check=True)
-        elapsed = time.time() - start_time
-        logging.info(f"Completed: {description} ({elapsed:.1f}s)")
-        return True
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Failed: {description}")
-        logging.error(f"Error output: {e.stderr}")
-        return False
-    except FileNotFoundError:
-        logging.error(f"Script not found: {script_name}")
-        return False
+REPO = os.path.dirname(os.path.abspath(__file__))
 
-def check_file_exists(filename, description):
-    """Check if a required file exists."""
-    if os.path.exists(filename):
-        logging.info(f"Found: {description} ({filename})")
-        return True
-    else:
-        logging.warning(f"Missing: {description} ({filename})")
-        return False
+#: Docking modes. Explicit -- never inferred from which files happen to exist.
+MODES = ("positives-only", "salvage-and-redock", "full-redock")
 
-def main():
-    """Main workflow runner."""
-    parser = argparse.ArgumentParser(description='Run the complete consensus docking workflow')
-    parser.add_argument('--skip-uniprot', action='store_true', 
-                       help='Skip UniProt mapping generation')
-    parser.add_argument('--skip-extract', action='store_true',
-                       help='Skip cavity extraction')
-    parser.add_argument('--skip-identify', action='store_true',
-                       help='Skip required structures identification')
-    parser.add_argument('--skip-alphafold', action='store_true',
-                       help='Skip AlphaFold model extraction')
-    parser.add_argument('--skip-fixing', action='store_true',
-                       help='Skip PDB fixing (hydrogens)')
-    parser.add_argument('--skip-convert', action='store_true',
-                       help='Skip PDB to PDBQT conversion')
-    parser.add_argument('--test-mode', action='store_true',
-                       help='Run batch_dock.py in test mode')
-    
-    args = parser.parse_args()
-    
-    logging.info("=== Consensus Docking Workflow Runner ===")
-    start_total = time.time()
-    
-    # Step 1: UniProt Mapping Generation
-    if not args.skip_uniprot:
-        if not run_script('prepare_uniprot_mapping.py', 'UniProt mapping generation'):
-            logging.error("Failed at step 1. Stopping workflow.")
-            return 1
-    else:
-        check_file_exists('uniprot_gene_mapping.csv', 'UniProt gene mapping')
-    
-    # Step 2: Cavity Extraction  
-    if not args.skip_extract:
-        if not run_script('extract_cavities.py', 'Cavity extraction'):
-            logging.error("Failed at step 2. Stopping workflow.")
-            return 1
-    else:
-        check_file_exists('cavity_mapping.csv', 'Cavity mapping')
-    
-    # Step 3: Identify Required Structures (NEW - MUST RUN BEFORE ALPHAFOLD EXTRACTION)
-    if not args.skip_identify:
-        if not run_script('identify_required_structures.py', 'Required structures identification'):
-            logging.warning("Required structures identification failed. Continuing with all structures.")
-            # Don't stop workflow - this helps optimize but isn't critical
-    else:
-        check_file_exists('required_structures.csv', 'Required structures mapping')
-    
-    # Step 4: AlphaFold Model Extraction (Recommended - now extracts only required structures)
-    if not args.skip_alphafold:
-        if not run_script('extract_alphafold_models.py', 'Local AlphaFold structure extraction (required only)'):
-            logging.warning("AlphaFold extraction failed. Continuing with extracted cavity data.")
-            # Don't stop workflow - this is optional but recommended
-    else:
-        check_file_exists('alphafold_mapping.csv', 'AlphaFold mapping')
-    
-    # Step 5: Fix Required PDBs (Add hydrogens)
-    if not args.skip_fixing:
-        if not run_script('fix_required_pdbs.py', 'PDB fixing (adding hydrogens)'):
-            logging.warning("PDB fixing failed. Continuing without fixed structures.")
-            # Don't stop workflow - this is recommended but not required
-    else:
-        check_file_exists('fixed_mapping.csv', 'Fixed structures mapping')
-    
-    # Step 6: PDB to PDBQT Conversion (Optional but recommended)
-    if not args.skip_convert:
-        if not run_script('convert_pdb_to_pdbqt.py', 'PDB to PDBQT conversion'):
-            logging.warning("PDBQT conversion failed. Docking will convert files on-the-fly.")
-            # Don't stop workflow - this is optional
-    else:
-        check_file_exists('pdbqt_mapping.csv', 'PDBQT mapping')
-    
-    # Step 7: Batch Docking
-    logging.info("Starting: Batch docking execution")
-    
-    # Check prerequisites
-    required_files = [
-        ('uniprot_gene_mapping.csv', 'UniProt gene mapping'),
-        ('cavity_mapping.csv', 'Cavity mapping')
+
+class PhaseFailed(RuntimeError):
+    """A phase exited non-zero and the pipeline cannot honestly continue."""
+
+
+class Phase:
+    """One runnable step, with the prerequisite it refuses to run without."""
+
+    def __init__(self, key, title, script, args, produces, requires=(), optional=False):
+        self.key = key
+        self.title = title
+        self.script = script
+        self.args = list(args)
+        self.produces = list(produces)
+        self.requires = list(requires)
+        self.optional = optional
+
+    def command(self):
+        return [sys.executable, os.path.join(REPO, self.script)] + self.args
+
+    def missing_prerequisites(self):
+        return [p for p in self.requires if not os.path.exists(p)]
+
+
+def build_phases(args):
+    """Assemble the phase list for the requested mode."""
+    run = args.run_dir
+    j = os.path.join
+    identity = j(run, "identity", "identity_index.parquet")
+    manifests = j(run, "manifests")
+
+    interactions = j(manifests, "interactions_resolved.csv")
+    cavity_manifest = j(manifests, "cavity_manifest.csv")
+    positives = j(manifests, "positives_planned.csv")
+    salvage_map = j(manifests, "salvage_map.csv")
+    pool = j(manifests, "negatives_pool.csv")
+    drawn = j(manifests, "negatives_drawn.csv")
+    manifest = j(manifests, "run_manifest.csv")
+    queue = j(manifests, "redock_queue.csv")
+
+    phases = [
+        Phase("identity", "Phase 0 - build the identity index",
+              "build_identity_index.py",
+              ["--idmapping", args.idmapping or "", "--proteome", args.proteome or "",
+               "--out", identity],
+              produces=[identity]),
+        Phase("interactions", "Phase 1 - resolve the drug-target edges",
+              "resolve_interactions.py",
+              ["--edges", args.edges or "", "--index", identity,
+               "--drugs", args.drugs, "--out", interactions,
+               "--rejects", j(manifests, "interactions_rejected.csv")],
+              produces=[interactions], requires=[identity]),
+        Phase("cavities", "Phase 2 - cavity manifest (names only, no unpacking)",
+              "extract_cavities.py",
+              ["--manifest-only", "--tarballs", args.tarballs or "", "--out", cavity_manifest],
+              produces=[cavity_manifest]),
+        Phase("positives", "Phase 3 - plan the positive jobs",
+              "plan_positives.py",
+              ["--interactions", interactions, "--index", identity,
+               "--cavities", cavity_manifest, "--drugs", args.drugs,
+               "--out", positives, "--rejects", j(manifests, "positives_rejected.csv")]
+              + (["--ligands", args.ligands] if args.ligands else []),
+              produces=[positives], requires=[interactions, cavity_manifest]),
     ]
-    
-    missing_files = []
-    for filename, description in required_files:
-        if not check_file_exists(filename, description):
-            missing_files.append(filename)
-    
-    if missing_files:
-        logging.error(f"Missing required files: {missing_files}")
-        logging.error("Cannot proceed with batch docking.")
-        return 1
-    
-    # Run batch docking
-    batch_script = 'batch_dock.py'
-    if args.test_mode:
-        logging.info("Running batch docking in test mode")
-        # You would need to modify batch_dock.py to accept command line arguments
-        # For now, this just runs it normally
-    
-    if not run_script(batch_script, 'Batch docking execution'):
-        logging.error("Failed at final step: batch docking.")
-        return 1
-    
-    # Success!
-    total_elapsed = time.time() - start_total
-    logging.info("=== Workflow Completed Successfully! ===")
-    logging.info(f"Total time: {total_elapsed:.1f}s ({total_elapsed/60:.1f}m)")
-    
-    # Summary of outputs
-    logging.info("\nGenerated files:")
-    output_files = [
-        'uniprot_gene_mapping.csv',
-        'cavity_mapping.csv',
-        'alphafold_mapping.csv',
-        'required_structures.csv',
-        'fixed_mapping.csv',
-        'pdbqt_mapping.csv',
-        'extracted_cavities/',
-        'alphafold_structures/',
-        'fixed_structures/',
-        'converted_pdbqt/',
-        'consensus_docking_results/'
-    ]
-    
-    for filename in output_files:
-        if os.path.exists(filename):
-            logging.info(f"  ✓ {filename}")
-        else:
-            logging.info(f"  - {filename} (not created)")
-    
+
+    if args.mode in ("salvage-and-redock",):
+        phases.append(
+            Phase("salvage", "Phase 4 - classify the old campaign (read-only)",
+                  "salvage_scan.py",
+                  ["--old-results", args.old_results or "", "--index", identity,
+                   "--interactions", interactions,
+                   "--out-map", salvage_map, "--out-pool", pool],
+                  produces=[salvage_map, pool], requires=[interactions]))
+
+    sample_args = ["--index", identity, "--interactions", interactions,
+                   "--positives", positives, "--out", drawn,
+                   "--redock-queue", j(manifests, "negatives_redock_queue.csv")]
+    if args.mode == "salvage-and-redock":
+        sample_args += ["--pool", pool, "--prefer-pool"]
+    if args.mode != "positives-only":
+        phases.append(
+            # The stage the old runner never called at all.
+            Phase("negatives", "Phase 5 - balanced negative sampling",
+                  "sample_negatives.py", sample_args,
+                  produces=[drawn], requires=[positives]))
+
+    phases.append(
+        Phase("manifest", "Phase 6 - assemble the run manifest and redock queue",
+              "build_run_manifest.py",
+              ["--positives", positives,
+               "--drawn", drawn if args.mode != "positives-only" else positives,
+               "--salvage-map", salvage_map,
+               "--out", manifest, "--redock-out", queue],
+              produces=[manifest, queue], requires=[positives]))
+
+    phases.append(
+        Phase("dock", "Phase 7 - dock the queue",
+              "batch_dock.py",
+              ["--queue", queue, "--run-dir", run,
+               "--complex-pdb", args.complex_pdb]
+              + (["--ligands", args.ligands] if args.ligands else []),
+              produces=[], requires=[queue]))
+
+    phases.append(
+        Phase("parse", "Phase 8 - parse results into the analysis table",
+              "parse_prepare.py", ["--run-dir", run],
+              produces=[], requires=[manifest], optional=True))
+
+    return phases
+
+
+def run_phase(phase, dry_run=False, timeout=None, will_exist=()):
+    """Run one phase.
+
+    ``will_exist`` names artifacts that earlier phases in this plan produce. In a
+    dry run nothing is actually created, so without it the prerequisite check
+    stops at phase 2 and the operator never sees the rest of the plan -- which
+    defeats the purpose of a dry run.
+    """
+    missing = [p for p in phase.missing_prerequisites() if p not in set(will_exist)]
+    if missing:
+        raise PhaseFailed(
+            "%s cannot run: missing prerequisite(s) %s. A missing prerequisite is "
+            "an error, never a fallback -- run the earlier phase, or pass its "
+            "--skip flag only if you know the artifact exists elsewhere."
+            % (phase.title, ", ".join(missing)))
+
+    command = phase.command()
+    LOG.info("%s", phase.title)
+    LOG.info("  $ %s", " ".join(command))
+    if dry_run:
+        return 0
+
+    start = time.time()
+    proc = subprocess.run(command, timeout=timeout)
+    elapsed = time.time() - start
+
+    if proc.returncode != 0:
+        raise PhaseFailed("%s exited %d after %.1fs"
+                          % (phase.title, proc.returncode, elapsed))
+
+    absent = [p for p in phase.produces if not os.path.exists(p)]
+    if absent:
+        raise PhaseFailed(
+            "%s exited 0 but did not produce %s. Exit code 0 with no output is how "
+            "a silent no-op looks like success." % (phase.title, ", ".join(absent)))
+
+    LOG.info("  ok (%.1fs)%s", elapsed,
+             "".join("\n    -> %s" % p for p in phase.produces))
     return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--run-dir", required=True, help="the new experiment directory")
+    parser.add_argument("--mode", choices=MODES, default="salvage-and-redock",
+                        help=("EXPLICIT docking mode (default: %(default)s). The old "
+                              "runner inferred this from whether a file happened to "
+                              "exist."))
+    parser.add_argument("--idmapping", default=None, help="HUMAN_9606_idmapping.dat.gz")
+    parser.add_argument("--proteome", default=None, help="UP000005640_9606.fasta.gz")
+    parser.add_argument("--edges", default=None, help="1_drug_to_protein.tsv")
+    parser.add_argument("--drugs", default="/opt/data/drugbank/small_molecule_drug_links.csv")
+    parser.add_argument("--tarballs", default="/opt/data/cavity_space/af_strong_cavities_data_all")
+    parser.add_argument("--ligands", default=None, help="prepared ligand SDF folder")
+    parser.add_argument("--old-results", default=None,
+                        help="the OLD consensus_docking_results tree (read-only)")
+    parser.add_argument("--complex-pdb", choices=("keep", "delete", "compress"),
+                        default="delete")
+    parser.add_argument("--skip", action="append", default=[],
+                        metavar="PHASE", help="phase key to skip (repeatable)")
+    parser.add_argument("--only", action="append", default=[],
+                        metavar="PHASE", help="run only these phase keys (repeatable)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the plan and exit without running anything")
+    parser.add_argument("--timeout", type=float, default=None,
+                        help="per-phase timeout in seconds")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    phases = build_phases(args)
+    if args.only:
+        phases = [p for p in phases if p.key in set(args.only)]
+    if args.skip:
+        phases = [p for p in phases if p.key not in set(args.skip)]
+
+    if not phases:
+        LOG.error("no phases selected")
+        return 2
+
+    LOG.info("run directory : %s", args.run_dir)
+    LOG.info("mode          : %s", args.mode)
+    LOG.info("phases        : %s", ", ".join(p.key for p in phases))
+    if args.dry_run:
+        LOG.info("--dry-run: printing commands only, running nothing")
+
+    started = time.time()
+    planned_outputs = []
+    for phase in phases:
+        try:
+            run_phase(phase, dry_run=args.dry_run, timeout=args.timeout,
+                      will_exist=planned_outputs if args.dry_run else ())
+            planned_outputs.extend(phase.produces)
+        except PhaseFailed as exc:
+            if phase.optional:
+                LOG.warning("%s (optional) -- continuing", exc)
+                continue
+            LOG.error("%s", exc)
+            LOG.error("STOPPING. Later phases would consume an artifact this phase "
+                      "did not produce.")
+            return 1
+        except subprocess.TimeoutExpired:
+            LOG.error("%s timed out after %.0fs", phase.title, args.timeout or 0)
+            return 1
+
+    LOG.info("all %d phase(s) completed in %.1fs", len(phases), time.time() - started)
+    return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

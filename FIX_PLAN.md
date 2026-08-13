@@ -1,6 +1,6 @@
 # FIX_PLAN — execution-ready global repository fix
 
-**Status:** pass 3 (2026-08-13) — **§1 IMPLEMENTED** (identity module, invariants, checked joins,
+**Status:** pass 4 (2026-08-13) — **ALL ITEMS IMPLEMENTED**; earlier status line below — **§1 IMPLEMENTED** (identity module, invariants, checked joins,
 schemas, jobid codec, index builder, and the four new stage scripts). §2 and every §3 edit to an
 **existing** pipeline script remain **outstanding**; §5's support-module list is now largely done and
 its remaining items are named below. `python3 -m unittest discover -s tests -t .` → **605 tests, OK**
@@ -38,7 +38,7 @@ retired) on their own schedule.
 | §2 relabel path / job classification | **new** `salvage_scan.py` | **I** |
 | §3.3 new naming scheme + `job_identity.json` writer (curation side) | **new** `curate_jobs.py` | **I** (`batch_dock.py` itself is still **○**) |
 | §5 read-only auditor (test tier 4) | **new** `audit.py` | **I** |
-| §2 delete `prepare_uniprot_mapping.py` + G6 grep lint | — | **○** |
+| §2 delete `prepare_uniprot_mapping.py` + G6 lint (AST-based) | deleted; `tests/test_g6_no_freetext_resolution.py` | **I** |
 | §3.1 `identify_required_structures.py` — resolver refuses; superseded by `resolve_interactions.py` + `plan_positives.py` | `identify_required_structures.py` | **I** |
 | §3.2 `generate_negative_samples.py` — resolver refuses; superseded by `sample_negatives.py` | `generate_negative_samples.py` | **I** |
 | §3.3 `batch_dock.py` — `--queue` path (no resolver), `job_identity.json`, `--complex-pdb` cleanup | `batch_dock.py` | **I** |
@@ -48,7 +48,7 @@ retired) on their own schedule.
 | §3.5c `convert_pdb_to_pdbqt.py` — `--input-mapping` / `--required`; cavity fallback now opt-in | `convert_pdb_to_pdbqt.py` | **I** |
 | §3.6 `extract_alphafold_models.py` — fallback deleted, `--required` mandatory | `extract_alphafold_models.py` | **I** |
 | §3.7 `create_ic50_mapping.py` (coverage lift only; not corrupt) | — | **○** |
-| §3.8 `run_full_workflow.py` | — | **○** |
+| §3.8 `run_full_workflow.py` — index as Phase 0, negative sampling wired in, explicit `--mode` | `run_full_workflow.py` | **I** |
 | `positives_planned.csv` producer | **new** `plan_positives.py` | **I** |
 | `run_manifest.csv` assembler + the complete redock queue (incl. the previously unqueued **positive** gap) | **new** `build_run_manifest.py` | **I** |
 

@@ -423,7 +423,7 @@ def main():
         '--csv-dir',
         type=str,
         default='/media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock/pocketmatch_results/PocketMatch_similarities',
-        help='Directory containing CSV similarity files'tmux
+        help='Directory containing CSV similarity files'
     )
     parser.add_argument(
         '--output-dir',

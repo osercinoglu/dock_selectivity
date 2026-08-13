@@ -515,6 +515,37 @@ Release 2026-06-10. Store them somewhere durable and pass `--idmapping` /
 
 ---
 
+## 2c. Toolchain status — ALL PHASES EXECUTABLE (2026-08-13)
+
+Every phase of the runbook is now backed by implemented, tested code. The suite is
+**743 tests, green under two `PYTHONHASHSEED` values**.
+
+| Phase | Stage | Status |
+|---|---|:--:|
+| 0 | `build_identity_index.py` | ✅ validated on real UniProt inputs |
+| 1 | `resolve_interactions.py` | ✅ 7,923/8,568 real edges resolved |
+| 2 | `extract_cavities.py --manifest-only` | ✅ 38,709 rows in 0.4 s, key-identical to the 76 GB unpack |
+| 2b | `plan_positives.py` | ✅ |
+| 3 | `salvage_scan.py` | ✅ all 24,173 real dirs, 0 unparseable |
+| 4 | `sample_negatives.py` | ✅ |
+| 5 | `curate_jobs.py` | ✅ |
+| 6 | `build_run_manifest.py` | ✅ |
+| 7 | `batch_dock.py --queue` | ✅ legacy resolver refuses |
+| 8 | `parse_prepare.py` | ✅ all six defects fixed |
+| — | `run_full_workflow.py` | ✅ drives 0–8, explicit `--mode`, `--dry-run` |
+| — | `audit.py` | ✅ STOP-gate runner |
+
+`prepare_uniprot_mapping.py` is **deleted**. An AST-based G6 lint fails the suite if
+a free-text identifier search, a `bioservices` import, or a read of
+`Mapped_Gene_Name` as a data key reappears anywhere in production code — and it
+asserts every production file parses, which is how the long-standing
+`pocketmatch_clustering.py:426` stray `tmux` token was finally caught and fixed.
+
+**Still required before Phase 0 can run:** the two authoritative UniProt files
+(§2b). They currently live only in scratch and should be moved somewhere durable.
+
+---
+
 ## 3. Runbook
 
 Every command below is the **real CLI of the script as it exists today** unless the phase is explicitly
