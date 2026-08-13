@@ -630,7 +630,58 @@ def generate_balanced_negatives(positive_df, known_pairs, drugs_with_sdf, protei
     return negatives
 
 
+
+# ---------------------------------------------------------------------------
+# Superseded -- FIX_PLAN 3.2
+# ---------------------------------------------------------------------------
+
+#: The stages that replace this one. Both resolve on ``node_2`` -- the Entrez
+#: Gene ID that has been present and unused in 1_drug_to_protein.tsv all along --
+#: through IdentityIndex, which guarantees a collapse factor of exactly 1.
+REPLACEMENT_STAGES = ('sample_negatives.py',)
+
+
+class CorruptedResolverRefused(RuntimeError):
+    """Raised when this script's gene-symbol resolver is invoked.
+
+    ``dict(zip(uniprot_df['Mapped_Gene_Name'], uniprot_df['Entry']))`` is
+    last-duplicate-wins over a column in which 57.73% of rows name a different
+    protein. It collapses 4,585 accessions onto 1,795 symbols, silently
+    discarding 2,790, and the accession that survives each collapse became the
+    receptor that was docked -- 633 of the campaign's 979 proteins (64.66%) are
+    not the protein their job name claims.
+    """
+
+
+def assert_resolver_not_used(allow_legacy=False):
+    """Refuse the corrupted path unless explicitly opted into."""
+    if allow_legacy:
+        logging.warning(
+            "*** --legacy-gene-resolution: using the CORRUPTED symbol resolver. "
+            "57.73%% of the mapping rows name a different protein. ***")
+        return
+    raise CorruptedResolverRefused(
+        "generate_negative_samples.py resolves identity with dict(zip(Mapped_Gene_Name, Entry)), "
+        "which is last-duplicate-wins over a column that is 57.73% wrong. "
+        "This stage is superseded by: "
+        + ", ".join(REPLACEMENT_STAGES)
+        + ". They resolve on the Entrez key via IdentityIndex (collapse factor 1). "
+        "Pass --legacy-gene-resolution to run this anyway."
+    )
+
+
+
 def main():
+    import argparse as _ap
+    _p = _ap.ArgumentParser(description="superseded stage; see REPLACEMENT_STAGES")
+    _p.add_argument('--legacy-gene-resolution', action='store_true',
+                    help='run the superseded, corrupted symbol resolver anyway')
+    _a, _ = _p.parse_known_args()
+    try:
+        assert_resolver_not_used(_a.legacy_gene_resolution)
+    except CorruptedResolverRefused as _exc:
+        logging.error('%s', _exc)
+        return 2
     """Main execution function"""
     start_time = datetime.now()
     
@@ -707,7 +758,7 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main() or 0)
     except KeyboardInterrupt:
         logging.warning("\n⚠️  Process interrupted by user")
         sys.exit(1)

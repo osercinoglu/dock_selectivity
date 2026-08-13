@@ -39,8 +39,8 @@ retired) on their own schedule.
 | §3.3 new naming scheme + `job_identity.json` writer (curation side) | **new** `curate_jobs.py` | **I** (`batch_dock.py` itself is still **○**) |
 | §5 read-only auditor (test tier 4) | **new** `audit.py` | **I** |
 | §2 delete `prepare_uniprot_mapping.py` + G6 grep lint | — | **○** |
-| §3.1 `identify_required_structures.py` | — | **○** |
-| §3.2 `generate_negative_samples.py` | — | **○** |
+| §3.1 `identify_required_structures.py` — resolver refuses; superseded by `resolve_interactions.py` + `plan_positives.py` | `identify_required_structures.py` | **I** |
+| §3.2 `generate_negative_samples.py` — resolver refuses; superseded by `sample_negatives.py` | `generate_negative_samples.py` | **I** |
 | §3.3 `batch_dock.py` — `--queue` path (no resolver), `job_identity.json`, `--complex-pdb` cleanup | `batch_dock.py` | **I** |
 | §3.4 `parse_prepare.py` — all five defects + a sixth (`except Exception` swallowing integrity failures) | `parse_prepare.py` | **I** |
 | §3.5 `extract_cavities.py` — `--manifest-only` (names, no unpacking) + mandatory `--required` | `extract_cavities.py` | **I** |
