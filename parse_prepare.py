@@ -15,6 +15,7 @@ Features:
 """
 
 import os
+import re
 import sys
 import glob
 from pathlib import Path
@@ -63,6 +64,113 @@ MAX_WORKERS_SEARCH = None  # Use all cores for search
 MAX_WORKERS_LOAD = 8  # Limit for I/O operations
 PROGRESS_UPDATE_INTERVAL = 0.1  # Progress bar update frequency
 
+
+# =============================================================================
+# Canonical vocabularies and identity parsing (the five FIX_PLAN §3.4 defects)
+# =============================================================================
+
+#: ``None`` means "discover everything". A cap here silently truncates the
+#: analysis: the 2025-06-29 run used 10,000 and lost 14,173 of 24,173 completed
+#: job directories without a single warning. Set an integer only when you
+#: deliberately want a partial pass, and expect the manifest check to fail.
+FILE_DISCOVERY_CAP = None
+
+
+class MergeFanOut(Exception):
+    """A join changed the row count. Never degrade this to a warning.
+
+    DEFECT 6 (found while testing defect 5): ``annotate_sample_types`` wrapped its
+    whole body in ``except Exception`` and, on any error, printed a warning and set
+    ``sample_type``/``Gene_Name`` to NA. That converts an integrity failure into a
+    silently unlabelled dataset -- the same "degrade instead of stop" reflex as the
+    universe-widening fallbacks in the extraction scripts. This exception is
+    deliberately re-raised past that handler.
+    """
+
+#: The engine names as they appear IN THE DATA (uppercase). The old code compared
+#: against 'Smina'/'LeDock'/'Gnina', so `filter_complete_tool_coverage` could match
+#: at most 1 of 4 and was a permanent silent no-op, and `LeDock_Score` was all-null.
+CANONICAL_TOOLS = ('GOLD', 'SMINA', 'LEDOCK', 'GNINA')
+
+_TOOL_ALIASES = {
+    'gold': 'GOLD', 'smina': 'SMINA', 'ledock': 'LEDOCK', 'le-dock': 'LEDOCK',
+    'gnina': 'GNINA',
+}
+
+
+def canonical_tool(value):
+    """Map any spelling of an engine name to its canonical uppercase form."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return _TOOL_ALIASES.get(text.lower(), text.upper())
+
+
+def parse_job_dir_name(dir_name, known_accessions=None):
+    """Recover identity from a job directory name.
+
+    DEFECT 2 (fixed). The old expression was::
+
+        re.match(r'(DB\d+)_([A-Za-z0-9]+)_([A-Z0-9]+)_cavity_(\d+)', dir_name)
+
+    ``[A-Za-z0-9]+`` cannot match a hyphen and the pattern has no place for a
+    fragment, so it rejected 1,777 of 24,173 directories: 1,743 legacy
+    multi-fragment names (``DB00091_CAMLG_P08F94_-F13-model_v1_cavity_10``) and 34
+    hyphenated symbols (``DB00157_MT-ND1_P03886_cavity_1``). Those became
+    1,174,786 rows (7.08%) with null identity, all sharing one fabricated
+    ``<NA>_<NA>`` pair value that forms a bogus mega-group in any ``group_by``.
+
+    Prefers ``job_identity.json`` when present (the authority), then the new
+    ``__``-delimited scheme, then a right-anchored legacy parse. Returns a dict
+    or ``None`` -- never a partial guess.
+    """
+    from dock_selectivity import jobid
+
+    for parser in (jobid.parse_job_dir,):
+        try:
+            identity = parser(dir_name)
+            return {
+                'drugbank_id': identity.drugbank_id,
+                'uniprot_id': identity.accession,
+                'gene_name': identity.gene,
+                'fragment_id': identity.fragment_id,
+                'cavity_index': identity.cavity_index,
+            }
+        except jobid.JobIdError:
+            pass
+
+    if known_accessions:
+        try:
+            identity = jobid.parse_legacy_job_dir(dir_name, known_accessions)
+            return {
+                'drugbank_id': identity.drugbank_id,
+                'uniprot_id': identity.accession,
+                'gene_name': identity.gene,
+                'fragment_id': identity.fragment_id,
+                'cavity_index': identity.cavity_index,
+            }
+        except jobid.JobIdError:
+            return None
+
+    # No accession set available: a permissive right-anchored regex that at least
+    # accepts hyphenated symbols and the legacy fragment suffix.
+    match = re.match(
+        r'^(DB\d+)_(.+?)_([A-Z0-9]{6,10})(?:_-?(?:AF-[A-Z0-9]+-)?F(\d+)-model_v\d+)?_cavity_(\d+)$',
+        dir_name)
+    if not match:
+        return None
+    drug, gene, accession, fragment, cavity = match.groups()
+    return {
+        'drugbank_id': drug,
+        'uniprot_id': accession,
+        'gene_name': None if gene.lower() in ('nan', 'none', '') else gene,
+        'fragment_id': 'F%d' % int(fragment) if fragment else 'F1',
+        'cavity_index': int(cavity),
+    }
+
+
 def get_system_info():
     """Get system information for optimization"""
     return {
@@ -96,12 +204,17 @@ def optimized_walk_search(args):
                     
                 file_lower = file.lower()
                 for pattern in patterns:
-                    if pattern in file_lower and len(results[pattern]) < max_files_per_pattern:
+                    if pattern in file_lower and (
+                        max_files_per_pattern is None
+                        or len(results[pattern]) < max_files_per_pattern
+                    ):
                         full_path = os.path.join(root, file)
                         results[pattern].append(full_path)
             
-            # Early termination if all patterns have enough files
-            if all(len(files) >= max_files_per_pattern for files in results.values()):
+            # Early termination only when a cap was deliberately requested.
+            if max_files_per_pattern is not None and all(
+                len(files) >= max_files_per_pattern for files in results.values()
+            ):
                 break
                 
     except (PermissionError, OSError, UnicodeDecodeError):
@@ -143,7 +256,14 @@ def find_consensus_results_files_optimized(base_directory, max_workers=None):
     # Get search directories with intelligent partitioning
     search_dirs = get_search_directories(base_directory, max_workers)
     max_depth = 4  # Slightly deeper search
-    max_files_per_pattern = 10000  # Higher limit
+    # DEFECT 1 (fixed): this was `max_files_per_pattern = 10000  # Higher limit`.
+    # Combined with the len() guard at :99 and the early `break` at :104, it capped
+    # discovery and silently dropped 14,173 of 24,173 completed job directories --
+    # 58% of the campaign, 845 GB and 8,732 core-hours -- from the analysis. The
+    # loss was differential (30.6% of negatives retained vs ~50% of positives),
+    # which is the mechanism behind the unexplained 2.03:1 class imbalance.
+    # None is now the sentinel for "no cap"; a cap may only be set deliberately.
+    max_files_per_pattern = FILE_DISCOVERY_CAP
     
     print(f"📂 Partitioned search into {len(search_dirs)} segments")
     
@@ -355,14 +475,13 @@ def optimized_file_loader(file_info):
         
         # Parse the directory name format: {drugbank_id}_{gene_name}_{uniprot_id}_cavity_{cavity_number}
         # Note: gene_name can be "nan" (lowercase) for entries without gene symbols
-        import re
-        match = re.match(r'(DB\d+)_([A-Za-z0-9]+)_([A-Z0-9]+)_cavity_(\d+)', dir_name)
-        if match:
-            drugbank_id, gene_name, uniprot_id, cavity_num = match.groups()
-            df['drugbank_id'] = drugbank_id
-            df['uniprot_id'] = uniprot_id
-            df['gene_name'] = gene_name
-            df['cavity_index'] = int(cavity_num)
+        parsed = parse_job_dir_name(dir_name)
+        if parsed:
+            df['drugbank_id'] = parsed['drugbank_id']
+            df['uniprot_id'] = parsed['uniprot_id']
+            df['gene_name'] = parsed['gene_name']
+            df['fragment_id'] = parsed['fragment_id']
+            df['cavity_index'] = parsed['cavity_index']
         else:
             # Fallback: keep existing values or set to Unknown
             if 'drugbank_id' not in df.columns:
@@ -745,11 +864,13 @@ def add_tool_specific_scores(df):
     print(f"\n🏷️  STEP: Adding tool-specific score columns...")
     
     # Create score columns for each tool
-    tools = ['GOLD', 'SMINA', 'LeDock','GNINA']
+    tools = list(CANONICAL_TOOLS)  # DEFECT 3 (fixed): 'LeDock' never matched data 'LEDOCK'
     for tool in tools:
+        _t1 = df['Tool1'].map(canonical_tool)
+        _t2 = df['Tool2'].map(canonical_tool)
         df[f'{tool}_Score'] = np.where(
-            df['Tool1'] == tool, df['Score1'],
-            np.where(df['Tool2'] == tool, df['Score2'], np.nan)
+            _t1 == tool, df['Score1'],
+            np.where(_t2 == tool, df['Score2'], np.nan)
         )
         # Reduce memory footprint (large datasets)
         df[f'{tool}_Score'] = df[f'{tool}_Score'].astype('float32')
@@ -1168,7 +1289,20 @@ def annotate_sample_types(df, metadata_file="/media/onur/Elements/cavity_space_c
             df['cavity_index'] = df['extracted_cavity_index']
         
         # Merge
+        # DEFECT 5 (fixed): this merged on (uniprot_id, drugbank_id, cavity_index),
+        # omitting Fragment_ID. required_structures_with_negatives.csv carries 1,428
+        # keys with >1 row that differ only by fragment, so the merge fanned out and
+        # duplicated 410,087 parquet rows across 179 jobs -- one job 12x, confirmed
+        # by parquet_rows / final_results_rows == the multiplicity exactly.
+        _before = len(df)
         df = df.merge(merge_metadata, on=['uniprot_id', 'drugbank_id', 'cavity_index'], how='left')
+        if len(df) != _before:
+            raise MergeFanOut(
+                "annotate_sample_types merge changed the row count %d -> %d (+%d). "
+                "The key (uniprot_id, drugbank_id, cavity_index) is not unique in the "
+                "metadata -- add Fragment_ID (normalised: the old pipeline wrote 'F1' "
+                "on positives and bare '1' on negatives) or de-duplicate first."
+                % (_before, len(df), len(df) - _before))
         
         annotated_rows = df['sample_type'].notna().sum()
         print(f"   Annotated: {annotated_rows:,}/{len(df):,} ({annotated_rows/len(df)*100:.1f}%)")
@@ -1179,6 +1313,10 @@ def annotate_sample_types(df, metadata_file="/media/onur/Elements/cavity_space_c
             for sample_type, count in sample_counts.items():
                 print(f"      {sample_type}: {count:,}")
         
+    except MergeFanOut:
+        # Integrity failure, not a load failure. Degrading this to NA columns is
+        # how 410,087 duplicated rows reached the analysis unremarked.
+        raise
     except FileNotFoundError:
         print(f"   ⚠️  Metadata file not found: {metadata_file}")
         df['sample_type'] = pd.NA
@@ -1332,13 +1470,14 @@ def filter_complete_tool_coverage(df):
         return df
     
     # Define expected tools
-    expected_tools = ['GOLD', 'Smina', 'LeDock','Gnina']
+    expected_tools = list(CANONICAL_TOOLS)  # DEFECT 4 (fixed): 3 of 4 literals were unmatchable
     
     # Find pairs with complete coverage
     complete_pairs = []
     
     for (drug, target), group in df.groupby(['drugbank_id', 'uniprot_id']):
-        tools_in_group = set(group['Tool1'].dropna()) | set(group['Tool2'].dropna())
+        tools_in_group = {canonical_tool(t) for t in group['Tool1'].dropna()} | {
+            canonical_tool(t) for t in group['Tool2'].dropna()}
         tools_present = [t for t in expected_tools if t in tools_in_group]
         
         if len(tools_present) == len(expected_tools):
