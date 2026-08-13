@@ -249,7 +249,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="redock_queue.csv to write. Omit to skip; the manifest still marks the rows.",
     )
-    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="debug-level logging")
     return parser
 
 

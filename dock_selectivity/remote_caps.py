@@ -1223,16 +1223,19 @@ def _build_parser() -> argparse.ArgumentParser:
                     "against it. Exits %d when the remote cannot serve it."
                     % EXIT_CAPS_FATAL)
     parser.add_argument("--host", help="user@host of the remote GPU machine")
-    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--port", type=int, default=None,
+                        help="ssh port (default: 22)")
     parser.add_argument("--key", default=None, help="ssh private key")
     parser.add_argument("--cpu", type=int, default=60,
                         help="requested gnina --cpu (default: NUM_THREADS, 60)")
-    parser.add_argument("--exhaustiveness", type=int, default=32)
+    parser.add_argument("--exhaustiveness", type=int, default=32,
+                        help="requested gnina exhaustiveness (default: %(default)s)")
     parser.add_argument("--num-modes", type=int, default=None,
                         help="omit to keep consensus_docker's default of 20")
     parser.add_argument("--deadline", type=float, default=1800.0,
                         help="per-job deadline in seconds (default 1800)")
-    parser.add_argument("--image", default=DEFAULT_IMAGE)
+    parser.add_argument("--image", default=DEFAULT_IMAGE,
+                        help="container image checked for on the remote (default: %(default)s)")
     parser.add_argument("--native", default=None,
                         help="native gnina path on the remote; skips the container")
     parser.add_argument("--remote-root", default=DEFAULT_REMOTE_ROOT,
@@ -1245,7 +1248,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="load a canned capability record; never probes")
     parser.add_argument("--cache", default=None,
                         help="cache path (default: no caching)")
-    parser.add_argument("--ttl", type=float, default=DEFAULT_CAPS_TTL_SECONDS)
+    parser.add_argument("--ttl", type=float, default=DEFAULT_CAPS_TTL_SECONDS,
+                        help="seconds a cached probe stays valid (default: %(default)s)")
     parser.add_argument("--json", action="store_true",
                         help="print the report as JSON instead of text")
     parser.add_argument("--strict", action="store_true",

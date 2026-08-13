@@ -1,3 +1,19 @@
+"""Split a multi-molecule SDF into one 3D-prepared file per DrugBank ID.
+
+Reads a combined SDF (e.g. DrugBank's approved-structures export), and for each
+molecule adds hydrogens, embeds 3D coordinates, optimises the geometry and writes
+``<DRUGBANK_ID>.sdf`` into the output folder. That folder is what the pipeline
+passes as ``--ligands``: every docking job looks up its ligand by DrugBank ID, so
+a molecule with no ``DRUGBANK_ID`` property is skipped and reported rather than
+written under a guessed name.
+
+Run once per ligand set, ahead of the pipeline.
+
+Usage::
+
+    python3 split_sdf.py <input.sdf> <output_dir>
+"""
+
 from rdkit import Chem
 from rdkit.Chem import AllChem # Contains functions for 3D operations
 import os

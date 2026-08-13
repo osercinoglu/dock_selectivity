@@ -265,7 +265,8 @@ def build_parser():
     parser.add_argument("--drugs", default=None,
                         help=("small_molecule_drug_links.csv. Resolved from --inputs-dir "
                               "when unset, else %s" % DEFAULT_DRUGS))
-    parser.add_argument("--tarballs", default="/opt/data/cavity_space/af_strong_cavities_data_all")
+    parser.add_argument("--tarballs", default="/opt/data/cavity_space/af_strong_cavities_data_all",
+                        help="folder of CavitySpace cavity tarballs (default: %(default)s)")
     parser.add_argument("--ligands", default=None, help="prepared ligand SDF folder")
     parser.add_argument("--pool", default=None,
                         help=("optional negatives_pool.csv: already-docked "

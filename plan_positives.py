@@ -349,7 +349,8 @@ def build_parser() -> argparse.ArgumentParser:
             "audit.py's G2 check asserts its row count."
         ),
     )
-    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="debug-level logging")
     return parser
 
 

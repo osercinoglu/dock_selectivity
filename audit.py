@@ -1406,8 +1406,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     identity = sub.add_parser("identity", help="G1-G7 + spot checks on the identity index")
-    identity.add_argument("--index", required=True)
-    identity.add_argument("--expect-sha256", default=None)
+    identity.add_argument("--index", required=True,
+                          help="identity_index.parquet to check")
+    identity.add_argument("--expect-sha256", default=None,
+                          help="fail unless the index hashes to this; pins a run to one index")
     identity.add_argument("--meta", default=None, help="identity_index.meta.json")
     identity.add_argument("--unresolved", default=None, help="unresolved_targets.csv")
     identity.add_argument(
@@ -1417,8 +1419,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     curated = sub.add_parser("curated", help="checks on a materialised docking tree")
-    curated.add_argument("--dir", required=True, dest="curated_dir")
-    curated.add_argument("--manifest", required=True)
+    curated.add_argument("--dir", required=True, dest="curated_dir",
+                         help="docking_results directory to check")
+    curated.add_argument("--manifest", required=True,
+                         help="run_manifest.csv the directory is checked against")
     curated.add_argument(
         "--index",
         required=True,
@@ -1442,11 +1446,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     run = sub.add_parser("run", help="cross-stage consistency for a whole run directory")
-    run.add_argument("--run-dir", required=True)
-    run.add_argument("--limit", type=int, default=None)
-    run.add_argument("--skip-determinism", action="store_true")
-    run.add_argument("--no-check-excluded", action="store_true")
-    run.add_argument("--expect", choices=("subset", "exact"), default="subset")
+    run.add_argument("--run-dir", required=True,
+                     help="run directory to check for cross-stage consistency")
+    run.add_argument("--limit", type=int, default=None,
+                     help="scan only the first N job directories")
+    run.add_argument("--skip-determinism", action="store_true",
+                     help="skip the PYTHONHASHSEED subprocess check (reported as SKIP)")
+    run.add_argument("--no-check-excluded", action="store_true",
+                     help="do not walk each job looking for complex_*.pdb / log_*.log")
+    run.add_argument("--expect", choices=("subset", "exact"), default="subset",
+                     help=("'subset': the directory may hold fewer jobs than the "
+                           "manifest; 'exact': it must hold exactly those "
+                           "(default: %(default)s)"))
 
     for subparser in (identity, curated, run):
         _add_common(subparser, suppress=True)

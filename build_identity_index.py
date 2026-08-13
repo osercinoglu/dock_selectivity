@@ -1949,6 +1949,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+        help="logging verbosity (default: %(default)s)",
     )
     return parser
 
