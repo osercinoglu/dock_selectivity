@@ -48,11 +48,50 @@ EOF
 Select engines per run with `--tools`, e.g. `--tools smina,ledock`. RMSD is always
 computed.
 
-### gnina
+### gnina — local or remote GPU
 
 gnina is GPU-only. On a machine with no CUDA runtime the binary fails at load
-(`libcudart.so.12` / `libcudnn.so.9` not found) and there is no CPU fallback — run
-without it and note the reduced tool coverage, or use a GPU host.
+(`libcudart.so.12` / `libcudnn.so.9` not found) and there is no CPU fallback.
+
+`gnina_remote.py` runs it on a remote GPU host instead. It presents gnina's exact
+command line, ships the receptor and ligand over SSH, runs the container there and
+writes `out.sdf` / `out.log` back to the local paths it was given — so
+`consensus_docker.py` cannot tell the difference and nothing else changes:
+
+```bash
+export GNINA_PATH=/home/onur/repos/dock_selectivity/gnina_remote.py
+export GNINA_REMOTE_HOST=user@gpu-host
+export GNINA_REMOTE_PORT=50000
+python3 batch_dock.py --queue … --tools smina,gnina,ledock
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GNINA_REMOTE_HOST` | — | `user@host`, **required** |
+| `GNINA_REMOTE_PORT` | 22 | ssh port |
+| `GNINA_REMOTE_IMAGE` | `gnina/gnina:v1.3.3` | container to run |
+| `GNINA_REMOTE_DIR` | `gnina_jobs` | remote scratch (relative to `$HOME`) |
+| `GNINA_REMOTE_KEY` | — | private key, if not the default |
+| `GNINA_REMOTE_NATIVE` | — | path to a native remote gnina; skips the container |
+
+Auth is SSH keys only — `ssh-copy-id -p <port> ~/.ssh/id_ed25519.pub user@host`
+once. Passwords are unsupported on purpose: this runs unattended per job, and
+`sshpass` would put the secret in the process list or on disk.
+
+Remote host requirements: an NVIDIA GPU with a current driver, Docker, and
+`nvidia-container-toolkit` so `docker run --gpus all` works. Verify with:
+
+```bash
+ssh -p <port> user@host 'docker run --rm --gpus all \
+    nvidia/cuda:12.9.0-base-ubuntu24.04 nvidia-smi --query-gpu=name --format=csv,noheader'
+```
+
+Then `docker pull gnina/gnina:v1.3.3` (23.6 GB download, ~37.5 GB on disk).
+
+Measured on an RTX 3060 Ti (8 GB): ~60 s per job at `--num_modes 5
+--exhaustiveness 8`, ~2.5 min at production settings, with ~300 KB up and ~1–2 MB
+down. Each job pulls its own results as it finishes, so the pipeline's
+skip-if-complete behaviour makes the remote stage resumable with no extra state.
 
 ## Reference data
 

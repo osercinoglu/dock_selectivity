@@ -120,7 +120,10 @@ RMSD_MAX_PARALLEL_JOBS = 16     # Maximum parallel jobs for RMSD calculation
 RMSD_TIMEOUT = 3000              # Timeout for RMSD calculation in seconds
 # --- Consensus Docker Fixed Arguments (from your example) ---
 SMINA_PATH = "/opt/anaconda3/envs/teachopencadd/bin/smina"
-GNINA_PATH = "/home/onur/software/gnina.1.3.2"  # NOTE: needs CUDA 12 + cuDNN 9; see SETUP.md
+# Point this at gnina_remote.py to run gnina on a remote GPU host; it presents the
+# same CLI, so consensus_docker.py cannot tell the difference. See SETUP.md.
+GNINA_PATH = os.environ.get(
+    "GNINA_PATH", "/home/onur/software/gnina.1.3.2")  # native needs CUDA 12 + cuDNN 9
 LEDOCK_PATH = "/home/onur/software/ledock_linux_x86"
 LEPRO_PATH = "/home/onur/software/lepro_linux_x86"
 GOLD_PATH = "/opt/goldsuite-5.3.0/bin/gold_auto"
@@ -1662,7 +1665,34 @@ def run_single_rmsd_job(job_data):
     try:
         # If FORCE_RMSD_RECALCULATION is True, remove existing final results
         if FORCE_RMSD_RECALCULATION:
+            # Never destroy a good result we cannot rebuild. consensus_docker.py
+            # computes RMSD from complex_*.pdb and needs >= 2 tools to have them; if
+            # they were cleaned away, an --only_rmsd run logs "Not enough tools",
+            # exits 0 and writes nothing. Deleting first would turn that into data
+            # loss. Verified in the pilot: smina and ledock kept results.csv (so the
+            # completion check skipped them) while their complexes were gone.
+            _tools_with_poses = rmsd_inputs_present(current_outfolder)
             final_results_file = os.path.join(current_outfolder, 'final_results.csv')
+            if _tools_with_poses < 2:
+                logging.error(
+                    "Job %s: RMSD needs complex_*.pdb from >= 2 tools, found %d in %s. "
+                    "Refusing to delete the existing final_results.csv for a "
+                    "recalculation that cannot succeed. Re-dock the affected tools, or "
+                    "run with --complex-pdb keep so the poses survive.",
+                    job_idx, _tools_with_poses, current_outfolder)
+                return {
+                    'success': False,
+                    'job_idx': job_idx,
+                    'drugbank_id': drugbank_id,
+                    'uniprot_id': uniprot_id,
+                    'gene_name': gene_name,
+                    'pocket_pdb': pocket_pdb,
+                    'current_outfolder': current_outfolder,
+                    'action': 'failed',
+                    'message': 'RMSD inputs missing: only %d tool(s) have complex_*.pdb'
+                               % _tools_with_poses,
+                    'process_id': process_id,
+                }
             if os.path.exists(final_results_file):
                 os.remove(final_results_file)
                 logging.debug(f"Removed final results file for recalculation: {final_results_file}")
