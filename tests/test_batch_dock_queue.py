@@ -219,6 +219,17 @@ class TestComplexPdbCleanup(unittest.TestCase):
             self.assertEqual(batch_dock.cleanup_complex_pdbs(job, "delete"), (0, 0))
             self.assertIn("complex_1.pdb", os.listdir(os.path.join(job, "smina")))
 
+    def test_rmsd_inputs_present_detects_cleaned_jobs(self):
+        """The guard for the trap the pilot found: cleaned complexes, silent RMSD."""
+        with tempfile.TemporaryDirectory() as tmp:
+            job = self._job(tmp)
+            self.assertEqual(batch_dock.rmsd_inputs_present(job), 4)
+            batch_dock.cleanup_complex_pdbs(job, "delete")
+            self.assertEqual(
+                batch_dock.rmsd_inputs_present(job), 0,
+                "after cleanup consensus_docker.py has no complex_*.pdb to compute "
+                "RMSD from, and would exit 0 writing nothing")
+
     def test_bad_mode_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ValueError):

@@ -239,7 +239,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--positives", required=True, help="positives_planned.csv")
     parser.add_argument("--drawn", required=True, help="negatives_drawn.csv")
-    parser.add_argument("--job-classification", required=True, help="job_classification.csv")
+    parser.add_argument("--job-classification", default=None,
+                        help=("job_classification.csv, when an output directory was "
+                              "pre-populated. Omit for a fresh run: nothing is reused, "
+                              "so every planned job is newly docked."))
     parser.add_argument("--out", required=True, help="run_manifest.csv to write")
     parser.add_argument(
         "--redock-out",
@@ -260,7 +263,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         positives = schemas.read_checked(args.positives, "positives_planned")
         drawn = schemas.read_checked(args.drawn, "negatives_drawn")
-        job_classification = schemas.read_checked(args.job_classification, "job_classification")
+        if args.job_classification:
+            job_classification = schemas.read_checked(
+                args.job_classification, "job_classification")
+        else:
+            job_classification = schemas.empty_frame("job_classification")
+            LOG.info("no --job-classification: every planned job is newly docked")
     except (InvariantViolation, OSError, ValueError) as exc:
         LOG.error("%s", exc)
         return 2

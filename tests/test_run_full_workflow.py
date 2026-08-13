@@ -123,10 +123,18 @@ class TestCli(unittest.TestCase):
             ["--run-dir", "/tmp/x", "--skip", "dock", "--skip", "parse"])
         self.assertEqual(args.skip, ["dock", "parse"])
 
-    def test_complex_pdb_defaults_to_delete(self):
-        """Otherwise the new run directory grows back to 1.4 TB of derived files."""
+    def test_complex_pdb_defaults_to_keep(self):
+        """consensus_docker.py computes RMSD FROM complex_*.pdb.
+
+        It discovers poses with glob("complex_*.pdb") and needs two tools to have
+        them. Deleting them by default breaks the RMSD stage -- verified in a live
+        pilot: an --only_rmsd run then logs "Not enough tools with valid results"
+        and exits 0 having written no final_results.csv. They are still 89% of the
+        old campaign's 1.4 TB, so delete/compress remain available as an archival
+        step once the analysis table is built.
+        """
         self.assertEqual(
-            wf.build_parser().parse_args(["--run-dir", "/tmp/x"]).complex_pdb, "delete")
+            wf.build_parser().parse_args(["--run-dir", "/tmp/x"]).complex_pdb, "keep")
 
     def test_no_phases_selected_exits_nonzero(self):
         rc = wf.main(["--run-dir", "/tmp/x", "--only", "nonexistent-phase", "--dry-run"])

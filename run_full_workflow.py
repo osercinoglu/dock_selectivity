@@ -123,8 +123,12 @@ def build_phases(args):
     sample_args = ["--index", identity, "--interactions", interactions,
                    "--positives", positives, "--out", drawn,
                    "--redock-queue", j(manifests, "negatives_redock_queue.csv")]
+    # Exactly one of --pool / --no-pool: the sampler refuses to guess whether
+    # prior results exist, and the runner must not guess on its behalf either.
     if args.pool:
         sample_args += ["--pool", args.pool, "--prefer-pool"]
+    else:
+        sample_args += ["--no-pool"]
     if args.mode != "positives-only":
         phases.append(
             # The stage the old runner never called at all.
@@ -270,7 +274,11 @@ def build_parser():
     parser.add_argument("--job-classification", default=None,
                         help="optional job_classification.csv from bootstrap_output_dir.py")
     parser.add_argument("--complex-pdb", choices=("keep", "delete", "compress"),
-                        default="delete")
+                        default="keep",
+                        help=("consensus_docker.py computes RMSD from complex_*.pdb, "
+                              "so removing them makes RMSD non-recomputable. Keep "
+                              "during a run; delete/compress as an archival step "
+                              "afterwards. Default: %(default)s"))
     parser.add_argument("--skip", action="append", default=[],
                         metavar="PHASE", help="phase key to skip (repeatable)")
     parser.add_argument("--only", action="append", default=[],

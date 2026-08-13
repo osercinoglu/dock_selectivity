@@ -1650,7 +1650,36 @@ def export_prepared_data_optimized(df, output_dir="./"):
         'analysis_ready': True
     }
 
-def main():
+def build_parser():
+    """CLI. Without one this script scanned its hardcoded BASE_DIR regardless of
+    what the caller passed -- so the workflow's --run-dir was ignored and Phase 7
+    read the wrong tree entirely."""
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Parse docking results into the analysis table.")
+    parser.add_argument("--run-dir", default=None,
+                        help="run directory; results are read from <run-dir>/docking_results")
+    parser.add_argument("--results-dir", default=None,
+                        help="explicit results tree (overrides --run-dir)")
+    parser.add_argument("--out", default=None, help="output parquet")
+    parser.add_argument("--manifest", default=None,
+                        help=("run_manifest.csv to check discovery against. Discovery "
+                              "finding fewer jobs than the manifest is the failure that "
+                              "silently dropped 58%% of the last campaign."))
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    global BASE_DIR, POCKET_CLUSTERS_DIR
+    if args.run_dir:
+        BASE_DIR = os.path.abspath(args.run_dir)
+        POCKET_CLUSTERS_DIR = os.path.join(BASE_DIR, "pocketmatch_results", "pocket_clusters")
+        print("run directory: %s" % BASE_DIR)
+    return _main_impl(args)
+
+
+def _main_impl(args=None):
     """
     Main execution function with comprehensive performance monitoring.
     Now includes all notebook processing steps for complete analysis-ready data.

@@ -120,7 +120,7 @@ RMSD_MAX_PARALLEL_JOBS = 16     # Maximum parallel jobs for RMSD calculation
 RMSD_TIMEOUT = 3000              # Timeout for RMSD calculation in seconds
 # --- Consensus Docker Fixed Arguments (from your example) ---
 SMINA_PATH = "/opt/anaconda3/envs/teachopencadd/bin/smina"
-GNINA_PATH = "/workspace/gnina.1.3.2.cuda12.8"  # Path to gnina executable/directory
+GNINA_PATH = "/home/onur/software/gnina.1.3.2"  # NOTE: needs CUDA 12 + cuDNN 9; see SETUP.md
 LEDOCK_PATH = "/home/onur/software/ledock_linux_x86"
 LEPRO_PATH = "/home/onur/software/lepro_linux_x86"
 GOLD_PATH = "/opt/goldsuite-5.3.0/bin/gold_auto"
@@ -483,21 +483,33 @@ def load_drug_target_combinations():
         logging.critical(f"Error loading drug-to-protein TSV: {e}")
         sys.exit(1)
 
-def load_best_mapping_with_pdbqt():
+def load_best_mapping_with_pdbqt(run_dir=None):
     """
     Load the best available mapping file with PDBQT paths.
     Prioritizes fixed PDB mapping, then AlphaFold mapping, then original cavity mapping.
-    
+
+    ``run_dir`` resolves the mapping filenames against ``<run_dir>/manifests`` so a
+    queue-mode run reads the mappings its own structure-prep phases wrote. Without
+    it the names are relative and resolve against the current working directory,
+    which is only correct when you happen to be standing in the run directory.
+
     Returns
     -------
     dict: Dictionary mapping UniProt IDs to lists of (receptor_pdb, pocket_pdb, receptor_pdbqt) tuples
     str: Source file used
     """
+    def _resolve(name):
+        if run_dir:
+            candidate = os.path.join(run_dir, "manifests", os.path.basename(name))
+            if os.path.exists(candidate):
+                return candidate
+        return name
+
     # Define priority order
     mapping_files = [
-        (FIXED_MAPPING_CSV, "fixed structures mapping"),
-        (ALPHAFOLD_MAPPING_CSV, "AlphaFold mapping"),
-        (CAVITY_MAPPING_CSV, "original cavity mapping")
+        (_resolve(FIXED_MAPPING_CSV), "fixed structures mapping"),
+        (_resolve(ALPHAFOLD_MAPPING_CSV), "AlphaFold mapping"),
+        (_resolve(CAVITY_MAPPING_CSV), "original cavity mapping")
     ]
     
     mapping_file = None
@@ -517,7 +529,8 @@ def load_best_mapping_with_pdbqt():
         sys.exit(1)
     
     # Load the mapping with PDBQT support
-    pdbqt_file = PDBQT_MAPPING_CSV if os.path.exists(PDBQT_MAPPING_CSV) else None
+    _pdbqt = _resolve(PDBQT_MAPPING_CSV)
+    pdbqt_file = _pdbqt if os.path.exists(_pdbqt) else None
     mapping_dict = load_cavity_mapping(mapping_file, pdbqt_file)
     
     return mapping_dict, mapping_file
@@ -1983,7 +1996,8 @@ def run_docking(
     pdb_info_dict, 
     processed_ligand_sdf_folder,
     output_base_folder="/media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock/consensus_docking_results",
-    has_explicit_cavities=False
+    has_explicit_cavities=False,
+    prebuilt_jobs=None
 ):
     """
     Iterates through drug-protein pairs, constructs commands, and runs three-stage docking.
@@ -2033,20 +2047,29 @@ def run_docking(
     
     os.makedirs(output_base_folder, exist_ok=True)
 
-    # Pre-build mappings for faster lookup
-    uniprot_gene_map = dict(zip(uniprot_map_df['Mapped_Gene_Name'], uniprot_map_df['Entry']))
+    # Pre-build mappings for faster lookup.
+    # Queue mode never resolves identity: accessions arrive already resolved, so the
+    # corrupted symbol map must not merely go unused -- it must not be built at all.
+    if prebuilt_jobs is not None:
+        uniprot_gene_map = {}
+    else:
+        uniprot_gene_map = dict(zip(uniprot_map_df['Mapped_Gene_Name'], uniprot_map_df['Entry']))
     
-    # Debug: Show some sample mappings
-    logging.info(f"UniProt-Gene mapping contains {len(uniprot_gene_map)} entries")
-    sample_gene_names = list(uniprot_gene_map.keys())[:5]
-    logging.info(f"Sample gene names in UniProt mapping: {sample_gene_names}")
-    sample_uniprot_ids = [uniprot_gene_map[gene] for gene in sample_gene_names]
-    logging.info(f"Corresponding UniProt IDs: {sample_uniprot_ids}")
+    if uniprot_gene_map:
+        logging.info(f"UniProt-Gene mapping contains {len(uniprot_gene_map)} entries")
 
     docking_jobs = [] # List to store job dictionaries
 
+    if prebuilt_jobs is not None:
+        # Queue mode: identity was resolved upstream and each job already names its
+        # receptor, pocket and output directory. Nothing here may re-derive them.
+        docking_jobs = list(prebuilt_jobs)
+        total_docking_jobs = len(docking_jobs)
+        logging.info("Using %d prebuilt job(s) from the queue", total_docking_jobs)
+
     logging.info("Preparing list of docking jobs...")
-    for index, row in tqdm(drug_to_protein_df.iterrows(), total=len(drug_to_protein_df), desc="Preparing Jobs"):
+    for index, row in (tqdm(drug_to_protein_df.iterrows(), total=len(drug_to_protein_df),
+                            desc="Preparing Jobs") if prebuilt_jobs is None else []):
         drugbank_id = row['node_1']
         gene_name = row['node_2_name']
         
@@ -2211,8 +2234,11 @@ def run_docking(
         if len(pocket_suffix) > 50:  # Arbitrary length limit
             pocket_suffix = f"cavity_{cavity_num}"
         
-        output_folder_name = f"{drugbank_id}_{gene_name}_{uniprot_id}_{pocket_suffix}"
-        current_outfolder = os.path.join(output_base_folder, output_folder_name)
+        if job.get('current_outfolder'):
+            current_outfolder = job['current_outfolder']   # queue mode: named upstream
+        else:
+            output_folder_name = f"{drugbank_id}_{gene_name}_{uniprot_id}_{pocket_suffix}"
+            current_outfolder = os.path.join(output_base_folder, output_folder_name)
         
         # Ensure we have absolute paths for all directory operations
         current_outfolder = os.path.abspath(current_outfolder)
@@ -2604,7 +2630,26 @@ class QueueJobError(RuntimeError):
     """Raised when a queue row cannot become a runnable job."""
 
 
-def cleanup_complex_pdbs(job_dir, mode="delete"):
+def rmsd_inputs_present(job_dir):
+    """True if any tool directory still has the complex_*.pdb RMSD is computed from.
+
+    ``consensus_docker.py`` discovers poses with
+    ``glob(os.path.join(folder, "complex_*.pdb"))`` and needs at least two tools to
+    have them. If they have been cleaned away, an ``--only_rmsd`` run logs
+    "Not enough tools with valid results" and exits 0 having written nothing --
+    success by exit code, silence by output. Check before spending the job.
+    """
+    have = 0
+    for tool in ("smina", "gnina", "gold", "ledock"):
+        tool_dir = os.path.join(job_dir, tool)
+        if os.path.isdir(tool_dir) and any(
+            n.startswith("complex_") and n.endswith(".pdb") for n in os.listdir(tool_dir)
+        ):
+            have += 1
+    return have
+
+
+def cleanup_complex_pdbs(job_dir, mode="keep"):
     """Drop or compress ``{tool}/complex_*.pdb`` once ``final_results.csv`` exists.
 
     These are 89% of the old campaign's 1.4 TB. They are DERIVED -- receptor plus
@@ -2655,6 +2700,76 @@ def cleanup_complex_pdbs(job_dir, mode="delete"):
         logging.debug("%s: %s %d complex_*.pdb, reclaimed %.1f MB",
                       job_dir, mode + "d", touched, reclaimed / 1e6)
     return touched, reclaimed
+
+
+def load_queue_mapping(run_dir):
+    """Compose the receptor/pocket mapping for queue mode, explicitly.
+
+    Pockets come from ``cavity_mapping.csv`` and receptors from
+    ``fixed_mapping.csv`` (falling back to ``alphafold_mapping.csv`` only for the
+    receptor column), joined on ``(accession, cavity_index)``. PDBQT paths are
+    merged in from ``pdbqt_mapping.csv`` when present.
+
+    Composing them is not a nicety: ``fix_required_pdbs.py`` fed a redock queue has
+    no pocket path to carry, so its output mapping has ``Pocket_PDB`` = NaN. Taking
+    pockets from the file that actually has them is correct; inferring them from a
+    receptor path would be guessing.
+    """
+    manifests = os.path.join(run_dir, "manifests")
+
+    def _read(name):
+        path = os.path.join(manifests, name)
+        return pd.read_csv(path) if os.path.exists(path) else None
+
+    cavities = _read("cavity_mapping.csv")
+    if cavities is None or "Pocket_PDB" not in cavities.columns:
+        raise FileNotFoundError(
+            "%s/cavity_mapping.csv is required for queue mode: it is the only file "
+            "that carries pocket paths. Run extract_cavities.py --required first."
+            % manifests)
+
+    receptors = None
+    for name in ("pdbqt_mapping.csv", "fixed_mapping.csv", "alphafold_mapping.csv"):
+        frame = _read(name)
+        if frame is not None and "Receptor_PDB" in frame.columns:
+            receptors = frame
+            logging.info("queue mode: receptors from %s", name)
+            break
+    if receptors is None:
+        raise FileNotFoundError(
+            "no receptor mapping in %s (looked for pdbqt/fixed/alphafold). Run the "
+            "structure-prep stages with --required first." % manifests)
+
+    def _key(frame):
+        acc = frame["UniProt_ID"].astype(str).str.strip()
+        cav = pd.to_numeric(frame["Cavity_Index"], errors="coerce")
+        return list(zip(acc, cav))
+
+    rec_by_acc = {}
+    for (acc, _cav), row in zip(_key(receptors), receptors.to_dict("records")):
+        pdb = row.get("Receptor_PDB")
+        pdbqt = row.get("Receptor_PDBQT")
+        if isinstance(pdb, str) and pdb:
+            rec_by_acc.setdefault(acc, (pdb, pdbqt if isinstance(pdbqt, str) else None))
+
+    info = {}
+    missing = []
+    for (acc, cav), row in zip(_key(cavities), cavities.to_dict("records")):
+        pocket = row.get("Pocket_PDB")
+        if not isinstance(pocket, str) or not pocket:
+            continue
+        receptor = rec_by_acc.get(acc)
+        if receptor is None:
+            missing.append(acc)
+            continue
+        info.setdefault(acc, []).append((receptor[0], pocket, receptor[1]))
+
+    if missing:
+        logging.warning("queue mode: %d accession(s) have a pocket but no receptor, "
+                        "e.g. %s", len(set(missing)), sorted(set(missing))[:3])
+    logging.info("queue mode: %d accession(s), %d pocket(s)",
+                 len(info), sum(len(v) for v in info.values()))
+    return info, os.path.join(manifests, "cavity_mapping.csv")
 
 
 def build_jobs_from_queue(queue_df, pdb_info_dict, ligand_folder, output_base_folder):
@@ -2811,9 +2926,30 @@ if __name__ == "__main__":
                          help=('opt in to the OLD gene-symbol resolver at :2034. It is '
                                'last-duplicate-wins over a corrupted column and sent '
                                '633 of 979 targets to the wrong protein. Do not use.'))
+    _parser.add_argument('--tools', default=None,
+                         help=("comma-separated engines to run, e.g. smina,ledock. "
+                               "Overrides the USE_* constants. 'rmsd' is always "
+                               "appended. Engine availability is environment-specific: "
+                               "gnina needs CUDA 12 + cuDNN 9."))
     _parser.add_argument('--test-mode', action='store_true')
     _parser.add_argument('--max-jobs', type=int, default=MAX_TEST_JOBS)
     _args = _parser.parse_args()
+
+    if _args.tools:
+        _want = {t.strip().lower() for t in _args.tools.split(',') if t.strip()}
+        _unknown = _want - {'smina', 'gnina', 'gold', 'ledock', 'rmsd'}
+        if _unknown:
+            logging.critical('unknown engine(s): %s', ', '.join(sorted(_unknown)))
+            sys.exit(2)
+        USE_SMINA = 'smina' in _want
+        USE_GNINA = 'gnina' in _want
+        USE_GOLD = 'gold' in _want
+        USE_LEDOCK = 'ledock' in _want
+        USE_RMSD_CALCULATION = True
+        globals().update(USE_SMINA=USE_SMINA, USE_GNINA=USE_GNINA,
+                         USE_GOLD=USE_GOLD, USE_LEDOCK=USE_LEDOCK,
+                         USE_RMSD_CALCULATION=True)
+        logging.info('*** --tools: %s ***', ', '.join(sorted(_want)))
 
     if _args.queue:
         _out_base = _args.output_base or (
@@ -2830,7 +2966,14 @@ if __name__ == "__main__":
             _queue_df = _queue_df.head(_args.max_jobs)
             logging.info('TEST MODE: limited to %d jobs', len(_queue_df))
 
-        _pdb_info_dict, _mapping_source = load_best_mapping_with_pdbqt()
+        try:
+            if _args.run_dir:
+                _pdb_info_dict, _mapping_source = load_queue_mapping(_args.run_dir)
+            else:
+                _pdb_info_dict, _mapping_source = load_best_mapping_with_pdbqt()
+        except FileNotFoundError as _exc:
+            logging.critical("%s", _exc)
+            sys.exit(2)
         _jobs, _rejects = build_jobs_from_queue(
             _queue_df, _pdb_info_dict, _args.ligands, _out_base)
         logging.info('queue: %d runnable job(s), %d rejected', len(_jobs), len(_rejects))
@@ -2871,6 +3014,17 @@ if __name__ == "__main__":
             logging.critical(f"Critical error in RMSD-only execution: {e}")
             import traceback
             logging.critical(traceback.format_exc())
+            sys.exit(1)
+
+    if _args.queue:
+        try:
+            run_docking(None, None, _pdb_info_dict, _args.ligands,
+                        output_base_folder=_out_base, prebuilt_jobs=QUEUE_JOBS)
+            sys.exit(0)
+        except Exception as _exc:
+            logging.critical("Critical error in queue execution: %s", _exc)
+            import traceback as _tb
+            logging.critical(_tb.format_exc())
             sys.exit(1)
 
     # 4. Load necessary data for docking

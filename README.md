@@ -83,6 +83,10 @@ python3 -m unittest discover -s tests -t .
 
 ## Environment
 
+See `SETUP.md` for the conda environment, the external docking programs and
+reference data locations.
+
+
 conda env `teachopencadd` (Python 3.9): pandas, polars, pyarrow, numpy, tqdm,
 rdkit, biopandas, pdbfixer/openmm, OpenBabel. Docking engines and
 `consensus_docker.py` paths are set at the top of `batch_dock.py`.

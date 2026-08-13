@@ -1568,15 +1568,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--pool",
-        required=True,
+        default=None,
         help=(
             "manifests/negatives_pool.csv -- already-docked non-interactions. "
-            "Required even when empty: this stage never infers its mode from "
-            "which files happen to exist."
+            "Either this or --no-pool is REQUIRED: this stage never infers its "
+            "mode from which files happen to exist."
         ),
     )
     parser.add_argument(
         "--out", required=True, help="manifests/negatives_drawn.csv to write"
+    )
+    parser.add_argument(
+        "--no-pool",
+        action="store_true",
+        help=(
+            "declare that there is NO pool of already-docked non-interactions, so "
+            "every drawn negative is new work. Explicit alternative to --pool; a "
+            "genuinely fresh run must say so rather than have it inferred."
+        ),
     )
     parser.add_argument(
         "--prefer-pool",
@@ -1710,7 +1719,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         index = IdentityIndex.load(args.index, expect_sha256=args.index_sha256)
         interactions = read_checked(args.interactions, "interactions_resolved")
         positives = read_checked(args.positives, "positives_planned")
-        pool = read_checked(args.pool, "negatives_pool")
+        if bool(args.pool) == bool(args.no_pool):
+            logger.error(
+                "pass exactly one of --pool <negatives_pool.csv> or --no-pool. "
+                "This stage will not guess whether prior results exist.")
+            return 2
+        if args.no_pool:
+            pool = empty_frame("negatives_pool")
+            logger.info("--no-pool: every drawn negative will be new work")
+        else:
+            pool = read_checked(args.pool, "negatives_pool")
     except (FileNotFoundError, SchemaViolation) as exc:
         logger.error("input contract violation: %s", exc)
         return EXIT_INPUT
