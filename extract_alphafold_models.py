@@ -27,6 +27,7 @@ Output:
     - alphafold_extraction.log
 """
 
+import argparse
 import os
 import sys
 import pandas as pd
@@ -191,48 +192,90 @@ def process_extraction_task(extraction_task):
             'error': str(e)
         }
 
-def load_required_structures():
-    """Load required structures from CSV file with fallback to cavity mapping."""
-    # Try to load required structures first (preferred)
-    if os.path.exists(REQUIRED_STRUCTURES_CSV):
-        try:
-            df = pd.read_csv(REQUIRED_STRUCTURES_CSV)
-            required_columns = ['UniProt_ID', 'Fragment_ID']
-            missing_columns = [col for col in required_columns if col not in df.columns]
-            
-            if missing_columns:
-                logging.error(f"Required columns missing from required structures: {missing_columns}")
-                logging.info("Falling back to cavity mapping...")
-            else:
-                logging.info(f"Loaded {len(df)} required structures from {REQUIRED_STRUCTURES_CSV}")
-                return df
-                
-        except Exception as e:
-            logging.error(f"Error loading required structures: {e}")
-            logging.info("Falling back to cavity mapping...")
-    
-    # Fallback to cavity mapping
-    if not os.path.exists(CAVITY_MAPPING_CSV):
-        logging.error(f"Neither required structures nor cavity mapping file found")
-        logging.error("Please run identify_required_structures.py or extract_cavities.py first.")
-        sys.exit(1)
-    
+class MissingRequiredSet(RuntimeError):
+    """Raised when the required-structure set is absent or unusable.
+
+    Deliberately fatal. The previous behaviour was to fall back to
+    ``cavity_mapping.csv``, which silently widened the job from 979 accessions /
+    1,005 fragments to 13,600 / 13,975 -- and the 2025-07-02 log shows exactly
+    that happening twice before the corrected 14:47 run. The fallback did log a
+    warning, but a warning inside a multi-thousand-line log is not a decision
+    anybody makes.
+    """
+
+
+def normalize_fragment_number(value):
+    """Return the bare fragment NUMBER from ``1``, ``'1'``, ``'F1'`` or ``'f1'``.
+
+    ``prepare_extraction_tasks`` builds ``AF-{acc}-F{fragment}``, so passing an
+    already-prefixed ``'F1'`` would produce ``AF-P30518-FF1`` and match nothing in
+    the archive. The old inputs used bare integers and the new manifests use
+    ``'F1'``, so both must work.
+    """
+    text = str(value).strip()
+    if text[:1] in ('F', 'f'):
+        text = text[1:]
     try:
-        df = pd.read_csv(CAVITY_MAPPING_CSV)
-        required_columns = ['UniProt_ID', 'Fragment_ID']
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        
-        if missing_columns:
-            logging.error(f"Required columns missing from cavity mapping: {missing_columns}")
-            sys.exit(1)
-        
-        logging.info(f"Loaded {len(df)} structures from cavity mapping (fallback)")
-        logging.warning("Using all cavity structures - for efficiency, run identify_required_structures.py first")
-        return df
-        
-    except Exception as e:
-        logging.error(f"Error loading cavity mapping: {e}")
-        sys.exit(1)
+        return int(text)
+    except (TypeError, ValueError):
+        raise ValueError('cannot read a fragment number from %r' % (value,))
+
+
+def load_required_structures(path=None, allow_fallback=False):
+    """Load the explicit required-structure set. No fallback.
+
+    Args:
+        path: CSV naming the structures to extract. Must carry an accession
+            column (``UniProt_ID`` or ``accession``); ``Fragment_ID`` /
+            ``fragment_id`` is optional and defaults to fragment 1.
+        allow_fallback: retained only so the old call site fails loudly rather
+            than mysteriously. Passing ``True`` raises.
+
+    Raises:
+        MissingRequiredSet: if ``path`` is None, absent, empty, or has no
+            accession column.
+    """
+    if allow_fallback:
+        raise MissingRequiredSet(
+            'allow_fallback=True is no longer supported. Falling back to '
+            'cavity_mapping.csv is what extracted 13,975 structures for a campaign '
+            'that used 1,005. Pass an explicit required set.'
+        )
+    if not path:
+        raise MissingRequiredSet(
+            'no required-structure set given. Run identify_required_structures.py '
+            '(or pass a redock_queue.csv / positives_planned.csv) and supply it with '
+            '--required. A missing prerequisite is an error, never a fallback.'
+        )
+    if not os.path.exists(path):
+        raise MissingRequiredSet('required-structure set not found: %r' % path)
+
+    df = pd.read_csv(path)
+    cols = {c.lower(): c for c in df.columns}
+    acc_col = cols.get('uniprot_id') or cols.get('accession')
+    if not acc_col:
+        raise MissingRequiredSet(
+            '%r has no accession column (looked for UniProt_ID / accession); '
+            'columns are %s' % (path, list(df.columns))
+        )
+
+    frag_col = cols.get('fragment_id')
+    out = pd.DataFrame({'UniProt_ID': df[acc_col].astype(str).str.strip()})
+    if frag_col:
+        out['Fragment_ID'] = [normalize_fragment_number(v) for v in df[frag_col]]
+    else:
+        logging.warning('%r has no Fragment_ID column; assuming fragment 1', path)
+        out['Fragment_ID'] = 1
+
+    out = out.drop_duplicates().reset_index(drop=True)
+    if out.empty:
+        raise MissingRequiredSet('required-structure set %r is empty' % path)
+
+    logging.info(
+        'required set: %d (accession, fragment) pairs over %d accessions from %s',
+        len(out), out['UniProt_ID'].nunique(), path,
+    )
+    return out
 
 def prepare_extraction_tasks(structures_df, archive_path, output_dir):
     """
@@ -343,33 +386,65 @@ def create_alphafold_mapping(structures_df, output_dir):
     updated_df = pd.DataFrame(updated_rows)
     return updated_df
 
-def main():
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description=(
+            'Extract AlphaFold models for an EXPLICIT required set. There is no '
+            'fallback to cavity_mapping.csv: that is what extracted 5,661 accession '
+            'directories for a campaign that used 979.'
+        )
+    )
+    parser.add_argument('--required', default=None,
+                        help=('CSV naming the structures to extract (required_structures.csv, '
+                              'redock_queue.csv, positives_planned.csv). MANDATORY.'))
+    parser.add_argument('--archive', default=ALPHAFOLD_ARCHIVE,
+                        help='local AlphaFold tar archive (default: %(default)s)')
+    parser.add_argument('--out-dir', default=OUTPUT_AF_DIR,
+                        help='extraction destination (default: %(default)s)')
+    parser.add_argument('--out', default=OUTPUT_MAPPING_CSV,
+                        help='mapping CSV to write (default: %(default)s)')
+    parser.add_argument('--threads', type=int, default=NUM_THREADS,
+                        help='extraction threads (default: %(default)s)')
+    return parser
+
+
+def main(argv=None):
     """Main function for AlphaFold model extraction."""
+    args = build_parser().parse_args(argv)
     start_time = time.time()
-    
+
+    archive = args.archive
+    out_dir = args.out_dir
+    out_csv = args.out
+    threads = args.threads
+
     logging.info("Starting AlphaFold model extraction workflow")
-    logging.info(f"Input (preferred): {REQUIRED_STRUCTURES_CSV}")
-    logging.info(f"Input (fallback): {CAVITY_MAPPING_CSV}")
-    logging.info(f"Archive: {ALPHAFOLD_ARCHIVE}")
-    logging.info(f"Output directory: {OUTPUT_AF_DIR}")
-    logging.info(f"Output mapping: {OUTPUT_MAPPING_CSV}")
-    logging.info(f"Number of threads: {NUM_THREADS}")
+    logging.info(f"Required set: {args.required}")
+    logging.info(f"Archive: {archive}")
+    logging.info(f"Output directory: {out_dir}")
+    logging.info(f"Output mapping: {out_csv}")
+    logging.info(f"Number of threads: {threads}")
     logging.info(f"Database version: {DATABASE_VERSION}")
-    
+
+    # Load the required set FIRST: without it there is nothing legitimate to do,
+    # and the old code's answer to that was to extract the entire database.
+    try:
+        structures_df = load_required_structures(args.required)
+    except (MissingRequiredSet, ValueError) as exc:
+        logging.error("%s", exc)
+        return 2
+
     # Check if archive exists
-    if not os.path.exists(ALPHAFOLD_ARCHIVE):
-        logging.error(f"AlphaFold archive not found: {ALPHAFOLD_ARCHIVE}")
+    if not os.path.exists(archive):
+        logging.error(f"AlphaFold archive not found: {archive}")
         logging.error("Please check the path to the AlphaFold database archive.")
-        sys.exit(1)
-    
+        return 2
+
     # Create output directory
-    os.makedirs(OUTPUT_AF_DIR, exist_ok=True)
-    
-    # Load required structures (with fallback to cavity mapping)
-    structures_df = load_required_structures()
-    
+    os.makedirs(out_dir, exist_ok=True)
+
     # Prepare extraction tasks
-    extraction_tasks, stats = prepare_extraction_tasks(structures_df, ALPHAFOLD_ARCHIVE, OUTPUT_AF_DIR)
+    extraction_tasks, stats = prepare_extraction_tasks(structures_df, archive, out_dir)
     
     if not extraction_tasks:
         logging.info("No extraction tasks needed. All required AlphaFold structures are already available.")
@@ -385,7 +460,7 @@ def main():
         successful_extractions = 0
         failed_extractions = 0
         
-        with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
+        with ThreadPoolExecutor(max_workers=threads) as executor:
             # Submit all tasks
             future_to_task = {executor.submit(process_extraction_task, task): task for task in extraction_tasks}
             
@@ -406,11 +481,11 @@ def main():
         logging.info(f"Time saved by skipping existing files: Significant!")
     
     # Create AlphaFold mapping CSV
-    alphafold_df = create_alphafold_mapping(structures_df, OUTPUT_AF_DIR)
-    alphafold_df.to_csv(OUTPUT_MAPPING_CSV, index=False)
+    alphafold_df = create_alphafold_mapping(structures_df, out_dir)
+    alphafold_df.to_csv(out_csv, index=False)
     
     # Summary statistics
-    total_structure_files = len([f for f in Path(OUTPUT_AF_DIR).rglob("*.pdb")])
+    total_structure_files = len([f for f in Path(out_dir).rglob("*.pdb")])
     available_structures = len(alphafold_df[alphafold_df['AlphaFold_Available'] == True])
     
     elapsed_time = time.time() - start_time
@@ -422,7 +497,7 @@ def main():
     logging.info(f"Found in archive: {stats['found_in_archive']}")
     logging.info(f"AlphaFold PDB files extracted/found: {total_structure_files}")
     logging.info(f"Available structures: {available_structures}")
-    logging.info(f"Updated mapping saved to: {OUTPUT_MAPPING_CSV}")
+    logging.info(f"Updated mapping saved to: {out_csv}")
     logging.info(f"Total processing time: {elapsed_time:.2f} seconds")
     
     # Verify the output
@@ -433,5 +508,8 @@ def main():
     else:
         logging.info("All entries have corresponding AlphaFold structures!")
 
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

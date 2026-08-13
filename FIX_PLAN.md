@@ -44,7 +44,7 @@ retired) on their own schedule.
 | §3.3 `batch_dock.py` (`:2034`, `:2211`, post-job cleanup hook) | — | **○** |
 | §3.4 `parse_prepare.py` (all five defects) | — | **○** |
 | §3.5 `extract_cavities.py` — `--manifest-only` (names, no unpacking) + mandatory `--required` | `extract_cavities.py` | **I** |
-| §3.6 `extract_alphafold_models.py` | — | **○** |
+| §3.6 `extract_alphafold_models.py` — fallback deleted, `--required` mandatory | `extract_alphafold_models.py` | **I** |
 | §3.7 `create_ic50_mapping.py` (coverage lift only; not corrupt) | — | **○** |
 | §3.8 `run_full_workflow.py` | — | **○** |
 | `positives_planned.csv` producer | **new** `plan_positives.py` | **I** |
