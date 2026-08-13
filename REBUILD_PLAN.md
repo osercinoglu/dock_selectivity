@@ -475,6 +475,46 @@ Three naming details that matter, because two artifacts would otherwise collide:
 
 ---
 
+## 2b. Validation status — run against the real data on 2026-08-13
+
+Phases 0–2 and 6's manifest step were executed against the real inputs, read-only,
+with all output to scratch. Results and one correction:
+
+| Stage | Real-data result |
+|---|---|
+| `build_identity_index.py` (authoritative) | 210,709 accessions, 19,323 Entrez ids, **max_collapse = 1** |
+| `resolve_interactions.py` | 8,568 edges → **7,923 resolved**, 645 rejected with reasons; **229 resolved that carry a null `node_2_name`** (unreachable by the old symbol resolver) and 143 from `node_1` name slugs |
+| Identity spot checks | AVPR2→P30518, TUBA1B→P68363, IL2→P60568, BRAF→P15056, BCL2→P10415, ALK→Q9UM73 — every documented corruption case correct |
+| `extract_cavities.py --manifest-only` | 38,709 rows / 13,600 accessions in **0.4 s, nothing unpacked**; key set **identical** to the `cavity_mapping.csv` the old code produced by unpacking 76 GB |
+| `salvage_scan.py` | 24,173 dirs in 5.7 s: **7,279 true_positive, 16,600 valid_non_interaction, 294 incomplete, 0 unparseable** |
+
+The salvage split cross-validates the forensic estimate exactly: 7,300 + 16,873 =
+24,173 (forensics) versus 7,279 + 16,600 + **294 incomplete** = 24,173 here — the
+difference is precisely the incomplete jobs the forensic pass folded into the two
+classes. `unparseable = 0` confirms the right-anchored parse handles every real name.
+
+### CORRECTION — `REDUCED_LOCAL` cannot drive Phase 1
+
+An earlier draft of this plan said the reduced index built from the legacy
+`uniprot_gene_mapping.csv` was "the way to start today". **It is not.** That file
+has no Entrez column, so the index carries **0 Entrez ids**, and since the
+corrected design resolves only on Entrez, `resolve_interactions.py` returns
+**8,568 in, 0 resolved, 8,568 rejected as UNKNOWN_ENTREZ**. The reduced index is
+useful for `accession → label` lookups (the salvage path) and nothing else.
+
+Phase 0 therefore **requires** the authoritative UniProt inputs. Both are public
+and were fetched successfully:
+
+```
+https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/idmapping/by_organism/HUMAN_9606_idmapping.dat.gz   # 36 MB
+https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/reference_proteomes/Eukaryota/UP000005640/UP000005640_9606.fasta.gz  # 7.7 MB
+```
+
+Release 2026-06-10. Store them somewhere durable and pass `--idmapping` /
+`--proteome`; the builder refuses to run without them rather than degrading.
+
+---
+
 ## 3. Runbook
 
 Every command below is the **real CLI of the script as it exists today** unless the phase is explicitly

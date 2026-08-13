@@ -394,6 +394,29 @@ def parse_job_dir(name: Any) -> JobIdentity:
         raise JobIdParseError("{0!r}: {1}".format(base, exc))
 
 
+def normalize_accession_set(known_accessions):
+    """Normalise an accession collection ONCE, for reuse across many parses.
+
+    :func:`parse_legacy_job_dir` normalises its ``known_accessions`` argument on
+    every call, which is O(A) per directory. Scanning the real campaign (24,173
+    directories) against the authoritative index (210,709 accessions) that way is
+    5.1e9 string operations. Build this once and pass the result instead; the
+    parser recognises a ``frozenset`` and reuses it verbatim.
+
+    Returns a ``frozenset`` of upper-cased, stripped, non-empty accessions.
+    """
+    if isinstance(known_accessions, str):
+        raise JobIdError(
+            "known_accessions must be a collection of accessions, got the bare "
+            "string {0!r}; iterating it would test single characters".format(
+                known_accessions
+            )
+        )
+    return frozenset(
+        str(a).strip().upper() for a in known_accessions if str(a).strip()
+    )
+
+
 def parse_legacy_job_dir(
     name: Any,
     known_accessions: Collection[str],
@@ -429,9 +452,17 @@ def parse_legacy_job_dir(
                 known_accessions
             )
         )
-    accessions = {
-        str(a).strip().upper() for a in known_accessions if str(a).strip()
-    }
+    # Normalising the accession set is O(len(known_accessions)), so doing it per
+    # call makes a scan over N directories O(N * A). That is invisible on a
+    # 10-directory fixture and crippling in production: 24,173 real directories
+    # against the 210,709-accession authoritative index is 5.1e9 string
+    # operations, ~6 CPU-minutes, versus well under a second here. Callers in a
+    # loop should pass a normalised frozenset (see normalize_accession_set) --
+    # which this recognises and reuses instead of rebuilding.
+    if type(known_accessions) is frozenset:
+        accessions = known_accessions
+    else:
+        accessions = normalize_accession_set(known_accessions)
     if not accessions:
         raise JobIdError(
             "parse_legacy_job_dir() requires a non-empty known_accessions set "

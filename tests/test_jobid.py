@@ -26,6 +26,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+from dock_selectivity import jobid  # noqa: E402
 from dock_selectivity.jobid import (  # noqa: E402
     DELIM,
     JOB_IDENTITY_FILENAME,
@@ -577,3 +578,61 @@ print("\n".join(lines))
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAccessionSetNormalisationIsHoistable(unittest.TestCase):
+    """Regression: parse_legacy_job_dir must not renormalise a big set per call.
+
+    Found by running the real chain, not by a fixture. parse_legacy_job_dir
+    normalised its known_accessions argument on every call, making a scan over N
+    directories O(N * A). At production scale -- 24,173 real job directories
+    against the 210,709-accession authoritative index -- that measured 35 minutes
+    of pure CPU. Passing a pre-normalised frozenset is 10,173x faster (0.21s).
+
+    Hermetic tests could never catch this: they use ~10 directories and a
+    handful of accessions, where both paths are instant.
+    """
+
+    def test_normalize_accession_set_returns_a_frozenset(self):
+        out = jobid.normalize_accession_set([" p30518 ", "q8nct1", "", "   "])
+        self.assertIsInstance(out, frozenset)
+        self.assertEqual(out, frozenset({"P30518", "Q8NCT1"}))
+
+    def test_normalize_rejects_a_bare_string(self):
+        with self.assertRaises(jobid.JobIdError):
+            jobid.normalize_accession_set("P30518")
+
+    def test_prenormalised_frozenset_is_reused_not_rebuilt(self):
+        """The fast path must be taken for a frozenset, and give identical results."""
+        raw = {"P30518", "Q8NCT1"}
+        norm = jobid.normalize_accession_set(raw)
+        name = "DB00035_AVPR2_P30518_cavity_2"
+        self.assertEqual(
+            jobid.parse_legacy_job_dir(name, raw),
+            jobid.parse_legacy_job_dir(name, norm),
+        )
+
+    def test_frozenset_path_does_not_scale_with_set_size(self):
+        """The whole point: parse cost must be independent of |accessions|."""
+        import time
+
+        small = jobid.normalize_accession_set({"P30518"})
+        large = jobid.normalize_accession_set(
+            {"P%05d" % i for i in range(60000)} | {"P30518"}
+        )
+        name = "DB00035_AVPR2_P30518_cavity_1"
+
+        def timed(accs, n=300):
+            start = time.time()
+            for _ in range(n):
+                jobid.parse_legacy_job_dir(name, accs)
+            return time.time() - start
+
+        timed(small, 50)  # warm up
+        t_small, t_large = timed(small), timed(large)
+        # A per-call rebuild would make the large set thousands of times slower.
+        self.assertLess(
+            t_large, max(t_small * 20, 0.5),
+            "parse scales with accession-set size: %.4fs vs %.4fs -- the "
+            "normalisation is being rebuilt per call again" % (t_large, t_small),
+        )
