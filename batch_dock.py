@@ -130,6 +130,46 @@ GOLD_PATH = "/opt/goldsuite-5.3.0/bin/gold_auto"
 NUM_THREADS = 60
 CUTOFF_VALUE = -7
 
+# --- DECOUPLED (ASYNCHRONOUS) GNINA ---------------------------------------
+# gnina is GPU-only and the GPU is on another machine, so stage 2 does not have
+# to block the local pipeline. With GNINA_ASYNC=1 the gnina stage hands its jobs
+# to a queue and returns immediately; a separate collector process (gnina_collect.py)
+# feeds the single remote GPU one job at a time and drops each result into the job
+# directory, while smina/GOLD/LeDock keep the local cores busy. A barrier before
+# stage 5 waits for the outstanding gnina results, because consensus RMSD is
+# computed from complex_*.pdb and cannot run for a job whose gnina has not landed.
+#
+# DEFAULT IS OFF. GNINA_ASYNC=0 is today's blocking stage, unchanged: a
+# reproduction run must not silently take a different path.
+GNINA_ASYNC = os.environ.get("GNINA_ASYNC", "0") == "1"
+# Validate the remote host's capabilities even when gnina runs the old blocking way.
+GNINA_VALIDATE_CAPS = os.environ.get("GNINA_VALIDATE_CAPS", "0") == "1"
+# Make a merely-oversubscribed request (e.g. --cpu 60 on a 24-core box) fatal.
+GNINA_STRICT_CAPS = os.environ.get("GNINA_STRICT_CAPS", "0") == "1"
+# Seconds the RMSD barrier waits. 0/unset -> computed from the queue's own
+# throughput (see gnina_queue.wait_for_completion), never infinite.
+GNINA_BARRIER_TIMEOUT = float(os.environ.get("GNINA_BARRIER_TIMEOUT", "0")) or None
+# Per-job deadline on the remote. Also calibrates the "is this exhaustiveness
+# even runnable there?" check that refuses the run up front.
+GNINA_JOB_DEADLINE = float(os.environ.get("GNINA_JOB_DEADLINE", "1800"))
+GNINA_MAX_ATTEMPTS = int(os.environ.get("GNINA_MAX_ATTEMPTS", "3"))
+GNINA_COLLECTOR_AUTOSTART = os.environ.get("GNINA_COLLECTOR_AUTOSTART", "1") == "1"
+GNINA_LEAVE_COLLECTOR = os.environ.get("GNINA_LEAVE_COLLECTOR", "0") == "1"
+# Admit a job to RMSD with >= 2 tools even though gnina never landed. This
+# changes WHICH tools contribute to a consensus RMSD, so it is a scientific
+# switch, not a convenience: default off, and every admitted job is named.
+GNINA_PARTIAL_RMSD = os.environ.get("GNINA_PARTIAL_RMSD", "0") == "1"
+# Queue state lives here; default <run_dir>/gnina_queue. Point it at an ext4 path
+# when the run directory is on the fuseblk external drive.
+GNINA_QUEUE_DIR = os.environ.get("GNINA_QUEUE_DIR") or None
+# A canned capability file (see dock_selectivity/remote_caps.py --caps-file):
+# validate against measured numbers instead of probing the GPU host.
+GNINA_CAPS_FILE = os.environ.get("GNINA_CAPS_FILE") or None
+# The pump. Module-level so tests can point it at a stub instead of spawning
+# the real collector.
+GNINA_COLLECTOR_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "gnina_collect.py")
+
 # Set up logging
 logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -2020,6 +2060,524 @@ def run_stage_jobs(job_data_list, stage_name, job_function, max_workers, timeout
         'unique_processes': len(unique_processes)
     }
 
+
+# ---------------------------------------------------------------------------
+# DECOUPLED GNINA -- the stage that does not block
+# ---------------------------------------------------------------------------
+#
+# Five stages run in sequence today, and stage 2 (gnina) is the one that does not
+# use the local machine at all: gnina is GPU-only, the GPU is on another host, and
+# ``gnina_remote.py`` already ships each job there. Waiting for it keeps 60 local
+# cores idle for the length of the whole gnina stage.
+#
+# With ``GNINA_ASYNC=1``:
+#
+#   * every job is enqueued BEFORE stage 1, so the remote GPU starts working while
+#     smina is still running locally;
+#   * ``gnina_collect.py`` (the pump) submits ONE job at a time -- the remote has a
+#     single GPU, so parallelism there would only make the jobs fight -- and drops
+#     each finished result into ``<job>/gnina/`` by re-invoking consensus_docker.py
+#     in collect mode, so the poses and CNN scores are produced by exactly the same
+#     code as today;
+#   * a barrier before stage 5 waits for what is still outstanding, because
+#     consensus RMSD globs ``complex_*.pdb`` per tool and cannot run for a job whose
+#     gnina has not landed.
+#
+# Everything here is inert unless GNINA_ASYNC is set, and every import of the new
+# modules is LAZY: batch_dock.py must keep importing (and its tests keep passing)
+# on a machine where none of this is configured.
+
+def gnina_async_enabled():
+    """True when the gnina stage should enqueue instead of block.
+
+    Read through a function rather than the global directly so that a
+    command-line override (``--gnina-async``) applies everywhere, including in
+    helpers called long after argument parsing.
+    """
+    return bool(GNINA_ASYNC)
+
+
+def gnina_run_dir(output_base_folder):
+    """The run directory that owns a given docking output folder.
+
+    Job directories live in ``<run_dir>/docking_results/<job_id>``, so the run
+    directory -- which is where the gnina queue, its logs and its summary live --
+    is the parent of the output base. ``--run-dir X`` always produces
+    ``X/docking_results`` as the output base, so this recovers exactly ``X``.
+    """
+    return os.path.dirname(os.path.abspath(output_base_folder))
+
+
+def _gnina_queue_root(run_dir):
+    """Where the queue's state files live (GNINA_QUEUE_DIR, else <run>/gnina_queue)."""
+    try:
+        from dock_selectivity import gnina_queue as _queue
+    except ImportError:
+        _queue = None
+    if _queue is not None:
+        try:
+            return _queue.queue_root(run_dir, GNINA_QUEUE_DIR)
+        except Exception:      # pragma: no cover - defensive: never fail on a path
+            pass
+    if GNINA_QUEUE_DIR:
+        return os.path.abspath(GNINA_QUEUE_DIR)
+    return os.path.join(os.path.abspath(run_dir), "gnina_queue")
+
+
+def _gnina_job_id(job_dir):
+    """The queue's job id for a job directory: its basename."""
+    return os.path.basename(os.path.normpath(job_dir))
+
+
+def _previous_effective_cpu(run_dir):
+    """The --cpu this campaign was already frozen at, or None.
+
+    Clamping ``--cpu`` is not result-neutral (gnina spreads its Monte-Carlo chains
+    over threads), so the number is resolved once and a mid-campaign change is
+    refused rather than silently applied to the second half of the data.
+    """
+    import json as _json
+    path = os.path.join(_gnina_queue_root(run_dir), "params.json")
+    try:
+        with open(path) as handle:
+            previous = _json.load(handle)
+    except (OSError, ValueError):
+        return None
+    cpu = previous.get("cpu") if isinstance(previous, dict) else None
+    try:
+        return int(cpu)
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_gnina_caps(run_dir, strict=False):
+    """Check ONCE, before any job is submitted, that the remote can do this run.
+
+    "If exhaustiveness required for gnina is too much for remote device we shall
+    warn and exit" -- and the moment to do that is now, not after four hours of
+    smina. Returns the report (whose ``effective_cpu`` is frozen into the queue's
+    params) or None when there is nothing to validate; exits 78 (EX_CONFIG) on any
+    FATAL finding, which is distinct from batch_dock's existing 2 and 3.
+    """
+    async_mode = gnina_async_enabled()
+    host = os.environ.get("GNINA_REMOTE_HOST")
+    if not host:
+        if async_mode:
+            logging.critical(
+                "GNINA_ASYNC=1 needs GNINA_REMOTE_HOST: the decoupled stage runs "
+                "gnina on a remote GPU host and there is no local fallback. Set "
+                "GNINA_REMOTE_HOST (see SETUP.md) or drop gnina from --tools.")
+            sys.exit(78)
+        logging.warning("GNINA_VALIDATE_CAPS is set but GNINA_REMOTE_HOST is not; "
+                        "nothing to validate (gnina is not running remotely).")
+        return None
+
+    try:
+        from dock_selectivity import remote_caps
+    except ImportError as exc:
+        if async_mode:
+            logging.critical(
+                "GNINA_ASYNC=1 needs dock_selectivity/remote_caps.py, which failed "
+                "to import (%s). Refusing to submit a campaign to a host whose "
+                "capacity was never checked.", exc)
+            sys.exit(78)
+        logging.warning("capability validation skipped: %s", exc)
+        return None
+
+    port = os.environ.get("GNINA_REMOTE_PORT")
+    try:
+        port = int(port) if port else None
+    except ValueError:
+        port = None
+    key = os.environ.get("GNINA_REMOTE_KEY") or None
+    native = os.environ.get("GNINA_REMOTE_NATIVE") or None
+    image, remote_root = _gnina_remote_defaults()
+
+    try:
+        if GNINA_CAPS_FILE:
+            logging.info("gnina capabilities: reading %s (no probe)", GNINA_CAPS_FILE)
+            caps = remote_caps.load_caps(GNINA_CAPS_FILE)
+        else:
+            cache_path = os.path.join(_gnina_queue_root(run_dir), "caps.json")
+            try:
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            except OSError as exc:
+                logging.warning("cannot create %s (%s); probing without a cache",
+                                os.path.dirname(cache_path), exc)
+                cache_path = None
+            caps = remote_caps.get_caps(host, port=port, key=key,
+                                        cache_path=cache_path, image=image,
+                                        native=native, remote_root=remote_root)
+    except Exception as exc:
+        if async_mode:
+            logging.critical(
+                "could not read the capabilities of %s (%s). The whole gnina stage "
+                "depends on that host; refusing to start a campaign blind. Fix the "
+                "connection, or pass GNINA_CAPS_FILE with a recorded probe.",
+                host, exc)
+            sys.exit(78)
+        logging.warning("capability probe of %s failed (%s); continuing because "
+                        "gnina is running the old blocking way", host, exc)
+        return None
+
+    request = remote_caps.DockRequest(
+        cpu=int(NUM_THREADS),
+        exhaustiveness=int(GNINA_EXHAUSTIVENESS),
+        num_modes=None,          # do not pass --num_modes: consensus_docker's
+                                 # default of 20 is what today's runs use
+        job_deadline_seconds=float(GNINA_JOB_DEADLINE),
+        image=image,
+        native=native,
+        gnina_path=GNINA_PATH,
+        async_mode=async_mode,
+    )
+    report = remote_caps.validate_request(
+        caps, request, strict=strict,
+        previous_effective_cpu=_previous_effective_cpu(run_dir))
+    code = remote_caps.enforce(report, logger=logging.getLogger(), strict=strict)
+    if code:
+        logging.critical(
+            "remote gnina capability check FAILED -- exiting %d before submitting "
+            "any job. Nothing has been docked and nothing has been enqueued.", code)
+        sys.exit(code)
+    return report
+
+
+def _gnina_remote_defaults():
+    """(image, remote_root) for the remote host, from gnina_remote.py's own defaults."""
+    image = "gnina/gnina:v1.3.3"
+    remote_root = "gnina_jobs"
+    try:
+        import gnina_remote as _remote
+        image = getattr(_remote, "DEFAULT_IMAGE", image)
+        remote_root = getattr(_remote, "DEFAULT_REMOTE_DIR", remote_root)
+    except ImportError:
+        pass
+    return (os.environ.get("GNINA_REMOTE_IMAGE") or image,
+            os.environ.get("GNINA_REMOTE_DIR") or remote_root)
+
+
+def gnina_params_from_config(caps_report):
+    """Freeze the docking parameters this campaign's gnina jobs will use.
+
+    Written once into the queue, so a campaign cannot silently change parameters
+    halfway: the pump refuses to run against a different set. ``num_modes`` is
+    deliberately None -- passing it would override consensus_docker's default of
+    20, which is a silent change to the science.
+    """
+    import datetime as _datetime
+
+    effective_cpu = getattr(caps_report, "effective_cpu", None)
+    try:
+        cpu = int(effective_cpu)
+    except (TypeError, ValueError):
+        cpu = int(NUM_THREADS)
+    port = os.environ.get("GNINA_REMOTE_PORT")
+    try:
+        port = int(port) if port else None
+    except ValueError:
+        port = None
+    image, remote_root = _gnina_remote_defaults()
+    return {
+        "schema_version": 1,
+        "cpu": cpu,
+        "exhaustiveness": int(GNINA_EXHAUSTIVENESS),
+        "num_modes": None,
+        "cutoff_value": float(CUTOFF_VALUE),
+        "consensus_docker_script": os.path.abspath(CONSENSUS_DOCKER_SCRIPT),
+        "gnina_path": os.path.abspath(GNINA_PATH),
+        "image": image,
+        "host": os.environ.get("GNINA_REMOTE_HOST"),
+        "port": port,
+        "key": os.environ.get("GNINA_REMOTE_KEY") or None,
+        "native": os.environ.get("GNINA_REMOTE_NATIVE") or None,
+        "remote_root": remote_root,
+        "job_deadline_seconds": float(GNINA_JOB_DEADLINE),
+        "max_attempts": int(GNINA_MAX_ATTEMPTS),
+        "created_at": _datetime.datetime.now(_datetime.timezone.utc)
+                               .strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+    }
+
+
+def enqueue_gnina_jobs(job_data_list, run_dir, params):
+    """Hand every gnina job to the queue. Idempotent: a re-run resumes.
+
+    Jobs whose gnina outputs already exist land straight in COLLECTED, so the
+    pump never re-docks finished work -- the same skip-if-done rule the blocking
+    stage has always had, moved into the queue.
+    """
+    try:
+        from dock_selectivity import gnina_queue
+    except ImportError as exc:
+        logging.critical("GNINA_ASYNC=1 needs dock_selectivity/gnina_queue.py, "
+                         "which failed to import (%s). Run without --gnina-async "
+                         "to use the blocking gnina stage.", exc)
+        sys.exit(2)
+
+    queue_obj = gnina_queue.GninaQueue(run_dir, queue_dir=GNINA_QUEUE_DIR, create=True)
+    try:
+        stats = queue_obj.enqueue_many(job_data_list, params)
+    except getattr(gnina_queue, "QueueError", ()) as exc:
+        logging.critical(
+            "the gnina queue at %s refused these jobs: %s. This usually means the "
+            "docking parameters changed mid-campaign; that is refused on purpose. "
+            "Use a fresh --queue-dir, or restore the previous parameters.",
+            queue_obj.root, exc)
+        sys.exit(2)
+    stats = dict(stats or {})
+    logging.info(
+        "gnina queue %s: %d enqueued, %d already queued, %d already complete "
+        "(the remote GPU starts on them now, while stage 1 runs locally)",
+        queue_obj.root, stats.get("enqueued", 0), stats.get("already_present", 0),
+        stats.get("already_complete", 0))
+    return stats
+
+
+def _log_gnina_queue_counts(run_dir, prefix="gnina queue"):
+    """Best-effort one-line census of the queue. Never raises: it is only a log."""
+    try:
+        from dock_selectivity import gnina_queue
+        counts = gnina_queue.GninaQueue(run_dir, queue_dir=GNINA_QUEUE_DIR,
+                                        create=False).counts()
+    except Exception as exc:
+        logging.debug("%s: counts unavailable (%s)", prefix, exc)
+        return {}
+    counts = dict(counts or {})
+    logging.info("%s: %s", prefix,
+                 ", ".join("%s=%s" % (k, counts[k]) for k in sorted(counts)) or "empty")
+    return counts
+
+
+def start_gnina_collector(run_dir, logger=None):
+    """Spawn the pump that feeds the remote GPU and collects results.
+
+    Detached (``start_new_session``) on purpose: a Ctrl-C of batch_dock should not
+    kill a collector that is half-way through downloading a 150-second GPU result.
+    :func:`stop_gnina_collector` is how it is asked to stop.
+    """
+    log = logger or logging.getLogger()
+    if not GNINA_COLLECTOR_AUTOSTART:
+        log.info("gnina collector autostart is OFF; start it yourself with: "
+                 "python %s --run-dir %s --daemon", GNINA_COLLECTOR_SCRIPT, run_dir)
+        return None
+    if not os.path.exists(GNINA_COLLECTOR_SCRIPT):
+        log.error("gnina collector not found at %s; jobs are enqueued but nothing "
+                  "will run them. Start a collector by hand or re-run once it exists.",
+                  GNINA_COLLECTOR_SCRIPT)
+        return None
+
+    queue_root = _gnina_queue_root(run_dir)
+    try:
+        os.makedirs(queue_root, exist_ok=True)
+        stop_file = os.path.join(queue_root, "STOP")
+        if os.path.exists(stop_file):
+            # A previous run asked the pump to stop. Leaving the file would stop
+            # this one the moment it started.
+            os.remove(stop_file)
+            log.info("cleared a leftover STOP file at %s", stop_file)
+    except OSError as exc:
+        log.warning("could not prepare %s: %s", queue_root, exc)
+
+    command = [sys.executable, GNINA_COLLECTOR_SCRIPT, "--run-dir", run_dir,
+               "--daemon", "--max-attempts", str(GNINA_MAX_ATTEMPTS),
+               "--job-deadline", str(GNINA_JOB_DEADLINE)]
+    if GNINA_QUEUE_DIR:
+        command += ["--queue-dir", GNINA_QUEUE_DIR]
+    if GNINA_CAPS_FILE:
+        command += ["--caps-file", GNINA_CAPS_FILE]
+    command += ["--log", os.path.join(queue_root, "collector.log")]
+
+    try:
+        stream = open(os.path.join(queue_root, "collector.out"), "ab")
+    except OSError:
+        stream = subprocess.DEVNULL
+    try:
+        proc = subprocess.Popen(
+            command, stdout=stream, stderr=subprocess.STDOUT,
+            cwd=os.path.dirname(os.path.abspath(__file__)), start_new_session=True)
+    except OSError as exc:
+        log.error("could not start the gnina collector (%s); jobs stay queued", exc)
+        return None
+    finally:
+        if hasattr(stream, "close"):
+            stream.close()
+    log.info("gnina collector started (pid %d): %s", proc.pid, " ".join(command))
+    return proc
+
+
+def stop_gnina_collector(run_dir, proc=None, timeout=60.0):
+    """Ask the pump to stop, and wait -- but never kill it.
+
+    A SIGKILL could land in the middle of consensus_docker writing a gnina
+    ``results.csv``, and ``check_tool_completion`` accepts any file that exists:
+    a truncated one would look like a finished job forever. So we ask (STOP file,
+    then SIGTERM, both of which it handles by finishing the in-flight collect) and
+    if it is still busy after ``timeout`` we say so and leave it running.
+    """
+    if GNINA_LEAVE_COLLECTOR:
+        logging.info("GNINA_LEAVE_COLLECTOR=1: leaving the gnina collector running; "
+                     "it stops on its own once the queue is drained.")
+        return
+    if proc is None and not GNINA_COLLECTOR_AUTOSTART:
+        # --no-collector: the pump belongs to whoever started it, possibly on
+        # another machine. Stopping someone else's collector is not ours to do.
+        logging.info("collector autostart is off; leaving any collector alone. "
+                     "Outstanding gnina jobs stay in %s.", _gnina_queue_root(run_dir))
+        return
+
+    queue_root = _gnina_queue_root(run_dir)
+    stop_file = os.path.join(queue_root, "STOP")
+    wrote_stop = False
+    try:
+        os.makedirs(queue_root, exist_ok=True)
+        with open(stop_file, "w") as handle:
+            handle.write("stopped by batch_dock pid %d\n" % os.getpid())
+        wrote_stop = True
+    except OSError as exc:
+        logging.warning("could not write %s: %s", stop_file, exc)
+
+    if proc is None:
+        if wrote_stop:
+            logging.warning(
+                "asked any running gnina collector to stop via %s. That file is "
+                "LEFT IN PLACE because this process did not start the collector and "
+                "cannot tell when it exits -- delete it before starting one by hand.",
+                stop_file)
+        return
+
+    deadline = time.time() + max(0.0, timeout)
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break
+        time.sleep(0.5)
+    if proc.poll() is None:
+        logging.info("gnina collector (pid %d) still busy; sending SIGTERM "
+                     "(it finishes the in-flight collect first)", proc.pid)
+        try:
+            proc.terminate()
+        except OSError as exc:
+            logging.warning("could not signal the gnina collector: %s", exc)
+        grace = time.time() + 30.0
+        while time.time() < grace and proc.poll() is None:
+            time.sleep(0.5)
+
+    if proc.poll() is None:
+        logging.warning(
+            "gnina collector (pid %d) did not stop within %.0fs. It is NOT being "
+            "killed: it may be writing a gnina results.csv, and a truncated one "
+            "would look complete forever. It exits on its own when drained.",
+            proc.pid, timeout)
+        return
+
+    logging.info("gnina collector (pid %d) exited with %s", proc.pid, proc.returncode)
+    if wrote_stop:
+        try:
+            os.remove(stop_file)
+        except OSError:
+            pass
+
+
+def wait_for_gnina_stage(run_dir, timeout=None):
+    """THE BARRIER: wait for outstanding gnina results, then let stage 5 proceed.
+
+    Bounded, reporting, and never fatal. On timeout it names what is still
+    outstanding and returns: stage 5 then computes consensus RMSD for every job
+    whose enabled tools are all complete and skips the rest, which is exactly the
+    filter that has always been there. A partial run therefore produces a usable
+    dataset instead of nothing, and re-running resumes the rest for free.
+    """
+    started = time.time()
+    empty = {"total": 0, "collected": 0, "abandoned": 0, "outstanding": 0,
+             "already_complete": 0, "elapsed_seconds": 0.0}
+    try:
+        from dock_selectivity import gnina_queue
+    except ImportError as exc:      # pragma: no cover - async cannot get this far
+        logging.critical("gnina barrier skipped: %s", exc)
+        summary = dict(empty)
+        summary["error"] = str(exc)
+        return summary
+
+    def _restart_collector(*_args, **_kwargs):
+        """Re-spawn the pump when the barrier finds it dead. A silently dead
+        collector must never be indistinguishable from a slow GPU."""
+        logging.warning("gnina barrier: the collector is not running -- restarting it")
+        return start_gnina_collector(run_dir)
+
+    logging.info("Waiting for outstanding gnina results before stage 5 "
+                 "(timeout: %s)",
+                 "computed from queue throughput" if timeout is None
+                 else "%.0fs" % timeout)
+    try:
+        summary = gnina_queue.wait_for_completion(
+            run_dir, timeout=timeout, logger=logging.getLogger(),
+            restart_collector=_restart_collector, queue_dir=GNINA_QUEUE_DIR)
+    except Exception as exc:
+        # Losing the barrier must not lose stage 5: the jobs whose gnina did land
+        # can still get their consensus, and the rest are reported below.
+        import traceback as _traceback
+        logging.critical("gnina barrier failed: %s", exc)
+        logging.critical(_traceback.format_exc())
+        summary = dict(empty)
+        summary["error"] = str(exc)
+
+    summary = dict(summary or {})
+    summary.setdefault("elapsed_seconds", time.time() - started)
+    logging.info(
+        "gnina barrier finished after %.1fs: %s collected, %s abandoned, "
+        "%s still outstanding of %s",
+        summary.get("elapsed_seconds", 0.0), summary.get("collected", 0),
+        summary.get("abandoned", 0), summary.get("outstanding", 0),
+        summary.get("total", 0))
+    return summary
+
+
+def gnina_ready(job_dir):
+    """True when this job's gnina result has landed and been post-processed."""
+    try:
+        from dock_selectivity import gnina_queue
+    except ImportError:
+        return check_tool_completion(job_dir, "gnina")
+    return bool(gnina_queue.outputs_complete(job_dir))
+
+
+def _report_gnina_exclusions(run_dir, missing_job_ids, partial_job_ids):
+    """Name every job stage 5 could not compute, and why. Silence is the risk here.
+
+    A timed-out barrier produces a PARTIAL dataset by design. If the excluded jobs
+    are not named, a partial campaign gets analysed as though it were complete.
+    """
+    summary_path = os.path.join(_gnina_queue_root(run_dir), "summary.json")
+    if missing_job_ids:
+        shown = ", ".join(missing_job_ids[:20])
+        if len(missing_job_ids) > 20:
+            shown += " (+%d more)" % (len(missing_job_ids) - 20)
+        logging.warning(
+            "Stage 5: %d job(s) excluded because their gnina result never landed; "
+            "they are listed in %s and will be completed by re-running batch_dock "
+            "(the queue and the remote directories make that cheap): %s",
+            len(missing_job_ids), summary_path, shown)
+    if partial_job_ids:
+        logging.warning(
+            "Stage 5: %d job(s) admitted to RMSD WITHOUT gnina under "
+            "GNINA_PARTIAL_RMSD; their consensus is computed from fewer tools and "
+            "is not comparable to the rest. They are listed in %s: %s",
+            len(partial_job_ids), summary_path, ", ".join(partial_job_ids[:20]))
+    if not (missing_job_ids or partial_job_ids):
+        return
+    try:
+        from dock_selectivity import gnina_queue
+        gnina_queue.GninaQueue(run_dir, queue_dir=GNINA_QUEUE_DIR,
+                               create=False).write_summary(extra={
+            "rmsd_excluded_jobs": list(missing_job_ids[:200]),
+            "rmsd_excluded_count": len(missing_job_ids),
+            "partial_rmsd_jobs": list(partial_job_ids[:200]),
+            "partial_rmsd_count": len(partial_job_ids),
+        })
+    except Exception as exc:
+        logging.warning("could not record the excluded jobs in %s: %s "
+                        "(the list above is the record)", summary_path, exc)
+
+
 def run_docking(
     drug_to_protein_df, 
     uniprot_map_df, 
@@ -2218,6 +2776,20 @@ def run_docking(
         logging.info(f"  - Max parallel jobs: {GNINA_MAX_PARALLEL_JOBS}")
         logging.info(f"  - Exhaustiveness: {GNINA_EXHAUSTIVENESS}")
         logging.info(f"  - Timeout: {GNINA_TIMEOUT/60:.1f} minutes")
+        if gnina_async_enabled():
+            logging.info("  - Mode: DECOUPLED (GNINA_ASYNC=1) - jobs are queued and "
+                         "run one at a time on the remote GPU; the local pipeline "
+                         "does not wait for them until the RMSD barrier")
+            logging.info(f"  - Queue: {_gnina_queue_root(gnina_run_dir(output_base_folder))}")
+            logging.info(f"  - Per-job remote deadline: {GNINA_JOB_DEADLINE/60:.1f} minutes, "
+                         f"max attempts: {GNINA_MAX_ATTEMPTS}")
+            logging.info("  - Barrier timeout: %s" % (
+                "computed from queue throughput" if GNINA_BARRIER_TIMEOUT is None
+                else "%.0fs" % GNINA_BARRIER_TIMEOUT))
+            if GNINA_PARTIAL_RMSD:
+                logging.warning("  - GNINA_PARTIAL_RMSD=1: jobs whose gnina never "
+                                "lands will still get a consensus RMSD from their "
+                                "remaining tools. That is a different measurement.")
     
     logging.info(f"Stage 3 - Gold: {'ENABLED' if USE_GOLD else 'DISABLED'}")
     if USE_GOLD:
@@ -2317,115 +2889,210 @@ def run_docking(
     stage3_stats = {'completed': 0, 'skipped': 0, 'failed': 0, 'timeout': 0, 'elapsed_time': 0, 'unique_processes': 0}
     stage4_stats = {'completed': 0, 'skipped': 0, 'failed': 0, 'timeout': 0, 'elapsed_time': 0, 'unique_processes': 0}
     stage5_stats = {'completed': 0, 'skipped': 0, 'failed': 0, 'timeout': 0, 'elapsed_time': 0, 'unique_processes': 0}
-    
-    # === STAGE 1: RUN SMINA DOCKING ===
-    if USE_SMINA:
-        logging.info("Stage 1: Smina docking is ENABLED")
-        
-        # Initialize resource monitor for adaptive execution
-        resource_monitor = None
-        if ENABLE_DYNAMIC_RESOURCE_MANAGEMENT:
-            resource_monitor = ResourceMonitor(
-                cpu_threshold=CPU_THRESHOLD,
-                memory_threshold=MEMORY_THRESHOLD,
-                check_interval=RESOURCE_CHECK_INTERVAL
-            )
-            logging.info("Dynamic resource management ENABLED for Smina stage")
-            logging.info(f"Resource thresholds - CPU: {CPU_THRESHOLD}%, Memory: {MEMORY_THRESHOLD}%")
+
+    # === DECOUPLED GNINA: VALIDATE, ENQUEUE, START THE PUMP -- ALL BEFORE STAGE 1 ===
+    # The capability check runs here, before a single smina job: "if exhaustiveness
+    # required for gnina is too much for remote device we shall warn and exit" is
+    # worth nothing if it fires four hours into the run. The enqueue runs here too,
+    # so the remote GPU is working on gnina while the local cores run smina.
+    gnina_run_directory = gnina_run_dir(output_base_folder)
+    gnina_caps_report = None
+    gnina_collector_proc = None
+    gnina_summary = None
+    gnina_enqueued = False
+    if USE_GNINA and (gnina_async_enabled() or GNINA_VALIDATE_CAPS):
+        gnina_caps_report = resolve_gnina_caps(gnina_run_directory,
+                                               strict=GNINA_STRICT_CAPS)
+    if USE_GNINA and gnina_async_enabled():
+        if not job_data_list:
+            logging.info("gnina async: no jobs to enqueue")
         else:
-            logging.info("Dynamic resource management DISABLED - using fixed parallelism")
-        
-        # Use adaptive execution for Smina stage
-        stage1_stats = run_stage_jobs_adaptive(
-            stage_name="Stage 1: Smina Docking", 
-            jobs=job_data_list,
-            job_function=run_single_smina_job,
-            resource_monitor=resource_monitor
-        )
-    else:
-        logging.info("Stage 1: Smina docking is DISABLED - skipping")
-    
-    # === STAGE 2: RUN GNINA DOCKING ===
-    if USE_GNINA:
-        logging.info("Stage 2: Gnina docking is ENABLED")
-        stage2_stats = run_stage_jobs(
-            job_data_list=job_data_list, 
-            stage_name="Stage 2: Gnina Docking", 
-            job_function=run_single_gnina_job,
-            max_workers=GNINA_MAX_PARALLEL_JOBS,
-            timeout=GNINA_TIMEOUT,
-            exhaustiveness=GNINA_EXHAUSTIVENESS
-        )
-    else:
-        logging.info("Stage 2: Gnina docking is DISABLED - skipping")
-    
-    # === STAGE 3: RUN GOLD DOCKING ===
-    if USE_GOLD:
-        logging.info("Stage 3: Gold docking is ENABLED")
-        stage3_stats = run_stage_jobs(
-            job_data_list=job_data_list, 
-            stage_name="Stage 3: Gold Docking", 
-            job_function=run_single_gold_job,
-            max_workers=GOLD_MAX_PARALLEL_JOBS,
-            timeout=GOLD_TIMEOUT,
-            exhaustiveness=GOLD_EXHAUSTIVENESS
-        )
-    else:
-        logging.info("Stage 3: Gold docking is DISABLED - skipping")
-    
-    # === STAGE 4: RUN LEDOCK DOCKING ===
-    if USE_LEDOCK:
-        logging.info("Stage 4: LeDock docking is ENABLED")
-        stage4_stats = run_stage_jobs(
-            job_data_list=job_data_list, 
-            stage_name="Stage 4: LeDock Docking", 
-            job_function=run_single_ledock_job,
-            max_workers=LEDOCK_MAX_PARALLEL_JOBS,
-            timeout=LEDOCK_TIMEOUT,
-            exhaustiveness=LEDOCK_EXHAUSTIVENESS
-        )
-    else:
-        logging.info("Stage 4: LeDock docking is DISABLED - skipping")
-    
-    # === STAGE 5: RUN RMSD CALCULATION FOR INCOMPLETE JOBS ===
-    if USE_RMSD_CALCULATION:
-        logging.info("Stage 5: RMSD calculation is ENABLED")
-        # Filter jobs that need RMSD calculation
-        # Only require enabled tools to be complete for RMSD calculation
-        rmsd_jobs = []
-        for job_data in job_data_list:
-            status = get_job_completion_status(job_data['current_outfolder'])
-            
-            # Check if all enabled tools are complete
-            tools_complete = True
-            if USE_SMINA and not status['smina']:
-                tools_complete = False
-            if USE_GNINA and not status['gnina']:
-                tools_complete = False
-            if USE_GOLD and not status['gold']:
-                tools_complete = False
-            if USE_LEDOCK and not status['ledock']:
-                tools_complete = False
-            
-            # Only add to RMSD jobs if all enabled tools are complete but final results don't exist
-            # OR if we're forcing recalculation
-            if tools_complete and (not status['final_results'] or FORCE_RMSD_RECALCULATION):
-                rmsd_jobs.append(job_data)
-        
-        if rmsd_jobs:
-            logging.info(f"Found {len(rmsd_jobs)} jobs needing RMSD calculation")
-            stage5_stats = run_stage_jobs(
-                job_data_list=rmsd_jobs, 
-                stage_name="Stage 5: RMSD Calculation", 
-                job_function=run_single_rmsd_job,
-                max_workers=RMSD_MAX_PARALLEL_JOBS,
-                timeout=RMSD_TIMEOUT
+            enqueue_gnina_jobs(job_data_list, gnina_run_directory,
+                               gnina_params_from_config(gnina_caps_report))
+            gnina_enqueued = True
+            gnina_collector_proc = start_gnina_collector(gnina_run_directory)
+
+    try:
+        # === STAGE 1: RUN SMINA DOCKING ===
+        if USE_SMINA:
+            logging.info("Stage 1: Smina docking is ENABLED")
+
+            # Initialize resource monitor for adaptive execution
+            resource_monitor = None
+            if ENABLE_DYNAMIC_RESOURCE_MANAGEMENT:
+                resource_monitor = ResourceMonitor(
+                    cpu_threshold=CPU_THRESHOLD,
+                    memory_threshold=MEMORY_THRESHOLD,
+                    check_interval=RESOURCE_CHECK_INTERVAL
+                )
+                logging.info("Dynamic resource management ENABLED for Smina stage")
+                logging.info(f"Resource thresholds - CPU: {CPU_THRESHOLD}%, Memory: {MEMORY_THRESHOLD}%")
+            else:
+                logging.info("Dynamic resource management DISABLED - using fixed parallelism")
+
+            # Use adaptive execution for Smina stage
+            stage1_stats = run_stage_jobs_adaptive(
+                stage_name="Stage 1: Smina Docking",
+                jobs=job_data_list,
+                job_function=run_single_smina_job,
+                resource_monitor=resource_monitor
             )
         else:
-            logging.info("No jobs need RMSD calculation - all are either incomplete or already have final results")
-    else:
-        logging.info("Stage 5: RMSD calculation is DISABLED - skipping")
-    
+            logging.info("Stage 1: Smina docking is DISABLED - skipping")
+
+        # === STAGE 2: RUN GNINA DOCKING ===
+        if USE_GNINA and gnina_async_enabled():
+            # Nothing to run and nothing to wait for: these jobs were handed to the
+            # queue before stage 1 and the remote GPU has been working through them,
+            # one at a time, for the whole of the local pipeline. The barrier before
+            # stage 5 is where the results are accounted for.
+            logging.info("Stage 2: Gnina is DECOUPLED (GNINA_ASYNC=1) - %d job(s) are "
+                         "in the queue at %s and run on the remote GPU while stages "
+                         "1/3/4 use the local cores", len(job_data_list),
+                         _gnina_queue_root(gnina_run_directory))
+            _log_gnina_queue_counts(gnina_run_directory, "Stage 2 queue state")
+        elif USE_GNINA:
+            logging.info("Stage 2: Gnina docking is ENABLED")
+            gnina_job_data_list = job_data_list
+            effective_cpu = getattr(gnina_caps_report, "effective_cpu", None)
+            if effective_cpu and int(effective_cpu) != int(NUM_THREADS):
+                # gnina runs on the remote host; asking for more threads than it has
+                # cores both slows it down and breaks the VRAM estimate the capability
+                # check just made. Only this stage is clamped -- smina, GOLD and
+                # LeDock are local and legitimately want NUM_THREADS.
+                logging.warning("Stage 2: clamping gnina --num_threads from %d to %d "
+                                "(the remote host's core count)", NUM_THREADS,
+                                int(effective_cpu))
+                gnina_job_data_list = [dict(j, num_threads=int(effective_cpu))
+                                       for j in job_data_list]
+            stage2_stats = run_stage_jobs(
+                job_data_list=gnina_job_data_list,
+                stage_name="Stage 2: Gnina Docking",
+                job_function=run_single_gnina_job,
+                max_workers=GNINA_MAX_PARALLEL_JOBS,
+                timeout=GNINA_TIMEOUT,
+                exhaustiveness=GNINA_EXHAUSTIVENESS
+            )
+        else:
+            logging.info("Stage 2: Gnina docking is DISABLED - skipping")
+
+        # === STAGE 3: RUN GOLD DOCKING ===
+        if USE_GOLD:
+            logging.info("Stage 3: Gold docking is ENABLED")
+            stage3_stats = run_stage_jobs(
+                job_data_list=job_data_list,
+                stage_name="Stage 3: Gold Docking",
+                job_function=run_single_gold_job,
+                max_workers=GOLD_MAX_PARALLEL_JOBS,
+                timeout=GOLD_TIMEOUT,
+                exhaustiveness=GOLD_EXHAUSTIVENESS
+            )
+        else:
+            logging.info("Stage 3: Gold docking is DISABLED - skipping")
+
+        # === STAGE 4: RUN LEDOCK DOCKING ===
+        if USE_LEDOCK:
+            logging.info("Stage 4: LeDock docking is ENABLED")
+            stage4_stats = run_stage_jobs(
+                job_data_list=job_data_list,
+                stage_name="Stage 4: LeDock Docking",
+                job_function=run_single_ledock_job,
+                max_workers=LEDOCK_MAX_PARALLEL_JOBS,
+                timeout=LEDOCK_TIMEOUT,
+                exhaustiveness=LEDOCK_EXHAUSTIVENESS
+            )
+        else:
+            logging.info("Stage 4: LeDock docking is DISABLED - skipping")
+
+        # === THE GNINA BARRIER ===
+        # consensus_docker computes RMSD by globbing complex_*.pdb per tool and needs
+        # >= 2 tools to have them, so a job's RMSD cannot run until its gnina result
+        # has landed AND been post-processed. Wait here, bounded, and report.
+        if USE_GNINA and gnina_async_enabled() and USE_RMSD_CALCULATION:
+            gnina_summary = wait_for_gnina_stage(gnina_run_directory,
+                                                 GNINA_BARRIER_TIMEOUT)
+            # The final summary block below reads stage2_stats and needs no change.
+            stage2_stats = {
+                'completed': gnina_summary.get('collected', 0),
+                'skipped': gnina_summary.get('already_complete', 0),
+                'failed': gnina_summary.get('abandoned', 0),
+                'timeout': gnina_summary.get('outstanding', 0),
+                'elapsed_time': gnina_summary.get('elapsed_seconds', 0.0),
+                'unique_processes': 1,
+            }
+        elif USE_GNINA and gnina_async_enabled():
+            logging.warning(
+                "RMSD is disabled, so nothing waits for the gnina queue. Jobs keep "
+                "running on the remote GPU and their state is in %s; finish them "
+                "with: python %s --run-dir %s --daemon",
+                _gnina_queue_root(gnina_run_directory), GNINA_COLLECTOR_SCRIPT,
+                gnina_run_directory)
+
+        # === STAGE 5: RUN RMSD CALCULATION FOR INCOMPLETE JOBS ===
+        if USE_RMSD_CALCULATION:
+            logging.info("Stage 5: RMSD calculation is ENABLED")
+            # Filter jobs that need RMSD calculation
+            # Only require enabled tools to be complete for RMSD calculation
+            rmsd_jobs = []
+            gnina_missing_jobs = []
+            partial_rmsd_jobs = []
+            partial_rmsd_allowed = (USE_GNINA and gnina_async_enabled()
+                                    and GNINA_PARTIAL_RMSD)
+            for job_data in job_data_list:
+                status = get_job_completion_status(job_data['current_outfolder'])
+
+                # Check if all enabled tools are complete
+                tools_complete = True
+                if USE_SMINA and not status['smina']:
+                    tools_complete = False
+                if USE_GNINA and not status['gnina']:
+                    # GNINA_PARTIAL_RMSD admits a job whose gnina never landed as long
+                    # as two other tools still have their poses. It changes which
+                    # tools contribute to a consensus, so it is off by default and
+                    # every admitted job is named here and in summary.json. Without
+                    # it the job is simply not an RMSD job -- the filter that has
+                    # always been here -- and is named as skipped instead.
+                    if (partial_rmsd_allowed
+                            and rmsd_inputs_present(job_data['current_outfolder']) >= 2):
+                        partial_rmsd_jobs.append(
+                            _gnina_job_id(job_data['current_outfolder']))
+                    else:
+                        gnina_missing_jobs.append(
+                            _gnina_job_id(job_data['current_outfolder']))
+                        tools_complete = False
+                if USE_GOLD and not status['gold']:
+                    tools_complete = False
+                if USE_LEDOCK and not status['ledock']:
+                    tools_complete = False
+
+                # Only add to RMSD jobs if all enabled tools are complete but final results don't exist
+                # OR if we're forcing recalculation
+                if tools_complete and (not status['final_results'] or FORCE_RMSD_RECALCULATION):
+                    rmsd_jobs.append(job_data)
+
+            if USE_GNINA and gnina_async_enabled():
+                _report_gnina_exclusions(gnina_run_directory, gnina_missing_jobs,
+                                         partial_rmsd_jobs)
+
+            if rmsd_jobs:
+                logging.info(f"Found {len(rmsd_jobs)} jobs needing RMSD calculation")
+                stage5_stats = run_stage_jobs(
+                    job_data_list=rmsd_jobs,
+                    stage_name="Stage 5: RMSD Calculation",
+                    job_function=run_single_rmsd_job,
+                    max_workers=RMSD_MAX_PARALLEL_JOBS,
+                    timeout=RMSD_TIMEOUT
+                )
+            else:
+                logging.info("No jobs need RMSD calculation - all are either incomplete or already have final results")
+        else:
+            logging.info("Stage 5: RMSD calculation is DISABLED - skipping")
+    finally:
+        # Only ever does anything in async mode: in the blocking path nothing was
+        # enqueued, there is no collector to stop, and this is a no-op.
+        if gnina_collector_proc is not None or gnina_enqueued:
+            stop_gnina_collector(gnina_run_directory, gnina_collector_proc)
+
     # Calculate final statistics
     total_elapsed_time = time.time() - start_time
     
@@ -2961,9 +3628,58 @@ if __name__ == "__main__":
                                "Overrides the USE_* constants. 'rmsd' is always "
                                "appended. Engine availability is environment-specific: "
                                "gnina needs CUDA 12 + cuDNN 9."))
+    _parser.add_argument('--gnina-async', action='store_true',
+                         help=('run gnina DECOUPLED: queue every gnina job up front, '
+                               'let one remote GPU work through them while smina/GOLD/'
+                               'LeDock use the local cores, and wait for what is left '
+                               'at a barrier before the RMSD stage. Off by default: it '
+                               'is a different execution path, not a different result.'))
+    _parser.add_argument('--gnina-barrier-timeout', type=float, default=None,
+                         metavar='SECONDS',
+                         help=('how long the RMSD barrier waits for outstanding gnina '
+                               'results. Default: computed from the queue\'s own '
+                               'throughput. 0 means do not wait at all (enqueue now, '
+                               'collect later). On timeout the run continues and the '
+                               'unfinished jobs are named, never silently dropped.'))
+    _parser.add_argument('--strict-caps', action='store_true',
+                         help=('make an oversubscribed request fatal: --num_threads 60 '
+                               'against a 24-core remote normally warns and clamps.'))
+    _parser.add_argument('--no-collector', action='store_true',
+                         help=('do not spawn gnina_collect.py. Jobs are still enqueued; '
+                               'run the collector yourself (e.g. on another machine).'))
+    _parser.add_argument('--gnina-partial-rmsd', action='store_true',
+                         help=('compute consensus RMSD for a job whose gnina never '
+                               'landed, from whatever >= 2 tools it has. This CHANGES '
+                               'which tools contribute to a consensus; every such job '
+                               'is logged and listed in the queue summary.'))
+    _parser.add_argument('--queue-dir', default=None,
+                         help=('where the gnina queue keeps its state. Default '
+                               '<run-dir>/gnina_queue; point it at an ext4 path when '
+                               'the run directory is on the external drive.'))
     _parser.add_argument('--test-mode', action='store_true')
     _parser.add_argument('--max-jobs', type=int, default=MAX_TEST_JOBS)
     _args = _parser.parse_args()
+
+    # Command line overrides the environment for the decoupled-gnina switches.
+    if _args.queue_dir:
+        GNINA_QUEUE_DIR = os.path.abspath(_args.queue_dir)
+        os.environ['GNINA_QUEUE_DIR'] = GNINA_QUEUE_DIR   # the collector reads it too
+    if _args.gnina_async:
+        globals().update(GNINA_ASYNC=True)
+        os.environ['GNINA_ASYNC'] = '1'
+    if _args.strict_caps:
+        globals().update(GNINA_STRICT_CAPS=True)
+    if _args.no_collector:
+        globals().update(GNINA_COLLECTOR_AUTOSTART=False)
+    if _args.gnina_partial_rmsd:
+        globals().update(GNINA_PARTIAL_RMSD=True)
+    if _args.gnina_barrier_timeout is not None:
+        # An explicit 0 means "do not wait"; the ENV form treats 0 as "unset", so
+        # this flag is the only way to ask for a non-blocking barrier.
+        globals().update(GNINA_BARRIER_TIMEOUT=float(_args.gnina_barrier_timeout))
+    if _args.gnina_async:
+        logging.info('*** --gnina-async: gnina runs decoupled on the remote GPU; '
+                     'the RMSD stage waits at a barrier for its results ***')
 
     if _args.tools:
         _want = {t.strip().lower() for t in _args.tools.split(',') if t.strip()}
