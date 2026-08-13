@@ -47,8 +47,8 @@ retired) on their own schedule.
 | §3.6 `extract_alphafold_models.py` | — | **○** |
 | §3.7 `create_ic50_mapping.py` (coverage lift only; not corrupt) | — | **○** |
 | §3.8 `run_full_workflow.py` | — | **○** |
-| **`positives_planned.csv` producer** — nothing writes it; blocks `REBUILD_PLAN` Phases 3 and 5 | — | **○ (new gap, see §5)** |
-| **`run_manifest.csv` assembler** — `curate_jobs.py --manifest-out` covers salvaged jobs only | — | **○ (new gap, see §5)** |
+| `positives_planned.csv` producer | **new** `plan_positives.py` | **I** |
+| `run_manifest.csv` assembler + the complete redock queue (incl. the previously unqueued **positive** gap) | **new** `build_run_manifest.py` | **I** |
 
 **Consequence for the rebuild:** `REBUILD_PLAN.md` Phases 0–5 are carried by implemented code; **Phases
 6, 7 and 8 are blocked purely on the ○ rows above** — `extract_*.py`, `batch_dock.py` and
