@@ -44,6 +44,8 @@ retired) on their own schedule.
 | §3.3 `batch_dock.py` (`:2034`, `:2211`, post-job cleanup hook) | — | **○** |
 | §3.4 `parse_prepare.py` (all five defects) | — | **○** |
 | §3.5 `extract_cavities.py` — `--manifest-only` (names, no unpacking) + mandatory `--required` | `extract_cavities.py` | **I** |
+| §3.5b `fix_required_pdbs.py` — mandatory `--required`, no widening | `fix_required_pdbs.py` | **I** |
+| §3.5c `convert_pdb_to_pdbqt.py` — `--input-mapping` / `--required`; cavity fallback now opt-in | `convert_pdb_to_pdbqt.py` | **I** |
 | §3.6 `extract_alphafold_models.py` — fallback deleted, `--required` mandatory | `extract_alphafold_models.py` | **I** |
 | §3.7 `create_ic50_mapping.py` (coverage lift only; not corrupt) | — | **○** |
 | §3.8 `run_full_workflow.py` | — | **○** |

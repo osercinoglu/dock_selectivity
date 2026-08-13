@@ -34,6 +34,7 @@ Note: This script now uses multiprocessing by default for better OpenBabel compa
 and should properly utilize all CPU cores for parallel conversion.
 """
 
+import argparse
 import os
 import sys
 import pandas as pd
@@ -326,39 +327,64 @@ def load_cavity_mapping(mapping_file):
         logging.error(f"Error loading cavity mapping: {e}")
         sys.exit(1)
 
-def load_best_cavity_mapping():
+class MissingInputMapping(RuntimeError):
+    """Raised when no acceptable input mapping is available.
+
+    Fatal by design (invariant G8). The old chain fell through
+    fixed -> alphafold -> cavity_mapping, and that last step is a 38,709-row
+    frame: reaching it converts the entire CavitySpace universe instead of the
+    ~980 receptors the campaign used. It logged only an advisory "consider
+    running fix_required_pdbs.py first".
     """
-    Load the best available cavity mapping file.
-    Prioritizes AlphaFold mapping over original cavity mapping.
-    
-    Returns
-    -------
-    pd.DataFrame: Cavity mapping dataframe
-    str: Source file used
+
+
+def filter_to_required(df, required_csv):
+    """Keep only rows whose accession is in an explicit required set."""
+    req = pd.read_csv(required_csv)
+    cols = {c.lower(): c for c in req.columns}
+    acc_col = cols.get('uniprot_id') or cols.get('accession')
+    if not acc_col:
+        raise MissingInputMapping(
+            '%r has no accession column (looked for UniProt_ID / accession); '
+            'columns are %s' % (required_csv, list(req.columns)))
+    wanted = {str(v).strip() for v in req[acc_col].dropna()}
+    before = len(df)
+    out = df[df['UniProt_ID'].astype(str).str.strip().isin(wanted)].copy()
+    logging.info('required filter: %d -> %d rows (%d accessions)',
+                 before, len(out), len(wanted))
+    return out
+
+
+def load_best_cavity_mapping(explicit=None, allow_cavity_fallback=False):
+    """Load the input mapping.
+
+    Args:
+        explicit: use exactly this file. Preferred -- it removes the guesswork.
+        allow_cavity_fallback: permit falling through to cavity_mapping.csv.
+            Off by default: that path converts every CavitySpace receptor.
     """
-    # Check for fixed mapping first (preferred)
-    if os.path.exists(FIXED_MAPPING_CSV):
-        logging.info(f"Using fixed mapping: {FIXED_MAPPING_CSV}")
-        df = load_cavity_mapping(FIXED_MAPPING_CSV)
-        return df, FIXED_MAPPING_CSV
-    
-    # Check for AlphaFold mapping second
-    elif os.path.exists(ALPHAFOLD_MAPPING_CSV):
-        logging.info(f"Using AlphaFold mapping: {ALPHAFOLD_MAPPING_CSV}")
-        df = load_cavity_mapping(ALPHAFOLD_MAPPING_CSV)
-        return df, ALPHAFOLD_MAPPING_CSV
-    
-    # Fall back to original cavity mapping
-    elif os.path.exists(CAVITY_MAPPING_CSV):
-        logging.info(f"Using original cavity mapping: {CAVITY_MAPPING_CSV}")
-        logging.info("Consider running fix_required_pdbs.py first for fixed structures with hydrogens")
-        df = load_cavity_mapping(CAVITY_MAPPING_CSV)
-        return df, CAVITY_MAPPING_CSV
-    
-    else:
-        logging.error("No cavity mapping file found!")
-        logging.error("Please run extract_cavities.py (and optionally fix_required_pdbs.py) first.")
-        sys.exit(1)
+    if explicit:
+        if not os.path.exists(explicit):
+            raise MissingInputMapping('input mapping not found: %r' % explicit)
+        logging.info('Using explicit input mapping: %s', explicit)
+        return load_cavity_mapping(explicit), explicit
+
+    for path, label in ((FIXED_MAPPING_CSV, 'fixed'), (ALPHAFOLD_MAPPING_CSV, 'AlphaFold')):
+        if os.path.exists(path):
+            logging.info('Using %s mapping: %s', label, path)
+            return load_cavity_mapping(path), path
+
+    if os.path.exists(CAVITY_MAPPING_CSV) and allow_cavity_fallback:
+        logging.warning('Falling back to %s -- this is the FULL CavitySpace universe '
+                        '(38,709 rows in the 2025-06-29 run). Explicitly permitted by '
+                        '--allow-cavity-fallback.', CAVITY_MAPPING_CSV)
+        return load_cavity_mapping(CAVITY_MAPPING_CSV), CAVITY_MAPPING_CSV
+
+    raise MissingInputMapping(
+        'no acceptable input mapping. Run fix_required_pdbs.py or '
+        'extract_alphafold_models.py first, or pass --input-mapping. Falling back to '
+        '%s would convert every CavitySpace receptor and requires an explicit '
+        '--allow-cavity-fallback.' % CAVITY_MAPPING_CSV)
 
 def prepare_conversion_tasks(cavity_df, output_dir):
     """
@@ -480,30 +506,60 @@ def create_updated_mapping(cavity_df, unique_receptors, output_dir):
     updated_df = pd.DataFrame(updated_rows)
     return updated_df
 
-def main():
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description=('Convert receptor PDBs to PDBQT. Prefers an explicit '
+                     '--input-mapping; the fallback to the full CavitySpace mapping '
+                     'must be asked for by name.'))
+    parser.add_argument('--input-mapping', default=None,
+                        help='exact mapping to convert (fixed_mapping.csv, alphafold_mapping.csv)')
+    parser.add_argument('--required', default=None,
+                        help='CSV restricting conversion to these accessions')
+    parser.add_argument('--allow-cavity-fallback', action='store_true',
+                        help='permit falling back to cavity_mapping.csv (the FULL '
+                             'CavitySpace universe, 38,709 rows in the 2025-06-29 run)')
+    parser.add_argument('--out-dir', default=OUTPUT_PDBQT_DIR, help='default: %(default)s')
+    parser.add_argument('--out', default=OUTPUT_MAPPING_CSV, help='default: %(default)s')
+    parser.add_argument('--threads', type=int, default=NUM_THREADS, help='default: %(default)s')
+    return parser
+
+
+def main(argv=None):
     """Main function for PDB to PDBQT conversion."""
+    args = build_parser().parse_args(argv)
     start_time = time.time()
-    
+    out_dir = args.out_dir
+    out_csv = args.out
+    threads = args.threads
+
     logging.info("Starting PDB to PDBQT conversion workflow")
-    logging.info(f"Input: {CAVITY_MAPPING_CSV}")
-    logging.info(f"Output directory: {OUTPUT_PDBQT_DIR}")
-    logging.info(f"Output mapping: {OUTPUT_MAPPING_CSV}")
-    logging.info(f"Number of workers: {NUM_THREADS}")
+    logging.info(f"Input mapping: {args.input_mapping or 'auto-select'}")
+    logging.info(f"Output directory: {out_dir}")
+    logging.info(f"Output mapping: {out_csv}")
+    logging.info(f"Number of workers: {threads}")
     logging.info(f"Using processes: {USE_PROCESSES}")
     logging.info(f"Conversion timeout: {CONVERSION_TIMEOUT}s")
     logging.info(f"pH value: {PH_VALUE}")
     logging.info(f"CPU count: {CPU_COUNT}")
     logging.info("Note: Now using ProcessPoolExecutor for better OpenBabel compatibility")
     
-    # Create output directory
-    os.makedirs(OUTPUT_PDBQT_DIR, exist_ok=True)
-    
-    # Load cavity mapping (prioritizes fixed PDB mapping if available)
-    cavity_df, source_file = load_best_cavity_mapping()
+    # Load the input mapping BEFORE creating anything on disk.
+    try:
+        cavity_df, source_file = load_best_cavity_mapping(
+            explicit=args.input_mapping,
+            allow_cavity_fallback=args.allow_cavity_fallback,
+        )
+        if args.required:
+            cavity_df = filter_to_required(cavity_df, args.required)
+    except MissingInputMapping as exc:
+        logging.error("%s", exc)
+        return 2
+
+    os.makedirs(out_dir, exist_ok=True)
     logging.info(f"Loaded {len(cavity_df)} cavity mappings from {source_file}")
     
     # Prepare conversion tasks with deduplication
-    conversion_tasks, unique_receptors = prepare_conversion_tasks(cavity_df, OUTPUT_PDBQT_DIR)
+    conversion_tasks, unique_receptors = prepare_conversion_tasks(cavity_df, out_dir)
     
     if not conversion_tasks:
         logging.info("No conversion tasks needed. All PDBQT files already exist.")
@@ -521,8 +577,8 @@ def main():
         
         logging.info(f"Using {executor_name} for parallelization")
         
-        print('num_workers: ', NUM_THREADS)
-        with executor_class(max_workers=NUM_THREADS) as executor:
+        print('num_workers: ', threads)
+        with executor_class(max_workers=threads) as executor:
             # Submit all tasks
             future_to_task = {executor.submit(process_conversion, task): task for task in conversion_tasks}
             
@@ -561,7 +617,7 @@ def main():
                     logging.error(f"Exception converting {task['pdb_path']}: {e}")
         
         # Log process usage statistics
-        logging.info(f"Used {len(unique_processes)} unique processes out of {NUM_THREADS} configured")
+        logging.info(f"Used {len(unique_processes)} unique processes out of {threads} configured")
         if len(unique_processes) == 1:
             logging.warning("Only 1 process was used! Parallelization may not be working correctly.")
         else:
@@ -570,11 +626,11 @@ def main():
         logging.info(f"Conversion completed: {successful_conversions} successful, {failed_conversions} failed, {timeout_conversions} timeout")
     
     # Create updated mapping CSV
-    updated_df = create_updated_mapping(cavity_df, unique_receptors, OUTPUT_PDBQT_DIR)
-    updated_df.to_csv(OUTPUT_MAPPING_CSV, index=False)
+    updated_df = create_updated_mapping(cavity_df, unique_receptors, out_dir)
+    updated_df.to_csv(out_csv, index=False)
     
     # Summary statistics
-    total_pdbqt_files = len([f for f in Path(OUTPUT_PDBQT_DIR).rglob("*.pdbqt")])
+    total_pdbqt_files = len([f for f in Path(out_dir).rglob("*.pdbqt")])
     
     elapsed_time = time.time() - start_time
     
@@ -582,7 +638,7 @@ def main():
     logging.info(f"Total cavity mappings processed: {len(cavity_df)}")
     logging.info(f"Unique UniProt IDs: {len(unique_receptors)}")
     logging.info(f"PDBQT files created/found: {total_pdbqt_files}")
-    logging.info(f"Updated mapping saved to: {OUTPUT_MAPPING_CSV}")
+    logging.info(f"Updated mapping saved to: {out_csv}")
     logging.info(f"Total processing time: {elapsed_time:.2f} seconds")
     
     # Verify the output
@@ -591,6 +647,8 @@ def main():
         logging.warning(f"Warning: {len(missing_pdbqt)} entries missing PDBQT files")
     else:
         logging.info("All entries have corresponding PDBQT files!")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

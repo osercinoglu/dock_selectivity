@@ -29,6 +29,7 @@ Output:
     - pdb_fixing.log
 """
 
+import argparse
 import os
 import sys
 import pandas as pd
@@ -183,51 +184,91 @@ def process_fixing_task(fixing_task):
             'error': str(e)
         }
 
-def load_required_structures():
-    """Load the list of required structures and find corresponding AlphaFold files."""
-    # Load required structures list
-    if not os.path.exists(REQUIRED_STRUCTURES_CSV):
-        logging.error(f"Required structures file not found: {REQUIRED_STRUCTURES_CSV}")
-        logging.error("Run identify_required_structures.py first")
-        sys.exit(1)
-    
-    # AlphaFold mapping is required for this script
-    if not os.path.exists(ALPHAFOLD_MAPPING_CSV):
-        logging.error(f"AlphaFold mapping file not found: {ALPHAFOLD_MAPPING_CSV}")
-        logging.error("Run extract_alphafold_models.py first")
-        sys.exit(1)
-    
-    try:
-        # Load required structures (without Receptor_PDB column)
-        required_df = pd.read_csv(REQUIRED_STRUCTURES_CSV)
-        logging.info(f"Loaded {len(required_df)} required structures")
-        
-        # Ensure required columns exist in required structures
-        required_columns = ['UniProt_ID', 'Fragment_ID']
-        missing_columns = [col for col in required_columns if col not in required_df.columns]
-        if missing_columns:
-            logging.error(f"Missing required columns in {REQUIRED_STRUCTURES_CSV}: {missing_columns}")
-            sys.exit(1)
-        
-        # Use AlphaFold mapping to get Receptor_PDB paths for only the required structures
-        return load_from_alphafold_mapping(required_df)
-        
-    except Exception as e:
-        logging.error(f"Error loading required structures: {e}")
-        sys.exit(1)
+class MissingRequiredSet(RuntimeError):
+    """Raised when the required-structure set or its AlphaFold mapping is absent.
 
-def load_from_alphafold_mapping(required_df):
+    Fatal by design (invariant G8): a stage may not choose its own universe when
+    its input is missing. See extract_alphafold_models.MissingRequiredSet for the
+    incident this rule comes from.
+    """
+
+
+def normalize_required_frame(df, source):
+    """Coerce any required-set frame to ``UniProt_ID`` / ``Fragment_ID``.
+
+    Accepts the legacy column names and the new schema's lowercase ones, so a
+    ``required_structures.csv``, a ``redock_queue.csv`` and a
+    ``positives_planned.csv`` are all valid inputs. Fragment ids are normalised to
+    bare integers, since ``'F1'`` and ``1`` both occur in this pipeline.
+    """
+    cols = {c.lower(): c for c in df.columns}
+    acc_col = cols.get('uniprot_id') or cols.get('accession')
+    if not acc_col:
+        raise MissingRequiredSet(
+            '%r has no accession column (looked for UniProt_ID / accession); '
+            'columns are %s' % (source, list(df.columns))
+        )
+    out = pd.DataFrame({'UniProt_ID': df[acc_col].astype(str).str.strip()})
+    frag_col = cols.get('fragment_id')
+    if frag_col:
+        fragments = []
+        for value in df[frag_col]:
+            text = str(value).strip()
+            if text[:1] in ('F', 'f'):
+                text = text[1:]
+            try:
+                fragments.append(int(text))
+            except (TypeError, ValueError):
+                fragments.append(1)
+        out['Fragment_ID'] = fragments
+    else:
+        out['Fragment_ID'] = 1
+    return out.drop_duplicates().reset_index(drop=True)
+
+
+def load_required_structures(required_csv=None, alphafold_csv=None):
+    """Load the required structures and attach their AlphaFold paths.
+
+    Both inputs are mandatory. There is no fallback to "every structure in the
+    AlphaFold mapping": this stage runs PDBFixer over each structure, so a widened
+    input set costs hours of CPU as well as disk.
+    """
+    required_csv = required_csv or REQUIRED_STRUCTURES_CSV
+    alphafold_csv = alphafold_csv or ALPHAFOLD_MAPPING_CSV
+
+    if not os.path.exists(required_csv):
+        raise MissingRequiredSet(
+            'required-structure set not found: %r. Run identify_required_structures.py '
+            '(or pass a redock_queue.csv) and supply it with --required.' % required_csv
+        )
+    if not os.path.exists(alphafold_csv):
+        raise MissingRequiredSet(
+            'AlphaFold mapping not found: %r. Run extract_alphafold_models.py first.'
+            % alphafold_csv
+        )
+
+    required_df = normalize_required_frame(pd.read_csv(required_csv), required_csv)
+    if required_df.empty:
+        raise MissingRequiredSet('required-structure set %r is empty' % required_csv)
+    logging.info(
+        'required set: %d (accession, fragment) pairs over %d accessions from %s',
+        len(required_df), required_df['UniProt_ID'].nunique(), required_csv,
+    )
+    return load_from_alphafold_mapping(required_df, alphafold_csv)
+
+def load_from_alphafold_mapping(required_df, alphafold_csv=None):
     """Load required structures using alphafold_mapping.csv, filtering to only required UniProt IDs."""
     try:
         # Load AlphaFold mapping (with Receptor_PDB paths)
-        alphafold_df = pd.read_csv(ALPHAFOLD_MAPPING_CSV)
+        alphafold_csv = alphafold_csv or ALPHAFOLD_MAPPING_CSV
+        alphafold_df = pd.read_csv(alphafold_csv)
         logging.info(f"Loaded {len(alphafold_df)} total AlphaFold mappings")
         
         # Ensure required columns exist in AlphaFold mapping
         alphafold_columns = ['UniProt_ID', 'Fragment_ID', 'Receptor_PDB', 'AlphaFold_Available']
         missing_alphafold_columns = [col for col in alphafold_columns if col not in alphafold_df.columns]
         if missing_alphafold_columns:
-            logging.error(f"Missing required columns in {ALPHAFOLD_MAPPING_CSV}: {missing_alphafold_columns}")
+            logging.error(f"Missing required columns in {alphafold_csv}: {missing_alphafold_columns}")
             sys.exit(1)
         
         # Get unique combinations of UniProt ID and Fragment ID from required structures
@@ -392,37 +433,65 @@ def create_fixed_mapping(required_df, output_dir):
     
     return updated_df
 
-def main():
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description=('Add hydrogens to an EXPLICIT required set of structures. '
+                     'PDBFixer is expensive, so a widened input set costs CPU hours '
+                     'as well as disk; --required is mandatory.'))
+    parser.add_argument('--required', default=None,
+                        help='CSV naming the structures to fix (required_structures.csv, '
+                             'redock_queue.csv, positives_planned.csv). MANDATORY.')
+    parser.add_argument('--alphafold-mapping', default=None,
+                        help='alphafold_mapping.csv (default: %s)' % ALPHAFOLD_MAPPING_CSV)
+    parser.add_argument('--out-dir', default=OUTPUT_DIR, help='default: %(default)s')
+    parser.add_argument('--out', default=OUTPUT_MAPPING_CSV, help='default: %(default)s')
+    parser.add_argument('--threads', type=int, default=NUM_THREADS, help='default: %(default)s')
+    return parser
+
+
+def main(argv=None):
     """Main function for selective PDB fixing."""
+    args = build_parser().parse_args(argv)
     start_time = time.time()
-    
+    out_dir = args.out_dir
+    out_csv = args.out
+    threads = args.threads
+
     logging.info("Starting selective PDB hydrogenation workflow")
-    logging.info(f"Required structures: {REQUIRED_STRUCTURES_CSV}")
-    logging.info(f"AlphaFold mapping: {ALPHAFOLD_MAPPING_CSV}")
-    logging.info(f"Output directory: {OUTPUT_DIR}")
-    logging.info(f"Available CPUs: {AVAILABLE_CPUS}")
-    logging.info(f"Using threads: {NUM_THREADS} (auto-detected)")
-    
-    # Create output directory
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
-    # Load input data
-    required_df = load_required_structures()
+    logging.info(f"Required structures: {args.required}")
+    logging.info(f"AlphaFold mapping: {args.alphafold_mapping or ALPHAFOLD_MAPPING_CSV}")
+    logging.info(f"Output directory: {out_dir}")
+    logging.info(f"Using threads: {threads}")
+
+    if not args.required:
+        logging.error(
+            '--required is mandatory. Without it this stage would run PDBFixer over '
+            'every structure in the AlphaFold mapping. A missing prerequisite is an '
+            'error, never a fallback.')
+        return 2
+
+    try:
+        required_df = load_required_structures(args.required, args.alphafold_mapping)
+    except MissingRequiredSet as exc:
+        logging.error("%s", exc)
+        return 2
+
+    os.makedirs(out_dir, exist_ok=True)
     
     # Prepare fixing tasks
-    fixing_tasks, stats, available_df = prepare_fixing_tasks(required_df, OUTPUT_DIR)
+    fixing_tasks, stats, available_df = prepare_fixing_tasks(required_df, out_dir)
     
     if not fixing_tasks:
         logging.info("No hydrogenation tasks needed. All required structures already hydrogenated.")
     else:
         # Perform parallel PDB fixing
         logging.info(f"Starting parallel hydrogenation of {len(fixing_tasks)} PDB structures...")
-        logging.info(f"Using {NUM_THREADS} parallel threads")
+        logging.info(f"Using {threads} parallel threads")
         
         successful_fixes = 0
         failed_fixes = 0
         
-        with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
+        with ThreadPoolExecutor(max_workers=threads) as executor:
             # Submit all tasks
             future_to_task = {executor.submit(process_fixing_task, task): task for task in fixing_tasks}
             
@@ -476,11 +545,11 @@ def main():
             logging.info("🎉 All structures hydrogenated successfully!")
     
     # Create fixed mapping CSV
-    fixed_df = create_fixed_mapping(required_df, OUTPUT_DIR)
-    fixed_df.to_csv(OUTPUT_MAPPING_CSV, index=False)
+    fixed_df = create_fixed_mapping(required_df, out_dir)
+    fixed_df.to_csv(out_csv, index=False)
     
     # Summary statistics
-    total_hydrogenated_files = len([f for f in Path(OUTPUT_DIR).rglob("*_H.pdb")])
+    total_hydrogenated_files = len([f for f in Path(out_dir).rglob("*_H.pdb")])
     available_hydrogenated = len(fixed_df[fixed_df['Receptor_Fixed'] == True])
     
     elapsed_time = time.time() - start_time
@@ -490,7 +559,7 @@ def main():
     logging.info(f"Available AlphaFold structures: {stats['available_structures']}")
     logging.info(f"Hydrogenated PDB files created/found: {total_hydrogenated_files}")
     logging.info(f"Structures with hydrogenated receptors: {available_hydrogenated}")
-    logging.info(f"Updated mapping saved to: {OUTPUT_MAPPING_CSV}")
+    logging.info(f"Updated mapping saved to: {out_csv}")
     logging.info(f"Total processing time: {elapsed_time:.2f} seconds")
     
     # Show completion status
@@ -499,6 +568,8 @@ def main():
         logging.warning(f"Warning: {len(missing_hydrogenated)} structures missing hydrogenated PDB files")
     else:
         logging.info("All required structures have hydrogenated PDB files!")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
