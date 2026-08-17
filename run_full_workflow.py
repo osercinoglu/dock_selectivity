@@ -19,10 +19,21 @@ of which this version fixes:
 3. **It started with the corrupted identity stage.** Step 1 was
    ``prepare_uniprot_mapping.py``, whose free-text search produced the mapping in
    which 57.73% of rows name a different protein.
+4. **It planned jobs and then docked them without building the receptors.** The
+   four structure-preparation scripts were left to be run by hand between the
+   manifest and the docking phase. Run the chain straight through and Phase 7
+   started with no receptor for any job in the queue.
 
 This runner drives the new stages, gates on the identity index, and makes every
 choice explicit. Each phase is skippable, and every phase verifies its own
 prerequisite rather than degrading when one is missing.
+
+Phase groups
+------------
+
+``--skip`` and ``--only`` take a phase key, or one of the group names in
+:data:`PHASE_GROUPS`. ``--only structures`` is the four structure-preparation
+phases; ``--skip structures`` is everything else.
 
 Usage
 -----
@@ -40,6 +51,11 @@ Usage
     python3 run_full_workflow.py --run-dir $NEW --dry-run     # print the plan only
 """
 
+# Phase 6 is four scripts rather than one because each writes a distinct mapping
+# CSV that batch_dock.py resolves independently (receptor priority: fixed >
+# alphafold > cavity, PDBQT substituted when present). Collapsing them into a
+# single phase would hide which mapping is missing when one step fails.
+
 from __future__ import annotations
 
 import argparse
@@ -55,6 +71,29 @@ REPO = os.path.dirname(os.path.abspath(__file__))
 
 #: Docking modes. Explicit -- never inferred from which files happen to exist.
 MODES = ("positives-only", "balanced")
+
+#: Names --skip/--only accept in place of a single phase key.
+PHASE_GROUPS = {
+    "structures": ("cavity-structures", "alphafold", "fix", "pdbqt"),
+    "planning": ("identity", "interactions", "cavities", "positives",
+                 "negatives", "manifest"),
+}
+
+#: Default AlphaFold archive, matching extract_alphafold_models.py's own default.
+DEFAULT_AF_ARCHIVE = "/opt/data/alphafold2/UP000005640_9606_HUMAN_v4.tar"
+
+
+def expand_phase_keys(keys):
+    """Expand group names in a --skip/--only list; pass anything else through.
+
+    An unknown name is deliberately *not* an error here: ``--only nonsense``
+    selects no phases and :func:`main` exits 2 saying so, which is the same
+    outcome by a clearer route than a parser error listing 12 valid keys.
+    """
+    out = []
+    for key in keys:
+        out.extend(PHASE_GROUPS.get(key, (key,)))
+    return out
 
 
 class PhaseFailed(RuntimeError):
@@ -94,6 +133,16 @@ def build_phases(args):
     drawn = j(manifests, "negatives_drawn.csv")
     manifest = j(manifests, "run_manifest.csv")
     queue = j(manifests, "redock_queue.csv")
+
+    structures = j(run, "structures")
+    cavity_mapping = j(manifests, "cavity_mapping.csv")
+    alphafold_mapping = j(manifests, "alphafold_mapping.csv")
+    fixed_mapping = j(manifests, "fixed_mapping.csv")
+    pdbqt_mapping = j(manifests, "pdbqt_mapping.csv")
+
+    # batch_dock.py resolves each mapping as <run-dir>/manifests/<basename>, so the
+    # structure phases must write there and nowhere else.
+    threads = ["--threads", str(args.threads)] if args.threads else []
 
     phases = [
         Phase("identity", "Phase 0 - build the identity index",
@@ -146,16 +195,45 @@ def build_phases(args):
                  if args.job_classification else []),
               produces=[manifest, queue], requires=[positives]))
 
+    phases.extend([
+        Phase("cavity-structures", "Phase 6a - unpack the cavities the queue names",
+              "extract_cavities.py",
+              ["--manifest", cavity_manifest, "--required", queue,
+               "--tarballs", args.tarballs or "",
+               "--out-dir", j(structures, "cavities"), "--out", cavity_mapping],
+              produces=[cavity_mapping], requires=[cavity_manifest, queue]),
+        Phase("alphafold", "Phase 6b - extract the AlphaFold models the queue names",
+              "extract_alphafold_models.py",
+              ["--required", queue, "--archive", args.af_archive,
+               "--out-dir", j(structures, "alphafold"), "--out", alphafold_mapping]
+              + threads,
+              produces=[alphafold_mapping], requires=[queue]),
+        Phase("fix", "Phase 6c - add hydrogens to the receptors",
+              "fix_required_pdbs.py",
+              ["--required", queue, "--alphafold-mapping", alphafold_mapping,
+               "--out-dir", j(structures, "fixed"), "--out", fixed_mapping]
+              + threads,
+              produces=[fixed_mapping], requires=[queue, alphafold_mapping]),
+        Phase("pdbqt", "Phase 6d - convert the receptors to PDBQT",
+              "convert_pdb_to_pdbqt.py",
+              ["--input-mapping", fixed_mapping, "--required", queue,
+               "--out-dir", j(structures, "pdbqt"), "--out", pdbqt_mapping]
+              + threads,
+              produces=[pdbqt_mapping], requires=[queue, fixed_mapping]),
+    ])
+
     phases.append(
-        Phase("dock", "Phase 6 - dock the queue (skips jobs already complete in the output dir)",
+        # Requires the receptors, not just the queue: docking a job list with no
+        # structures behind it is the failure this phase group was added to prevent.
+        Phase("dock", "Phase 7 - dock the queue (skips jobs already complete in the output dir)",
               "batch_dock.py",
               ["--queue", queue, "--run-dir", run,
                "--complex-pdb", args.complex_pdb]
               + (["--ligands", args.ligands] if args.ligands else []),
-              produces=[], requires=[queue]))
+              produces=[], requires=[queue, fixed_mapping, cavity_mapping]))
 
     phases.append(
-        Phase("parse", "Phase 7 - parse results into the analysis table",
+        Phase("parse", "Phase 8 - parse results into the analysis table",
               "parse_prepare.py", ["--run-dir", run],
               produces=[], requires=[manifest], optional=True))
 
@@ -267,7 +345,13 @@ def build_parser():
                               "when unset, else %s" % DEFAULT_DRUGS))
     parser.add_argument("--tarballs", default="/opt/data/cavity_space/af_strong_cavities_data_all",
                         help="folder of CavitySpace cavity tarballs (default: %(default)s)")
+    parser.add_argument("--af-archive", default=DEFAULT_AF_ARCHIVE,
+                        help="AlphaFold tar archive to extract models from (default: %(default)s)")
     parser.add_argument("--ligands", default=None, help="prepared ligand SDF folder")
+    parser.add_argument("--threads", type=int, default=None,
+                        help=("worker threads for the structure phases (extraction, "
+                              "hydrogen addition, PDBQT conversion). Unset leaves each "
+                              "script on its own default."))
     parser.add_argument("--pool", default=None,
                         help=("optional negatives_pool.csv: already-docked "
                               "non-interaction jobs the sampler may draw from before "
@@ -280,10 +364,12 @@ def build_parser():
                               "so removing them makes RMSD non-recomputable. Keep "
                               "during a run; delete/compress as an archival step "
                               "afterwards. Default: %(default)s"))
-    parser.add_argument("--skip", action="append", default=[],
-                        metavar="PHASE", help="phase key to skip (repeatable)")
-    parser.add_argument("--only", action="append", default=[],
-                        metavar="PHASE", help="run only these phase keys (repeatable)")
+    parser.add_argument("--skip", action="append", default=[], metavar="PHASE",
+                        help=("phase key to skip (repeatable). Also accepts a group "
+                              "name: %s" % ", ".join(sorted(PHASE_GROUPS))))
+    parser.add_argument("--only", action="append", default=[], metavar="PHASE",
+                        help=("run only these phase keys (repeatable). Also accepts a "
+                              "group name: %s" % ", ".join(sorted(PHASE_GROUPS))))
     parser.add_argument("--dry-run", action="store_true",
                         help="print the plan and exit without running anything")
     parser.add_argument("--timeout", type=float, default=None,
@@ -298,9 +384,11 @@ def main(argv=None):
 
     phases = build_phases(args)
     if args.only:
-        phases = [p for p in phases if p.key in set(args.only)]
+        selected = set(expand_phase_keys(args.only))
+        phases = [p for p in phases if p.key in selected]
     if args.skip:
-        phases = [p for p in phases if p.key not in set(args.skip)]
+        skipped = set(expand_phase_keys(args.skip))
+        phases = [p for p in phases if p.key not in skipped]
 
     if not phases:
         LOG.error("no phases selected")

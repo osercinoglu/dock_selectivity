@@ -83,6 +83,107 @@ class TestPhaseComposition(unittest.TestCase):
             parser.parse_args(["--run-dir", "/tmp/x", "--mode", "whatever-is-lying-around"])
 
 
+class TestStructurePhases(unittest.TestCase):
+    """Phase 6 builds the receptors.
+
+    Before it existed the runner planned a queue and then handed it to
+    ``batch_dock.py`` with nothing to dock into: the four structure-preparation
+    scripts were documented in the pilot section of SETUP.md and left to be run by
+    hand. A chain that plans work it cannot execute is the same class of defect as
+    a phase exiting 0 without producing its output.
+    """
+
+    STRUCTURE_KEYS = ("cavity-structures", "alphafold", "fix", "pdbqt")
+
+    def test_the_four_structure_scripts_are_invoked(self):
+        scripts = [p.script for p in plan()]
+        for script in ("extract_cavities.py", "extract_alphafold_models.py",
+                       "fix_required_pdbs.py", "convert_pdb_to_pdbqt.py"):
+            with self.subTest(script=script):
+                self.assertIn(script, scripts)
+
+    def test_structures_come_after_the_queue_and_before_docking(self):
+        keys = [p.key for p in plan()]
+        for key in self.STRUCTURE_KEYS:
+            with self.subTest(phase=key):
+                self.assertLess(keys.index("manifest"), keys.index(key))
+                self.assertLess(keys.index(key), keys.index("dock"))
+
+    def test_structure_phases_are_ordered_by_their_dependencies(self):
+        """Hydrogens need the extracted model; PDBQT needs the hydrogenated one."""
+        keys = [p.key for p in plan()]
+        self.assertLess(keys.index("alphafold"), keys.index("fix"))
+        self.assertLess(keys.index("fix"), keys.index("pdbqt"))
+
+    def test_mappings_land_where_batch_dock_looks_for_them(self):
+        """batch_dock resolves each mapping as <run-dir>/manifests/<basename>.
+
+        A structure phase writing anywhere else produces a run that plans, preps,
+        and then silently docks against whatever older mapping is on the path.
+        """
+        import batch_dock
+
+        expected = {
+            "cavity-structures": batch_dock.CAVITY_MAPPING_CSV,
+            "alphafold": batch_dock.ALPHAFOLD_MAPPING_CSV,
+            "fix": batch_dock.FIXED_MAPPING_CSV,
+            "pdbqt": batch_dock.PDBQT_MAPPING_CSV,
+        }
+        by_key = {p.key: p for p in plan()}
+        for key, mapping_name in expected.items():
+            with self.subTest(phase=key):
+                produced = by_key[key].produces
+                self.assertEqual(len(produced), 1)
+                self.assertEqual(os.path.basename(produced[0]),
+                                 os.path.basename(mapping_name))
+                self.assertEqual(os.path.basename(os.path.dirname(produced[0])),
+                                 "manifests")
+
+    def test_every_structure_phase_is_restricted_to_the_queue(self):
+        """--required is what keeps a run from materialising all 38,709 cavities."""
+        for phase in plan():
+            if phase.key not in self.STRUCTURE_KEYS:
+                continue
+            with self.subTest(phase=phase.key):
+                self.assertIn("--required", phase.args)
+                target = phase.args[phase.args.index("--required") + 1]
+                self.assertTrue(target.endswith("redock_queue.csv"), target)
+
+    def test_docking_requires_the_receptors_not_just_the_queue(self):
+        dock = [p for p in plan() if p.key == "dock"][0]
+        basenames = {os.path.basename(r) for r in dock.requires}
+        self.assertIn("fixed_mapping.csv", basenames)
+        self.assertIn("redock_queue.csv", basenames)
+
+    def test_threads_is_passed_only_when_set(self):
+        by_key = {p.key: p for p in plan()}
+        self.assertNotIn("--threads", by_key["fix"].args)
+        by_key = {p.key: p for p in plan(threads="8")}
+        self.assertEqual(by_key["fix"].args[by_key["fix"].args.index("--threads") + 1], "8")
+        # extract_cavities.py has no --threads; passing one would be a parser error.
+        self.assertNotIn("--threads", by_key["cavity-structures"].args)
+
+
+class TestPhaseGroups(unittest.TestCase):
+    def test_only_structures_selects_exactly_the_structure_phases(self):
+        self.assertEqual(wf.expand_phase_keys(["structures"]),
+                         list(TestStructurePhases.STRUCTURE_KEYS))
+
+    def test_groups_name_phases_that_exist(self):
+        keys = {p.key for p in plan()}
+        for group, members in wf.PHASE_GROUPS.items():
+            for member in members:
+                with self.subTest(group=group, phase=member):
+                    self.assertIn(member, keys)
+
+    def test_the_groups_partition_everything_except_dock_and_parse(self):
+        grouped = {k for members in wf.PHASE_GROUPS.values() for k in members}
+        self.assertEqual({p.key for p in plan()} - grouped, {"dock", "parse"})
+
+    def test_an_unrecognised_key_passes_through_unchanged(self):
+        self.assertEqual(wf.expand_phase_keys(["dock", "nonsense"]), ["dock", "nonsense"])
+
+
 class TestPrerequisiteDiscipline(unittest.TestCase):
     def test_a_missing_prerequisite_stops_the_run(self):
         phase = wf.Phase("x", "X", "build_identity_index.py", [],

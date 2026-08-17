@@ -44,7 +44,10 @@ alone — useful when a phase needs different arguments, or when re-running one.
 | 3 | `plan_positives.py` | resolved edges, cavities, ligands | `manifests/positives_planned.csv` |
 | 4 | `sample_negatives.py` | positives, interactions | `manifests/negatives_drawn.csv` |
 | 5 | `build_run_manifest.py` | positives, negatives | `manifests/run_manifest.csv`, `redock_queue.csv` |
-| 6 | `extract_alphafold_models.py`, `fix_required_pdbs.py`, `convert_pdb_to_pdbqt.py`, `extract_cavities.py` | queue | `structures/` |
+| 6a | `extract_cavities.py` | cavity manifest, queue | `structures/cavities/`, `cavity_mapping.csv` |
+| 6b | `extract_alphafold_models.py` | queue | `structures/alphafold/`, `alphafold_mapping.csv` |
+| 6c | `fix_required_pdbs.py` | queue, alphafold mapping | `structures/fixed/`, `fixed_mapping.csv` |
+| 6d | `convert_pdb_to_pdbqt.py` | queue, fixed mapping | `structures/pdbqt/`, `pdbqt_mapping.csv` |
 | 7 | `batch_dock.py --queue` | queue, structures, ligands | `docking_results/<job>/` |
 | 8 | `parse_prepare.py` | docking results | `analysis/combined_results.parquet` |
 
@@ -67,8 +70,11 @@ in both classes. `--prefer-pool` reuses already-docked non-interactions.
 **5 — manifest.** Merges both into the authority on what should exist, plus the
 queue of what must actually be docked.
 
-**6 — structures.** Extracts cavities, AlphaFold models, adds hydrogens, converts
-to PDBQT. Each takes `--required` and materialises only what the queue asks for.
+**6 — structures.** Extracts cavities and AlphaFold models, adds hydrogens,
+converts to PDBQT. Each takes `--required` and materialises only what the queue
+asks for — the four steps run in order because each consumes the previous one's
+mapping. `batch_dock.py` picks receptors in the order fixed > alphafold > cavity,
+substituting PDBQT where one exists.
 
 **7 — docking.** Five stages in order: smina → gnina → GOLD → LeDock → consensus
 RMSD. `consensus_docker.py` is invoked once per tool per job; the RMSD stage
@@ -77,9 +83,18 @@ compares every pose of every tool pair into `final_results.csv`.
 **8 — analysis.** Walks the job directories into one parquet, joining sample
 types, IC50s, cavity clusters and DTA predictions.
 
-## Running one phase
+## Running part of the pipeline
 
-Each script documents its own arguments:
+`--only` and `--skip` take a phase key from the table, or a group name —
+`planning` (phases 0–5) and `structures` (phase 6):
+
+```bash
+python3 run_full_workflow.py --run-dir $RUN --only planning     # plan, don't dock
+python3 run_full_workflow.py --run-dir $RUN --only structures --threads 16
+python3 run_full_workflow.py --run-dir $RUN --skip parse
+```
+
+Each script also runs standalone and documents its own arguments:
 
 ```bash
 python3 <script>.py --help

@@ -168,21 +168,13 @@ programs, in a few minutes:
 ```bash
 P=<data>/pilot
 python3 run_full_workflow.py --inputs-dir $P/inputs --run-dir $P/run --mode balanced \
-    --skip dock --skip parse
-python3 extract_cavities.py --manifest $P/run/manifests/cavity_manifest.csv \
-    --required $P/run/manifests/redock_queue.csv \
-    --out-dir $P/run/structures/cavities --out $P/run/manifests/cavity_mapping.csv
-python3 extract_alphafold_models.py --required $P/run/manifests/redock_queue.csv \
-    --out-dir $P/run/structures/alphafold --out $P/run/manifests/alphafold_mapping.csv
-python3 fix_required_pdbs.py --required $P/run/manifests/redock_queue.csv \
-    --alphafold-mapping $P/run/manifests/alphafold_mapping.csv \
-    --out-dir $P/run/structures/fixed --out $P/run/manifests/fixed_mapping.csv
-python3 convert_pdb_to_pdbqt.py --input-mapping $P/run/manifests/fixed_mapping.csv \
-    --required $P/run/manifests/redock_queue.csv \
-    --out-dir $P/run/structures/pdbqt --out $P/run/manifests/pdbqt_mapping.csv
+    --skip dock --skip parse            # phases 0-6: plan and build the receptors
 python3 batch_dock.py --queue $P/run/manifests/redock_queue.csv --run-dir $P/run \
     --ligands $P/inputs/ligands --tools smina,ledock --test-mode --max-jobs 1
 ```
+
+Four jobs are planned and their two receptors materialised in about 40 s; the
+docking step is what takes the remaining minutes.
 
 Expected: `docking_results/<job>/final_results.csv` with one row per cross-tool
 pose pair (400 rows for a 20×20 smina/LeDock comparison), and `job_identity.json`
