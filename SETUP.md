@@ -20,12 +20,44 @@ Tests use the standard library `unittest` only:
 python3 -m unittest discover -s tests -t .
 ```
 
+### Notifications (optional)
+
+Any script, and the workflow runner, will send Pushover notifications with
+`--notify`. The credentials come from the environment only — never a command-line
+flag, never a file in this repository, never a log record:
+
+1. Create an account at [pushover.net](https://pushover.net) and install the app
+   on the device you want woken up. Your **user key** is on the dashboard.
+2. On the same dashboard, *Create an Application/API Token* (any name, e.g.
+   `dock_selectivity`). That gives the **application token**.
+3. Export both, in the shell you start runs from — put them in `~/.bashrc` or a
+   file you keep outside the repo, not in `environment.yml`:
+
+```bash
+export PUSHOVER_TOKEN=<application token>
+export PUSHOVER_USER_KEY=<user key>
+export PUSHOVER_DEVICE=<device name>       # optional; all devices otherwise
+```
+
+4. Check them without running anything:
+
+```bash
+python3 run_full_workflow.py --run-dir $RUN --dry-run --notify
+```
+
+`--notify` with either variable unset exits 2 at startup rather than at hour 40.
+A notification that fails to send is logged as a warning and never stops a run.
+
 ## External programs
 
 The pipeline shells out to `consensus_docker.py`, which in turn drives the
-docking engines. Paths are set at the top of `batch_dock.py`.
+docking engines. Each binary is found in this order: the environment variable
+below, then `$PATH`, then `~/software/<binary>`. Each also has a flag
+(`--smina-path`, `--gnina-path`, …), and an *enabled* engine whose binary is
+missing aborts the run with exit 2 naming the engine, the variable and the flag —
+rather than failing inside a subprocess an hour later.
 
-| Program | Constant | Notes |
+| Program | Variable | Notes |
 |---|---|---|
 | `consensus_docker.py` | `CONSENSUS_DOCKER_SCRIPT` | separate repo, `github.com/…/consensus_docking` |
 | smina | `SMINA_PATH` | conda: `conda install -c conda-forge smina` |

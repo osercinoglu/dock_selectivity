@@ -46,11 +46,19 @@ Usage
 ::
 
     python3 build_run_manifest.py \\
-        --positives    manifests/positives_planned.csv \\
-        --drawn        manifests/negatives_drawn.csv \\
-        --job-classification  manifests/job_classification.csv \\
-        --out          manifests/run_manifest.csv \\
-        --redock-out   manifests/redock_queue.csv
+        --run-dir      $RUN \\
+        --positives    $RUN/manifests/positives_planned.csv \\
+        --drawn        $RUN/manifests/negatives_drawn.csv \\
+        --job-classification  $RUN/manifests/job_classification.csv \\
+        --out          $RUN/manifests/run_manifest.csv \\
+        --redock-out   $RUN/manifests/redock_queue.csv
+
+``--run-dir`` is optional and moves only this step's own log and scratch state to
+``$RUN/steps/build_run_manifest/``; the manifests keep their explicit ``--out`` /
+``--redock-out`` paths.  Without it the step directory is inferred from ``--out``,
+so the log still lands in the campaign rather than in the invocation directory.
+``--notify`` (with ``PUSHOVER_TOKEN`` / ``PUSHOVER_USER_KEY`` in the environment)
+sends a Pushover message when the stage finishes or fails.
 """
 
 from __future__ import annotations
@@ -65,8 +73,18 @@ import pandas as pd
 
 from dock_selectivity import jobid, schemas
 from dock_selectivity.invariants import InvariantViolation, assert_unique_key
+from dock_selectivity.runtime import add_runtime_arguments, resolve_out_dir, step
 
-LOG = logging.getLogger("build_run_manifest")
+#: Names the logger, the step directory and the log file. Must stay equal to the
+#: logger name below, or ``step()`` would configure a logger this module never uses.
+STEP_NAME = "build_run_manifest"
+
+LOG = logging.getLogger(STEP_NAME)
+
+#: Directories the fixed run layout puts artifacts in; their parent is the run
+#: directory. Consulted only to place this step's own log when ``--run-dir`` is
+#: absent -- the log must land in the campaign, never in the invocation directory.
+_LAYOUT_DIRS = ("manifests", "identity", "analysis", "structures", "docking_results")
 
 #: Reuse classification that makes a job reusable as a positive.
 _TRUE_POSITIVE = "true_positive"
@@ -77,6 +95,20 @@ _FROM_POOL = "pool"
 
 class ManifestError(InvariantViolation):
     """Raised when the manifest cannot be assembled without ambiguity or loss."""
+
+
+def infer_run_dir(artifact_path: str) -> str:
+    """Best guess at the run directory, from an artifact this step writes.
+
+    ``--run-dir`` is optional so every existing command line (including the ones
+    ``run_full_workflow.py`` builds) keeps working unchanged, but the step log may
+    not fall back to the invocation directory -- that is how the repository working
+    tree filled up with stray ``*.log`` files.
+    """
+    parent = os.path.dirname(os.path.abspath(artifact_path))
+    if os.path.basename(parent) in _LAYOUT_DIRS:
+        return os.path.dirname(parent)
+    return parent
 
 
 def _norm_fragment(value: Any) -> str:
@@ -249,18 +281,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="redock_queue.csv to write. Omit to skip; the manifest still marks the rows.",
     )
+    parser.add_argument(
+        "--run-dir",
+        default=None,
+        help=(
+            "campaign run directory. Optional: it only places this step's own log "
+            "and scratch state at <run-dir>/steps/build_run_manifest/. The manifests "
+            "keep their explicit --out/--redock-out paths."
+        ),
+    )
     parser.add_argument("-v", "--verbose", action="store_true",
-                        help="debug-level logging")
+                        help="debug-level logging (same as --log-level DEBUG)")
+    add_runtime_arguments(parser, STEP_NAME)
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(levelname)s %(message)s",
-    )
-
+def _assemble(args: argparse.Namespace) -> int:
+    """The stage itself. ``main()`` runs this inside :func:`step`."""
     try:
         positives = schemas.read_checked(args.positives, "positives_planned")
         drawn = schemas.read_checked(args.drawn, "negatives_drawn")
@@ -297,6 +334,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     LOG.info("wrote %s", args.out)
     if args.redock_out:
         LOG.info("redock_queue: %d jobs -> %s", len(redock), args.redock_out)
+    return 0
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.verbose:
+        # -v predates --log-level and existing command lines still pass it.
+        args.log_level = "DEBUG"
+    resolve_out_dir(args, STEP_NAME, args.run_dir or infer_run_dir(args.out))
+    try:
+        with step(STEP_NAME, args):
+            code = _assemble(args)
+            if code:
+                # step() reports a non-zero SystemExit as a failure (and notifies
+                # about it); main() still owes its caller an int, so catch it back.
+                raise SystemExit(code)
+    except SystemExit as exc:
+        return int(exc.code or 0)
     return 0
 
 

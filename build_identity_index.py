@@ -76,6 +76,7 @@ Examples
 
     # authoritative, offline, from files already on disk
     python build_identity_index.py \\
+        --run-dir   $NEW \\
         --idmapping /opt/data/uniprot/HUMAN_9606_idmapping.dat.gz \\
         --proteome  /opt/data/uniprot/UP000005640_9606.fasta.gz \\
         --hgnc      /opt/data/hgnc/hgnc_complete_set.txt \\
@@ -88,6 +89,14 @@ Examples
     python build_identity_index.py \\
         --from-legacy-gene-names $OLD/uniprot_gene_mapping.csv \\
         --out $NEW/identity/identity_index_reduced.parquet
+
+``--run-dir`` is optional and moves only this step's own log and scratch state to
+``$NEW/steps/build_identity_index/``; the index, meta, rejects and notes keep their
+explicit ``--out`` / ``--meta`` / ``--unresolved`` / ``--notes`` paths.  Without it
+the step directory is inferred from ``--out``, so the log still lands in the
+campaign rather than in the invocation directory.  ``--notify`` (with
+``PUSHOVER_TOKEN`` / ``PUSHOVER_USER_KEY`` in the environment) sends a Pushover
+message when the build finishes or fails.
 
 Set ``SOURCE_DATE_EPOCH`` to make ``identity_index.meta.json`` byte-reproducible
 too (the parquet always is).
@@ -142,6 +151,11 @@ from dock_selectivity.invariants import (  # noqa: E402
     assert_unique_key,
     write_invariant_report,
 )
+from dock_selectivity.runtime import (  # noqa: E402
+    add_runtime_arguments,
+    resolve_out_dir,
+    step,
+)
 
 __all__ = [
     "BUILDER_VERSION",
@@ -179,7 +193,19 @@ __all__ = [
     "write_outputs",
 ]
 
-logger = logging.getLogger("build_identity_index")
+#: Names the logger, the step directory and the log file. Must stay equal to the
+#: logger name below, or ``step()`` would configure a logger this module never uses.
+STEP_NAME = "build_identity_index"
+
+logger = logging.getLogger(STEP_NAME)
+
+#: Directories the fixed run layout puts artifacts in; their parent is the run
+#: directory. Consulted only to place this step's own log when ``--run-dir`` is
+#: absent -- the log must land in the campaign, never in the invocation directory.
+_LAYOUT_DIRS = ("manifests", "identity", "analysis", "structures", "docking_results")
+
+#: ``PYTHONHASHSEED`` values ``--check-determinism`` rebuilds under (G3).
+DEFAULT_DETERMINISM_SEEDS = (0, 1, 42)
 
 #: Bumped whenever the *content* of the emitted index could change for identical
 #: inputs.  Recorded in the meta so a stale index is identifiable.
@@ -1946,12 +1972,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="record this UniProt release string in the meta (offline builds)",
     )
     parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
-        help="logging verbosity (default: %(default)s)",
+        "--determinism-seeds",
+        type=int,
+        nargs="+",
+        default=list(DEFAULT_DETERMINISM_SEEDS),
+        metavar="SEED",
+        help=(
+            "PYTHONHASHSEED values --check-determinism rebuilds under "
+            "(default: {0})".format(" ".join(str(s) for s in DEFAULT_DETERMINISM_SEEDS))
+        ),
     )
+    parser.add_argument(
+        "--run-dir",
+        default=None,
+        help=(
+            "campaign run directory. Optional: it only places this step's own log "
+            "and scratch state at <run-dir>/steps/build_identity_index/. The index "
+            "and its sidecars keep their explicit --out/--meta/--unresolved paths."
+        ),
+    )
+    # --log-level, --quiet and the notification flags come from the shared
+    # runtime; this parser must not declare its own copy of any of them.
+    add_runtime_arguments(parser, STEP_NAME)
+    _allow_critical_log_level(parser)
     return parser
+
+
+def _allow_critical_log_level(parser: argparse.ArgumentParser) -> None:
+    """Keep ``--log-level CRITICAL`` working after the shared runtime took over.
+
+    The runtime offers DEBUG|INFO|WARNING|ERROR; this script has accepted
+    CRITICAL since it was written and callers (the test suite among them) use it
+    to silence an intentionally-failing build.  Widening the existing action's
+    choices preserves that without declaring a second, competing flag.
+    """
+    for action in parser._actions:  # argparse exposes no public accessor
+        if "--log-level" in action.option_strings and action.choices is not None:
+            if "CRITICAL" not in action.choices:
+                action.choices = list(action.choices) + ["CRITICAL"]
 
 
 def build_from_options(args: argparse.Namespace) -> BuildResult:
@@ -2040,7 +2098,22 @@ def parquet_fingerprint_for_argv(argv: Sequence[str]) -> str:
         return file_sha256(path)
 
 
-def _check_determinism(argv: Sequence[str], seeds: Sequence[int] = (0, 1, 42)) -> Dict[str, Any]:
+def infer_run_dir(artifact_path: str) -> str:
+    """Best guess at the run directory, from an artifact this step writes.
+
+    ``--run-dir`` is optional so every existing command line (including the one
+    ``run_full_workflow.py`` builds) keeps working unchanged, but the step log may
+    not fall back to the invocation directory -- that is how the repository working
+    tree filled up with stray ``*.log`` files.
+    """
+    parent = os.path.dirname(os.path.abspath(artifact_path))
+    if os.path.basename(parent) in _LAYOUT_DIRS:
+        return os.path.dirname(parent)
+    return parent
+
+
+def _check_determinism(argv: Sequence[str],
+                       seeds: Sequence[int] = DEFAULT_DETERMINISM_SEEDS) -> Dict[str, Any]:
     snippet = (
         "import json, sys\n"
         "sys.path.insert(0, {repo!r})\n"
@@ -2054,19 +2127,8 @@ def _check_determinism(argv: Sequence[str], seeds: Sequence[int] = (0, 1, 42)) -
     )
 
 
-def run(argv: Optional[Sequence[str]] = None) -> int:
-    """CLI entry point.  Returns a process exit code; raises nothing expected."""
-    raw_argv = list(sys.argv[1:] if argv is None else argv)
-    args = build_parser().parse_args(raw_argv)
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    # basicConfig is a no-op once the root logger has handlers, so set the level
-    # explicitly: a second call to run() in the same process must still honour
-    # --log-level.
-    logging.getLogger().setLevel(getattr(logging, args.log_level))
-
+def _build_and_write(args: argparse.Namespace, raw_argv: Sequence[str]) -> int:
+    """The build itself.  :func:`run` executes this inside :func:`step`."""
     try:
         result = build_from_options(args)
     except BuildInputError as exc:
@@ -2106,7 +2168,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     if args.check_determinism:
-        report = _check_determinism(raw_argv)
+        report = _check_determinism(raw_argv, seeds=args.determinism_seeds)
         logger.info("determinism check: %s", "OK" if report.get("ok") else "FAILED")
 
     banner = ""
@@ -2144,6 +2206,23 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             meta["outputs"]["notes_path"],
         )
     )
+    return 0
+
+
+def run(argv: Optional[Sequence[str]] = None) -> int:
+    """CLI entry point.  Returns a process exit code; raises nothing expected."""
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(raw_argv)
+    resolve_out_dir(args, STEP_NAME, args.run_dir or infer_run_dir(args.out))
+    try:
+        with step(STEP_NAME, args):
+            code = _build_and_write(args, raw_argv)
+            if code:
+                # step() reports a non-zero SystemExit as a failure (and notifies
+                # about it); run() still owes its caller an int, so catch it back.
+                raise SystemExit(code)
+    except SystemExit as exc:
+        return int(exc.code or 0)
     return 0
 
 

@@ -54,13 +54,22 @@ Usage
 ::
 
     python3 sample_negatives.py \\
+        --run-dir      $NEW \\
         --index        $NEW/identity/identity_index.parquet \\
         --interactions $NEW/manifests/interactions_resolved.csv \\
         --positives    $NEW/manifests/positives_planned.csv \\
         --pool         $NEW/manifests/negatives_pool.csv \\
         --prefer-pool \\
+        --seed         42 \\
         --redock-queue $NEW/manifests/redock_queue_negatives.csv \\
         --out          $NEW/manifests/negatives_drawn.csv
+
+``--run-dir`` is optional and moves only this step's own log and scratch state to
+``$NEW/steps/sample_negatives/``; the manifests keep their explicit ``--out`` and
+sidecar paths.  Without it the step directory is inferred from ``--out``, so the
+log still lands in the campaign rather than in the invocation directory.
+``--notify`` (with ``PUSHOVER_TOKEN`` / ``PUSHOVER_USER_KEY`` in the environment)
+sends a Pushover message when the stage finishes or fails.
 
 Determinism: identical inputs and ``--seed`` produce byte-identical outputs, on
 any ``PYTHONHASHSEED``.  Nothing here iterates a ``set``, and no timestamp is
@@ -117,6 +126,11 @@ from dock_selectivity.invariants import (  # noqa: E402
 IDENTITY_ERRORS = (InvariantViolation, _IdentityInvariantViolation)
 from dock_selectivity.jobid import format_job_dir  # noqa: E402
 from dock_selectivity.joins import checked_merge  # noqa: E402
+from dock_selectivity.runtime import (  # noqa: E402
+    add_runtime_arguments,
+    resolve_out_dir,
+    step,
+)
 from dock_selectivity.schemas import (  # noqa: E402
     SchemaViolation,
     empty_frame,
@@ -143,7 +157,16 @@ __all__ = [
     "main",
 ]
 
-logger = logging.getLogger("sample_negatives")
+#: Names the logger, the step directory and the log file. Must stay equal to the
+#: logger name below, or ``step()`` would configure a logger this module never uses.
+STEP_NAME = "sample_negatives"
+
+logger = logging.getLogger(STEP_NAME)
+
+#: Directories the fixed run layout puts artifacts in; their parent is the run
+#: directory. Consulted only to place this step's own log when ``--run-dir`` is
+#: absent -- the log must land in the campaign, never in the invocation directory.
+_LAYOUT_DIRS = ("manifests", "identity", "analysis", "structures", "docking_results")
 
 #: Balance units.  ``job`` = one cavity row; ``pair`` = one (drug, accession).
 UNIT_JOB = "job"
@@ -1532,6 +1555,20 @@ def write_outputs(
 # --------------------------------------------------------------------------
 
 
+def infer_run_dir(artifact_path: str) -> str:
+    """Best guess at the run directory, from an artifact this step writes.
+
+    ``--run-dir`` is optional so every existing command line (including the ones
+    ``run_full_workflow.py`` builds) keeps working unchanged, but the step log may
+    not fall back to the invocation directory -- that is how the repository working
+    tree filled up with stray ``*.log`` files.
+    """
+    parent = os.path.dirname(os.path.abspath(artifact_path))
+    if os.path.basename(parent) in _LAYOUT_DIRS:
+        return os.path.dirname(parent)
+    return parent
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sample_negatives.py",
@@ -1629,11 +1666,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deficits", default=None, help="override sidecar path")
     parser.add_argument("--report", default=None, help="override sidecar path")
     parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="logging verbosity (default INFO)",
+        "--max-repair-scans",
+        type=int,
+        default=DEFAULT_MAX_REPAIR_SCANS,
+        help=(
+            "ceiling on the endgame repair's length-3 augmentation scans "
+            "(default {0}). The repair is a bounded improvement, never a "
+            "correctness requirement: whatever the budget cannot close is "
+            "reported as a deficit rather than silently abandoned."
+        ).format(DEFAULT_MAX_REPAIR_SCANS),
     )
+    parser.add_argument(
+        "--run-dir",
+        default=None,
+        help=(
+            "campaign run directory. Optional: it only places this step's own log "
+            "and scratch state at <run-dir>/steps/sample_negatives/. The manifests "
+            "keep their explicit --out and sidecar paths."
+        ),
+    )
+    # --log-level, --quiet and the notification flags come from the shared
+    # runtime; this parser must not declare its own copy of any of them.
+    add_runtime_arguments(parser, STEP_NAME)
     return parser
 
 
@@ -1708,13 +1762,8 @@ def _log_summary(result: SamplingResult) -> None:
                 )
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_arg_parser().parse_args(argv)
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(levelname)s %(name)s: %(message)s",
-    )
-
+def _sample(args: argparse.Namespace) -> int:
+    """The stage itself. ``main()`` runs this inside :func:`step`."""
     try:
         index = IdentityIndex.load(args.index, expect_sha256=args.index_sha256)
         interactions = read_checked(args.interactions, "interactions_resolved")
@@ -1745,6 +1794,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             prefer_pool=args.prefer_pool,
             seed=args.seed,
             balance_unit=args.balance_unit,
+            max_repair_scans=args.max_repair_scans,
         )
     except IDENTITY_ERRORS as exc:
         logger.error("invariant violation: %s", exc)
@@ -1775,6 +1825,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             written["deficits"],
         )
         return EXIT_UNBALANCED
+    return EXIT_OK
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    resolve_out_dir(args, STEP_NAME, args.run_dir or infer_run_dir(args.out))
+    try:
+        with step(STEP_NAME, args):
+            code = _sample(args)
+            if code:
+                # step() reports a non-zero SystemExit as a failure (and notifies
+                # about it); main() still owes its caller an int, so catch it back.
+                raise SystemExit(code)
+    except SystemExit as exc:
+        return int(exc.code or 0)
     return EXIT_OK
 
 

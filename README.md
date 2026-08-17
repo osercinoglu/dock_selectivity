@@ -24,12 +24,36 @@ Inputs are shared and versioned; outputs are per-run:
 ```
 $DATA/inputs/     1_drug_to_protein.tsv, small_molecule_drug_links.csv,
                   ligands/, uniprot/
-$DATA/runs/<date>/  identity/ manifests/ structures/ docking_results/ analysis/
+$DATA/runs/<date>/  identity/ manifests/ structures/ docking_results/
+                    steps/ logs/          ← logs, one folder per phase
 ```
 
 Every stage skips work already complete on disk, so a run can be interrupted and
 resumed, and a partially populated output directory is docked to completion
 rather than redone.
+
+## Where the logs are
+
+Nothing writes a log file loose into the directory you started it from:
+
+```
+$RUN/logs/workflow.log                    the runner: plan, phase, exit code, elapsed
+$RUN/steps/<phase>/<script>.log           that phase's own log
+$RUN/steps/<phase>/<phase>.console.log    everything that phase printed
+```
+
+Run a script standalone with no `--run-dir` and it makes `./<step-name>/` and logs
+there. The four structure scripts name that log after the *phase* rather than the
+script, because the runner sets it with `--log-file`.
+
+The runner captures each phase's stdout and stderr into that console log instead
+of twelve scripts interleaving progress bars in one terminal — but a failed phase
+still quotes the tail of its output into `workflow.log` and onto your screen.
+
+Every script takes `--out-dir` (its own folder), `--log-file`, `--log-level` and
+`--quiet`. The four structure scripts are the exception: they owned `--out-dir`
+first and it means *where the structures land*, so their log is set with
+`--log-file` — which is what `run_full_workflow.py` passes them.
 
 ## The pipeline, phase by phase
 
@@ -49,7 +73,7 @@ alone — useful when a phase needs different arguments, or when re-running one.
 | 6c | `fix_required_pdbs.py` | queue, alphafold mapping | `structures/fixed/`, `fixed_mapping.csv` |
 | 6d | `convert_pdb_to_pdbqt.py` | queue, fixed mapping | `structures/pdbqt/`, `pdbqt_mapping.csv` |
 | 7 | `batch_dock.py --queue` | queue, structures, ligands | `docking_results/<job>/` |
-| 8 | `parse_prepare.py` | docking results | `analysis/combined_results.parquet` |
+| 8 | `parse_prepare.py` | docking results, manifest | `combined_filtered_annotated_docking_results.parquet` |
 
 **0 — identity.** Builds the accession ↔ Entrez ↔ symbol index everything else
 keys on. Run once; downstream stages pin its SHA256.
@@ -81,7 +105,36 @@ RMSD. `consensus_docker.py` is invoked once per tool per job; the RMSD stage
 compares every pose of every tool pair into `final_results.csv`.
 
 **8 — analysis.** Walks the job directories into one parquet, joining sample
-types, IC50s, cavity clusters and DTA predictions.
+types, IC50s, cavity clusters and DTA predictions. Discovery is checked against
+`run_manifest.csv`: finding fewer jobs than the manifest declares stops the parse
+instead of quietly producing a smaller table.
+
+## Being told when it breaks
+
+A three-day run that dies at hour 40 should not wait for you to notice. Set two
+environment variables — never a flag, never a file in this repo — and pass
+`--notify`:
+
+```bash
+export PUSHOVER_TOKEN=<application token>     # pushover.net → Create an Application
+export PUSHOVER_USER_KEY=<your user key>      # shown on your pushover.net dashboard
+export PUSHOVER_DEVICE=<device name>          # optional; all devices otherwise
+
+python3 run_full_workflow.py --run-dir $RUN --notify
+```
+
+You get one message when the run starts, one naming the phase and its exit code
+if anything fails, and one at the end with the total time and a per-phase
+summary. `--notify` with the variables unset exits 2 **before** the first phase,
+so a broken notification setup is discovered in seconds rather than at hour 40;
+`--dry-run --notify` is a way to check them without running anything.
+
+`--notify-steps` additionally passes `--notify` down to every phase script, which
+then reports on itself (failures only). Off by default — otherwise a 12-phase run
+notifies twelve more times. Any individual script takes `--notify`,
+`--notify-on start|success|failure|all` and `--notify-title` the same way. A
+notification that cannot be delivered is logged as a warning and never stops the
+run. See `SETUP.md` for the Pushover account setup.
 
 ## Running part of the pipeline
 

@@ -16,6 +16,10 @@ Modules:
 * :mod:`dock_selectivity.jobid` -- the job-directory naming codec and
   ``job_identity.json``, which replaces the folder name as the carrier of
   identity.
+* :mod:`dock_selectivity.runtime` -- the shared step runtime every script's
+  ``main()`` uses: the common ``--out-dir/--log-*/--notify*`` flags, logging
+  configured *after* parsing into ``<run-dir>/steps/<step>/<step>.log``, and
+  Pushover notifications that can fail without failing the run.
 
 Submodules are imported lazily (PEP 562) so that importing the package costs
 nothing and never depends on optional third-party libraries.

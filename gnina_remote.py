@@ -18,7 +18,12 @@ was given.
 
 Point ``GNINA_PATH`` at this file and nothing else changes::
 
-    GNINA_PATH = "/home/onur/repos/dock_selectivity/gnina_remote.py"
+    # batch_dock.py --gnina-path $REPO/gnina_remote.py   (or GNINA_PATH=...)
+    GNINA_REMOTE_HOST=user@gpubox $REPO/gnina_remote.py \\
+        -r receptor.pdb -l ligand.sdf -o out.sdf --log out.log --cpu 16
+
+It takes no flags of its own: every argument it does not recognise is forwarded
+to the remote gnina, so its configuration is environment variables (below).
 
 Surviving a flaky link
 ----------------------
@@ -74,7 +79,9 @@ Configuration (environment, so no secrets live in the repo)::
     GNINA_REMOTE_NATIVE   native gnina path on the remote; skips the container
     GNINA_REMOTE_RETRIES  transient-failure attempts, default 5
     GNINA_REMOTE_TIMEOUT  seconds to wait for the remote run, default 7200
+    GNINA_REMOTE_POLL     seconds between completion checks in sync mode, default 10
     GNINA_REMOTE_KEEP     set to 1 to keep the remote job directory after success
+    GNINA_REMOTE_LOG      also append this shim's progress lines to this file
 
     GNINA_REMOTE_MODE       sync (default) | submit | collect
     GNINA_REMOTE_TICKET     where to write the ticket JSON
@@ -93,12 +100,24 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import posixpath
 import shlex
 import subprocess
 import sys
 import time
+
+#: This shim is exec'd once per docking job as if it were the gnina binary, and
+#: ``consensus_docker.py`` reads what comes back, so the stdout/stderr contract is
+#: fixed: progress goes to stderr, nothing goes to stdout. The logger exists so a
+#: campaign can ALSO keep a file (GNINA_REMOTE_LOG); it is never given a console
+#: handler, and with no handler at all its records simply go nowhere.
+LOG = logging.getLogger("gnina_remote")
+
+#: Optional file log for the shim, an absolute path. Off by default: thousands of
+#: invocations appending to one file is a choice, not a default.
+ENV_LOG_FILE = "GNINA_REMOTE_LOG"
 
 DEFAULT_IMAGE = "gnina/gnina:v1.3.3"
 DEFAULT_REMOTE_DIR = "gnina_jobs"
@@ -523,6 +542,11 @@ class _Config(object):
         self.lock_stale = int(float(os.environ.get("GNINA_REMOTE_LOCK_STALE",
                                                    DEFAULT_LOCK_STALE) or
                                     DEFAULT_LOCK_STALE))
+        # How often sync mode asks the remote whether it is done. Every poll is
+        # an SSH round trip, so a campaign on a slow link wants it larger and a
+        # test wants it near zero.
+        self.poll_interval = float(os.environ.get("GNINA_REMOTE_POLL",
+                                                  POLL_INTERVAL) or POLL_INTERVAL)
         remote_root = os.environ.get("GNINA_REMOTE_DIR", DEFAULT_REMOTE_DIR)
         # A quoted "~" is literal to the remote shell: shlex.quote("~/x") makes it
         # create a directory actually named "~". Keep the path relative (ssh resolves
@@ -692,7 +716,7 @@ def _run_sync(cfg, ticket):
             deadline = time.time() + cfg.run_timeout
             code = None
             while time.time() < deadline:
-                time.sleep(POLL_INTERVAL)
+                time.sleep(cfg.poll_interval)
                 try:
                     poll = run_resilient(
                         cfg.ssh + ["cat %s/exit_code 2>/dev/null || echo RUNNING" % q],
@@ -872,16 +896,48 @@ def _run_collect(cfg, ticket):
 CAPABILITIES = ("sync", "submit", "collect")
 
 
+def _configure_file_log():
+    """Add a file handler when GNINA_REMOTE_LOG names one. Never a console one.
+
+    Deliberately environment-driven rather than a flag: this shim's command line
+    belongs to gnina, and every argument it does not recognise is forwarded to
+    the remote binary, so a ``--log-file`` here would be either swallowed from
+    gnina's own options or passed on to it. The shared runtime does the work, in
+    ``quiet=True`` so stderr keeps carrying exactly what it carried before.
+    """
+    path = os.environ.get(ENV_LOG_FILE)
+    if not path:
+        return None
+    try:
+        from dock_selectivity.runtime import configure_logging
+    except ImportError:                     # pragma: no cover - a bare checkout
+        return None
+    try:
+        return configure_logging(
+            "gnina_remote",
+            out_dir=os.path.dirname(os.path.abspath(path)) or ".",
+            log_file=path, quiet=True)
+    except (OSError, ValueError) as exc:    # pragma: no cover - defensive
+        # A log this shim could not open must never cost a docking job.
+        sys.stderr.write("gnina_remote: cannot write %s (%s); stderr only\n"
+                         % (path, exc))
+        return None
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--capabilities" in argv:
         sys.stdout.write("gnina_remote modes: %s\n" % " ".join(CAPABILITIES))
         return 0
     known, passthrough = parse_args(argv)
+    _configure_file_log()
 
     def log(msg):
+        # stderr first and always: it is the contract with consensus_docker.py.
+        # The file, when there is one, is a copy -- never a replacement.
         sys.stderr.write("gnina_remote: %s\n" % msg)
         sys.stderr.flush()
+        LOG.info("%s", msg)
 
     mode = (os.environ.get("GNINA_REMOTE_MODE") or MODE_SYNC).strip().lower()
     if mode not in MODES:

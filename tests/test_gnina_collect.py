@@ -1241,17 +1241,41 @@ class TestProcessHygiene(unittest.TestCase):
                          "gnina_collect pulled in a module it must not")
 
     def test_repeated_main_calls_do_not_stack_log_handlers(self):
-        """A duplicated line per handler is how a campaign log becomes unreadable."""
+        """A duplicated line per handler is how a campaign log becomes unreadable.
+
+        Logging now belongs to dock_selectivity.runtime, which owns tagged
+        handlers on the ``gnina_collect`` logger and never touches root; both
+        halves of that are asserted here.
+        """
+        step_logger = logging.getLogger(gc.STEP_NAME)
+        before = list(step_logger.handlers)
         root = logging.getLogger()
-        before = list(root.handlers)
+        root_before = list(root.handlers)
+        tmp = tempfile.mkdtemp(prefix="gnina_collect_log_")
         try:
-            tmp = tempfile.mkdtemp(prefix="gnina_collect_log_")
+            # There is no queue under --run-dir, so the pump refuses -- but only
+            # after the step has configured its logging, which is the part under
+            # test. (--status takes the query path and configures nothing.)
             for _ in range(3):
-                gc.main(["--run-dir", tmp, "--status"])
-            ours = [h for h in root.handlers if getattr(h, gc._OUR_HANDLER, False)]
+                self.assertEqual(gc.main(["--run-dir", tmp, "--once", "--quiet"]),
+                                 gc.EXIT_USAGE)
+            log_path = os.path.join(tmp, "steps", gc.STEP_NAME,
+                                    gc.STEP_NAME + ".log")
+            ours = [h for h in step_logger.handlers
+                    if getattr(h, "baseFilename", None) == log_path]
             self.assertEqual(len(ours), 1)
+            self.assertEqual(list(root.handlers), root_before,
+                             "the pump must not touch the root logger")
         finally:
-            root.handlers = before
+            # The same handler object is also borrowed by the dock_selectivity
+            # package logger; closing it while it is still attached there would
+            # make the next library record try to reopen a deleted temp file.
+            library = logging.getLogger("dock_selectivity")
+            for handler in list(step_logger.handlers):
+                if handler not in before:
+                    step_logger.removeHandler(handler)
+                    library.removeHandler(handler)
+                    handler.close()
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_the_cli_help_works_without_a_run_directory(self):

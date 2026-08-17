@@ -1,213 +1,202 @@
 #!/usr/bin/env python3
 """
-Negative Sample Generator for Consensus Docking
-================================================
+Negative Sample Generator -- SUPERSEDED, DO NOT USE FOR NEW RUNS
+===============================================================
 
-This script generates negative samples (non-interacting drug-target pairs) to complement
-the positive samples identified in the docking workflow. Negative samples are essential
-for training and evaluating machine learning models on docking data.
+    ############################################################
+    #  DEPRECATED.  This stage is replaced by                  #
+    #      sample_negatives.py                                 #
+    #  It builds its positive set through Mapped_Gene_Name, a  #
+    #  column in which 57.73% of rows name a DIFFERENT         #
+    #  protein (KNOWN_ISSUE_uniprot_gene_mapping.md), so both  #
+    #  the positives it balances against and the "known        #
+    #  interactions" it avoids are wrong.  It refuses to run   #
+    #  unless --legacy-gene-resolution is given, and it is     #
+    #  retained only so an old campaign can be reproduced      #
+    #  bug-for-bug.                                            #
+    ############################################################
 
-Implemented Strategy: Balanced Negative Sampling (Najm et al.)
+Implemented strategy: Balanced Negative Sampling (Najm et al.)
 --------------------------------------------------------------
-This strategy ensures balanced representation by maintaining equal numbers of positive
-and negative samples for each drug and each target.
+Each drug appears in the same number of positive and negative samples, and so
+does each target, which stops a model learning "drug X binds everything" or
+"target Y binds nothing". A greedy algorithm satisfies both constraints at
+once: count each drug's and each target's positives, then draw, for every drug,
+that many non-interacting targets, always preferring the target that is
+furthest from its own quota.
 
-Key principles:
-- Each drug appears in the same number of positive and negative samples
-- Each target appears in the same number of positive and negative samples
-- Prevents the model from learning spurious patterns like:
-  * "Drug X interacts with everything"
-  * "Target Y never interacts"
+It replicated batch_dock.py's pairing logic rather than reading
+required_structures.csv, so that the negatives sat in the same universe as the
+positives -- and it inherited batch_dock.py's identity defect along with it.
 
-Algorithm (Greedy Approach):
-1. Replicate batch_dock.py logic to identify actual positive drug-target-pocket combinations
-2. Count positive interactions for each drug (n_drug) and target (n_target)
-3. For each drug: select (n_drug) negative targets
-4. For each target: ensure it appears (n_target) times in negatives
-5. Use a greedy algorithm to satisfy both constraints simultaneously
+Why it is wrong: the symbol -> accession step is
+``dict(zip(Mapped_Gene_Name, Entry))``, last-duplicate-wins over a corrupted
+column. sample_negatives.py resolves on the Entrez key through IdentityIndex
+(collapse factor 1), draws reproducibly from --seed, and reports its deficits.
 
-This addresses a specific concern: drugs with 20 targets will have 20 negative samples,
-while drugs with 1 target will have 1 negative sample, maintaining equal representation.
-
-Important: This script replicates the same drug-target pairing logic as batch_dock.py
-to ensure consistency. It doesn't just read required_structures.csv (which only lists
-structures to extract), but actually determines which drugs interact with which targets
-by consulting the drug-protein interaction database.
-
-The script provides infrastructure for:
-1. Loading actual positive drug-target-pocket combinations (like batch_dock.py)
-2. Loading known drug-target interactions to avoid false negatives
-3. Identifying available drugs (with SDF files) and protein structures
-4. Validating generated negatives
-5. Combining positive and negative samples into a single dataset
-6. Generating metadata about the sampling process
-
-Prerequisites:
-- drug_to_protein.tsv (known interactions)
-- small_molecule_drug_links.csv (available drugs)
-- uniprot_gene_mapping.csv (UniProt to gene mapping, from prepare_uniprot_mapping.py)
-- cavity_mapping.csv (available protein structures/pockets, from extract_cavities.py)
-- Processed ligand SDF folder with individual drug files
+Every input path is now a flag with no machine-specific default, and the draw's
+random seed is a flag too: reproducing an old run means stating that run's
+paths and seed, not inheriting a dead workstation's layout.
 
 Usage:
-    python generate_negative_samples.py
+    # refuses, exit code 2 -- this is the intended outcome
+    python3 generate_negative_samples.py
+
+    # deliberate legacy reproduction
+    python3 generate_negative_samples.py --legacy-gene-resolution \\
+        --edges /opt/data/multiscale_interactome_data/1_drug_to_protein.tsv \\
+        --drugs /opt/data/drugbank/small_molecule_drug_links.csv \\
+        --uniprot-mapping ./uniprot_gene_mapping.csv \\
+        --cavity-mapping ./cavity_mapping.csv \\
+        --ligands /opt/data/drugbank/drugbank_approved_split \\
+        --out ./required_structures_with_negatives.csv \\
+        --metadata-out ./negative_samples_metadata.json \\
+        --seed 42 --run-dir /path/to/campaign
+
+Input:
+    --edges            drug-protein interaction edges (TSV)
+    --drugs            small-molecule DrugBank links (CSV)
+    --uniprot-mapping  the corrupted UniProt/gene mapping (CSV)
+    --cavity-mapping   extracted cavity structures (CSV, from extract_cavities.py)
+    --ligands          directory of per-drug SDF files
 
 Output:
-    - required_structures_with_negatives.csv: Augmented structure list with negatives
-    - negative_samples_metadata.json: Statistics and metadata about generated negatives
-    - negative_samples.log: Processing log
+    --out              required_structures_with_negatives.csv
+    --metadata-out     negative_samples_metadata.json
+    <out-dir>/generate_negative_samples.log   (see --out-dir / --log-file)
 """
 
+import argparse
+import json
+import logging
 import os
 import sys
-import pandas as pd
-import numpy as np
-import logging
-import json
-from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
 
+import numpy as np
+import pandas as pd
+
+from dock_selectivity.runtime import add_runtime_arguments, resolve_out_dir, step
+
+STEP_NAME = "generate_negative_samples"
+
 # --- Configuration ---
-# Input files (same paths as batch_dock.py for consistency)
-DRUG_TO_PROTEIN_TSV = "/opt/data/multiscale_interactome_data/1_drug_to_protein.tsv"
-SMALL_MOLECULE_DRUGS_CSV = "/opt/data/drugbank/small_molecule_drug_links.csv"
-UNIPROT_MAPPING_CSV = "uniprot_gene_mapping.csv"  # From prepare_uniprot_mapping.py
-CAVITY_MAPPING_CSV = "cavity_mapping.csv"  # From extract_cavities.py
-PROCESSED_LIGAND_SDF_FOLDER = "/opt/data/drugbank/drugbank_approved_split"
+# Defaults only; every one of these is a flag. Reference datasets under
+# /opt/data are machine-wide and may default; run-specific files may not.
+DEFAULT_DRUG_TO_PROTEIN_TSV = "/opt/data/multiscale_interactome_data/1_drug_to_protein.tsv"
+DEFAULT_SMALL_MOLECULE_DRUGS_CSV = "/opt/data/drugbank/small_molecule_drug_links.csv"
+DEFAULT_UNIPROT_MAPPING_CSV = "uniprot_gene_mapping.csv"
+DEFAULT_CAVITY_MAPPING_CSV = "cavity_mapping.csv"
+DEFAULT_LIGAND_SDF_FOLDER = "/opt/data/drugbank/drugbank_approved_split"
+DEFAULT_OUTPUT_CSV = "required_structures_with_negatives.csv"
+DEFAULT_METADATA_JSON = "negative_samples_metadata.json"
+DEFAULT_SEED = 42
 
-OUTPUT_CSV = "required_structures_with_negatives.csv"
-METADATA_JSON = "negative_samples_metadata.json"
-LOG_FILE = "negative_samples.log"
+#: Guard against a greedy loop that can never satisfy its constraints. An
+#: implementation detail of the loop, not a knob anyone tunes per run.
+MAX_GREEDY_ATTEMPTS = 1000000
 
-# Set up logging
-logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
-logging.getLogger().addHandler(console_handler)
+#: The columns batch_dock.py reads back out of --out. A contract, not a setting.
+REQUIRED_MAPPING_COLUMNS = ['Entry', 'Mapped_Gene_Name']
+
+logger = logging.getLogger(STEP_NAME)
 
 
-def load_positive_samples():
+class MissingInput(RuntimeError):
+    """A declared input does not exist. A missing prerequisite is not a default."""
+
+
+def _read_or_fail(path, what, **kwargs):
+    """Load a table, or fail naming the flag that would fix it."""
+    if not path or not os.path.exists(path):
+        raise MissingInput("%s not found: %r" % (what, path))
+    frame = pd.read_csv(path, **kwargs)
+    logger.info("Loaded %d rows from %s (%s)", len(frame), path, what)
+    return frame
+
+
+def _gene_to_uniprot(uniprot_df):
+    """THE DEFECT: last-duplicate-wins over a column that is 57.73% wrong."""
+    missing = [c for c in REQUIRED_MAPPING_COLUMNS if c not in uniprot_df.columns]
+    if missing:
+        raise MissingInput(
+            "UniProt mapping is missing required columns %s; found %s"
+            % (missing, list(uniprot_df.columns)))
+    return dict(zip(uniprot_df['Mapped_Gene_Name'], uniprot_df['Entry']))
+
+
+def load_positive_samples(edges_path, drugs_path, uniprot_mapping_path,
+                          cavity_mapping_path, ligand_folder):
+    """Load positive samples by replicating batch_dock.py's (corrupted) logic.
+
+    1. drug-protein interactions, filtered to small molecules
+    2. gene symbol -> UniProt accession through the corrupted mapping
+    3. one sample per available cavity of each mapped accession
     """
-    Load positive samples by replicating batch_dock.py's logic.
-    
-    This function:
-    1. Loads drug-protein interactions from DRUG_TO_PROTEIN_TSV
-    2. Filters for small molecules only
-    3. Maps gene names to UniProt IDs
-    4. Finds available pockets for each target
-    5. Creates explicit drug-target-pocket combinations (the actual positive samples)
-    """
-    logging.info("=" * 60)
-    logging.info("LOADING POSITIVE SAMPLES (replicating batch_dock.py logic)")
-    logging.info("=" * 60)
-    
-    # Step 1: Load drug-protein interactions
-    if not os.path.exists(DRUG_TO_PROTEIN_TSV):
-        logging.error(f"❌ Drug-protein interaction file not found: {DRUG_TO_PROTEIN_TSV}")
-        sys.exit(1)
-    
-    drug_to_protein_df = pd.read_csv(DRUG_TO_PROTEIN_TSV, sep='\t')
-    logging.info(f"✅ Loaded {len(drug_to_protein_df):,} drug-protein interactions")
-    
-    # Step 2: Load small molecule drugs
-    if not os.path.exists(SMALL_MOLECULE_DRUGS_CSV):
-        logging.error(f"❌ Small molecule drugs file not found: {SMALL_MOLECULE_DRUGS_CSV}")
-        sys.exit(1)
-    
-    small_molecules_df = pd.read_csv(SMALL_MOLECULE_DRUGS_CSV)
+    logger.info("LOADING POSITIVE SAMPLES (replicating batch_dock.py logic)")
+
+    drug_to_protein_df = _read_or_fail(edges_path, "drug-protein edges (--edges)", sep='\t')
+    small_molecules_df = _read_or_fail(drugs_path, "small-molecule drug links (--drugs)")
     small_molecules = set(small_molecules_df['DrugBank ID'].unique())
-    logging.info(f"✅ Loaded {len(small_molecules):,} small molecule drugs")
-    
-    # Step 3: Filter drug-protein interactions for small molecules only
+
     initial_rows = len(drug_to_protein_df)
     drug_to_protein_df = drug_to_protein_df[drug_to_protein_df['node_1'].isin(small_molecules)]
-    logging.info(f"✅ Filtered to {len(drug_to_protein_df):,} small molecule drug-protein pairs (from {initial_rows:,})")
-    
-    # Step 4: Load UniProt mapping
-    if not os.path.exists(UNIPROT_MAPPING_CSV):
-        logging.error(f"❌ UniProt mapping file not found: {UNIPROT_MAPPING_CSV}")
-        logging.error("Please run prepare_uniprot_mapping.py first!")
-        sys.exit(1)
-    
-    uniprot_df = pd.read_csv(UNIPROT_MAPPING_CSV)
-    
-    # Debug: show what columns we actually have
-    logging.info(f"   UniProt mapping columns: {list(uniprot_df.columns)}")
-    
-    # Check for required columns (consistent with batch_dock.py)
-    required_columns = ['Entry', 'Mapped_Gene_Name']
-    missing_columns = [col for col in required_columns if col not in uniprot_df.columns]
-    
-    if missing_columns:
-        logging.error(f"❌ Required columns missing from UniProt mapping: {missing_columns}")
-        logging.error(f"   Found columns: {list(uniprot_df.columns)}")
-        logging.error("Please regenerate the mapping file using prepare_uniprot_mapping.py")
-        sys.exit(1)
-    
-    # Create gene to UniProt mapping (same as batch_dock.py: Mapped_Gene_Name -> Entry)
-    gene_to_uniprot = dict(zip(uniprot_df['Mapped_Gene_Name'], uniprot_df['Entry']))
-    logging.info(f"✅ Loaded UniProt mapping for {len(gene_to_uniprot):,} genes")
-    
-    # Step 5: Load cavity mapping
-    if not os.path.exists(CAVITY_MAPPING_CSV):
-        logging.error(f"❌ Cavity mapping file not found: {CAVITY_MAPPING_CSV}")
-        logging.error("Please run extract_cavities.py first!")
-        sys.exit(1)
-    
-    cavity_df = pd.read_csv(CAVITY_MAPPING_CSV)
-    logging.info(f"✅ Loaded cavity mapping with {len(cavity_df):,} structures")
-    logging.info(f"   Cavity mapping columns: {list(cavity_df.columns)}")
-    logging.info(f"   Unique proteins in cavity mapping: {cavity_df['UniProt_ID'].nunique():,}")
-    
-    # Step 6: Create positive samples by replicating batch_dock.py logic
+    logger.info("Filtered to %d small molecule drug-protein pairs (from %d)",
+                len(drug_to_protein_df), initial_rows)
+
+    uniprot_df = _read_or_fail(uniprot_mapping_path,
+                               "UniProt/gene mapping (--uniprot-mapping)")
+    gene_to_uniprot = _gene_to_uniprot(uniprot_df)
+    logger.info("Loaded UniProt mapping for %d genes", len(gene_to_uniprot))
+
+    cavity_df = _read_or_fail(cavity_mapping_path, "cavity mapping (--cavity-mapping)")
+    logger.info("Unique proteins in cavity mapping: %d", cavity_df['UniProt_ID'].nunique())
+
+    if not ligand_folder or not os.path.isdir(ligand_folder):
+        raise MissingInput("ligand SDF folder not found: %r (--ligands)" % ligand_folder)
+
     positive_samples = []
     skipped_no_ligand = 0
     skipped_no_uniprot = 0
     skipped_no_cavity = 0
-    
-    logging.info("\nCreating positive drug-target-pocket combinations...")
-    logging.info(f"Processing {len(drug_to_protein_df):,} drug-protein interactions...")
-    
+
+    logger.info("Creating positive drug-target-pocket combinations from %d interactions...",
+                len(drug_to_protein_df))
+
     for idx, row in drug_to_protein_df.iterrows():
         drugbank_id = row['node_1']
         gene_name = row['node_2_name']
-        
-        # Log progress every 1000 interactions
+
         if (idx + 1) % 1000 == 0:
-            logging.info(f"  Processed {idx + 1:,}/{len(drug_to_protein_df):,} interactions, created {len(positive_samples):,} samples...")
-        
-        # Check if ligand SDF exists (like batch_dock.py does)
-        ligand_sdf_path = os.path.join(PROCESSED_LIGAND_SDF_FOLDER, f"{drugbank_id}.sdf")
+            logger.info("  Processed %d/%d interactions, created %d samples...",
+                        idx + 1, len(drug_to_protein_df), len(positive_samples))
+
+        ligand_sdf_path = os.path.join(ligand_folder, "%s.sdf" % drugbank_id)
         if not os.path.exists(ligand_sdf_path):
             skipped_no_ligand += 1
             continue
-        
-        # Map gene to UniProt ID
+
         uniprot_id = gene_to_uniprot.get(gene_name)
         if not uniprot_id:
             skipped_no_uniprot += 1
             continue
-        
-        # Find available cavities for this UniProt ID
+
         target_cavities = cavity_df[cavity_df['UniProt_ID'] == uniprot_id]
         if target_cavities.empty:
             skipped_no_cavity += 1
             continue
-        
-        # Create one positive sample for each cavity (like batch_dock.py does)
+
         for _, cavity_row in target_cavities.iterrows():
-            # Handle Fragment_ID - convert integer to F-string format if needed
+            # Fragment_ID arrives as an int from some producers and as "F1" from
+            # others; batch_dock.py only understands the F-prefixed spelling.
             fragment_id = cavity_row.get('Fragment_ID', 'F1')
             if isinstance(fragment_id, (int, float)):
-                fragment_id = f"F{int(fragment_id)}"
+                fragment_id = "F%d" % int(fragment_id)
             elif not isinstance(fragment_id, str):
                 fragment_id = 'F1'
-            
-            positive_sample = {
+
+            positive_samples.append({
                 'UniProt_ID': uniprot_id,
                 'Fragment_ID': fragment_id,
                 'Cavity_Index': cavity_row.get('Cavity_Index', 1),
@@ -215,373 +204,269 @@ def load_positive_samples():
                 'Gene_Name': gene_name,
                 'Interaction_Count': 1,  # This is a known interaction
                 'sample_type': 'positive',
-                'drugbank_id': drugbank_id
-            }
-            positive_samples.append(positive_sample)
-    
-    # Convert to DataFrame
+                'drugbank_id': drugbank_id,
+            })
+
     positive_df = pd.DataFrame(positive_samples)
-    
-    # Check if we have any positive samples
+
     if positive_df.empty:
-        logging.error("\n❌ No positive samples could be created!")
-        logging.error("Reasons:")
-        if skipped_no_ligand > 0:
-            logging.error(f"  - {skipped_no_ligand:,} interactions skipped (no ligand SDF)")
-        if skipped_no_uniprot > 0:
-            logging.error(f"  - {skipped_no_uniprot:,} interactions skipped (no UniProt mapping)")
-        if skipped_no_cavity > 0:
-            logging.error(f"  - {skipped_no_cavity:,} interactions skipped (no cavity structures)")
-        logging.error("\nPlease check:")
-        logging.error("1. Drug-protein interaction file has valid data")
-        logging.error("2. Small molecule drugs are available")
-        logging.error("3. UniProt mapping is complete")
-        logging.error("4. Cavity structures have been extracted")
-        logging.error("5. Ligand SDF files are in the correct location")
-        sys.exit(1)
-    
-    # Report statistics
-    logging.info(f"\n✅ Created {len(positive_df):,} positive drug-target-pocket combinations")
-    logging.info(f"   Unique drugs: {positive_df['drugbank_id'].nunique():,}")
-    logging.info(f"   Unique proteins: {positive_df['UniProt_ID'].nunique():,}")
-    logging.info(f"   Unique drug-target pairs: {len(set(zip(positive_df['drugbank_id'], positive_df['UniProt_ID']))):,}")
-    
-    if skipped_no_ligand > 0:
-        logging.warning(f"⚠️  Skipped {skipped_no_ligand:,} interactions (no ligand SDF)")
-    if skipped_no_uniprot > 0:
-        logging.warning(f"⚠️  Skipped {skipped_no_uniprot:,} interactions (no UniProt mapping)")
-    if skipped_no_cavity > 0:
-        logging.warning(f"⚠️  Skipped {skipped_no_cavity:,} interactions (no cavity structures)")
-    
+        raise MissingInput(
+            "no positive samples could be created "
+            "(%d skipped for no ligand SDF, %d for no UniProt mapping, "
+            "%d for no cavity structures)"
+            % (skipped_no_ligand, skipped_no_uniprot, skipped_no_cavity))
+
+    logger.info("Created %d positive drug-target-pocket combinations", len(positive_df))
+    logger.info("   Unique drugs: %d", positive_df['drugbank_id'].nunique())
+    logger.info("   Unique proteins: %d", positive_df['UniProt_ID'].nunique())
+    logger.info("   Unique drug-target pairs: %d",
+                len(set(zip(positive_df['drugbank_id'], positive_df['UniProt_ID']))))
+
+    for count, reason in ((skipped_no_ligand, "no ligand SDF"),
+                          (skipped_no_uniprot, "no UniProt mapping"),
+                          (skipped_no_cavity, "no cavity structures")):
+        if count:
+            logger.warning("Skipped %d interactions (%s)", count, reason)
+
     return positive_df
 
 
-def load_known_interactions():
+def load_known_interactions(edges_path, drugs_path, uniprot_mapping_path):
+    """Load known drug-protein interactions to avoid generating false negatives.
+
+    This reads ALL interactions, not just those with available structures or
+    ligands, so a pair that is genuinely known never turns up as a negative.
     """
-    Load known drug-protein interactions to avoid generating false negatives.
-    
-    This function loads ALL drug-protein interactions (not just those with available
-    structures/ligands) to ensure we don't accidentally create negatives for 
-    interactions that are actually known, even if they're not in our positive set
-    due to missing structures or ligands.
-    """
-    logging.info("\n" + "=" * 60)
-    logging.info("LOADING KNOWN INTERACTIONS")
-    logging.info("=" * 60)
-    
-    if not os.path.exists(DRUG_TO_PROTEIN_TSV):
-        logging.error(f"❌ Drug-protein interaction file not found: {DRUG_TO_PROTEIN_TSV}")
-        sys.exit(1)
-    
-    # Load all interactions
-    interactions_df = pd.read_csv(DRUG_TO_PROTEIN_TSV, sep='\t')
-    
-    # Load small molecule filter
-    if not os.path.exists(SMALL_MOLECULE_DRUGS_CSV):
-        logging.error(f"❌ Small molecule drugs file not found: {SMALL_MOLECULE_DRUGS_CSV}")
-        sys.exit(1)
-    
-    small_molecules_df = pd.read_csv(SMALL_MOLECULE_DRUGS_CSV)
+    logger.info("LOADING KNOWN INTERACTIONS")
+
+    interactions_df = _read_or_fail(edges_path, "drug-protein edges (--edges)", sep='\t')
+    small_molecules_df = _read_or_fail(drugs_path, "small-molecule drug links (--drugs)")
     small_molecules = set(small_molecules_df['DrugBank ID'].unique())
-    
-    # Load UniProt mapping to convert gene names to UniProt IDs
-    if not os.path.exists(UNIPROT_MAPPING_CSV):
-        logging.error(f"❌ UniProt mapping file not found: {UNIPROT_MAPPING_CSV}")
-        sys.exit(1)
-    
-    uniprot_df = pd.read_csv(UNIPROT_MAPPING_CSV)
-    
-    # Check for required columns (consistent with batch_dock.py)
-    required_columns = ['Entry', 'Mapped_Gene_Name']
-    missing_columns = [col for col in required_columns if col not in uniprot_df.columns]
-    
-    if missing_columns:
-        logging.error(f"❌ Required columns missing from UniProt mapping: {missing_columns}")
-        sys.exit(1)
-    
-    # Create gene to UniProt mapping (same as batch_dock.py: Mapped_Gene_Name -> Entry)
-    gene_to_uniprot = dict(zip(uniprot_df['Mapped_Gene_Name'], uniprot_df['Entry']))
-    
-    # Create set of known interactions for fast lookup
+
+    uniprot_df = _read_or_fail(uniprot_mapping_path,
+                               "UniProt/gene mapping (--uniprot-mapping)")
+    gene_to_uniprot = _gene_to_uniprot(uniprot_df)
+
     known_pairs = set()
-    
     for _, row in interactions_df.iterrows():
-        drugbank_id = row['node_1']  # DrugBank ID
-        gene_name = row['node_2_name']  # Gene name
-        
-        # Only include small molecules
+        drugbank_id = row['node_1']
+        gene_name = row['node_2_name']
         if drugbank_id not in small_molecules:
             continue
-            
-        # Map gene name to UniProt ID
         uniprot_id = gene_to_uniprot.get(gene_name)
         if uniprot_id:
             known_pairs.add((drugbank_id, uniprot_id))
-    
-    logging.info(f"✅ Loaded {len(known_pairs):,} known small molecule drug-target interactions")
-    
+
+    logger.info("Loaded %d known small molecule drug-target interactions", len(known_pairs))
     return known_pairs
 
 
-def load_available_resources(positive_df):
+def load_available_resources(positive_df, cavity_mapping_path, ligand_folder):
+    """Load available drugs, proteins, and pockets.
+
+    Only drugs and proteins that appear in the interaction database are loaded,
+    so negatives are sampled from the same universe as the positives.
     """
-    Load available drugs, proteins, and pockets.
-    
-    IMPORTANT: Only loads drugs and proteins that appear in the known interaction
-    database (DRUG_TO_PROTEIN_TSV). This ensures negatives are sampled from the
-    same universe as the positives.
-    """
-    logging.info("\n" + "=" * 60)
-    logging.info("LOADING AVAILABLE RESOURCES")
-    logging.info("=" * 60)
-    
-    # Get drugs and proteins that appear in the interaction database (from positives)
+    logger.info("LOADING AVAILABLE RESOURCES")
+
     drugs_in_db = set(positive_df['drugbank_id'].unique())
     proteins_in_db = set(positive_df['UniProt_ID'].unique())
-    
-    logging.info(f"✅ Drugs in interaction database: {len(drugs_in_db):,}")
-    logging.info(f"✅ Proteins in interaction database: {len(proteins_in_db):,}")
-    
-    # Filter drugs that have SDF files
+    logger.info("Drugs in interaction database: %d", len(drugs_in_db))
+    logger.info("Proteins in interaction database: %d", len(proteins_in_db))
+
+    if not ligand_folder or not os.path.isdir(ligand_folder):
+        raise MissingInput("ligand SDF folder not found: %r (--ligands)" % ligand_folder)
+
     drugs_with_sdf = set()
-    if os.path.exists(PROCESSED_LIGAND_SDF_FOLDER):
-        for drug_id in drugs_in_db:
-            sdf_path = os.path.join(PROCESSED_LIGAND_SDF_FOLDER, f"{drug_id}.sdf")
-            if os.path.exists(sdf_path):
-                drugs_with_sdf.add(drug_id)
-    
-    logging.info(f"   Drugs with SDF files: {len(drugs_with_sdf):,}")
-    
-    # Load available protein structures and pockets (only for proteins in DB)
-    if not os.path.exists(CAVITY_MAPPING_CSV):
-        logging.error(f"❌ Cavity mapping file not found: {CAVITY_MAPPING_CSV}")
-        sys.exit(1)
-    
-    cavity_df = pd.read_csv(CAVITY_MAPPING_CSV)
-    
-    # Create mapping of UniProt_ID to available cavities (only for proteins in DB)
+    for drug_id in drugs_in_db:
+        if os.path.exists(os.path.join(ligand_folder, "%s.sdf" % drug_id)):
+            drugs_with_sdf.add(drug_id)
+    logger.info("   Drugs with SDF files: %d", len(drugs_with_sdf))
+
+    cavity_df = _read_or_fail(cavity_mapping_path, "cavity mapping (--cavity-mapping)")
+
     protein_cavities = defaultdict(list)
     for _, row in cavity_df.iterrows():
         uniprot_id = row['UniProt_ID']
-        
-        # Only include proteins that appear in the interaction database
         if uniprot_id not in proteins_in_db:
             continue
-            
-        cavity_info = {
+        protein_cavities[uniprot_id].append({
             'Fragment_ID': row.get('Fragment_ID', 'F1'),
             'Cavity_Index': row.get('Cavity_Index', 1),
             'Pocket_PDB': row.get('Pocket_PDB', ''),
-            'Gene_Name': row.get('Gene_Name', '')
-        }
-        protein_cavities[uniprot_id].append(cavity_info)
-    
-    available_proteins = set(protein_cavities.keys())
+            'Gene_Name': row.get('Gene_Name', ''),
+        })
+
     total_pockets = sum(len(cavities) for cavities in protein_cavities.values())
-    
-    logging.info(f"✅ Available proteins (from interaction DB): {len(available_proteins):,}")
-    logging.info(f"   Total pockets: {total_pockets:,}")
-    
+    logger.info("Available proteins (from interaction DB): %d", len(protein_cavities))
+    logger.info("   Total pockets: %d", total_pockets)
+
     return drugs_with_sdf, protein_cavities
 
 
 def validate_negatives(negatives_df, positive_df, known_pairs):
-    """Validate that no negatives are actually positive samples"""
-    logging.info("\n" + "=" * 60)
-    logging.info("VALIDATING NEGATIVE SAMPLES")
-    logging.info("=" * 60)
-    
+    """Validate that no negatives are actually positive samples."""
+    logger.info("VALIDATING NEGATIVE SAMPLES")
+
     issues = []
-    
-    # Check for overlap with positive samples
     positive_pairs = set(zip(positive_df['drugbank_id'], positive_df['UniProt_ID']))
     negative_pairs = set(zip(negatives_df['drugbank_id'], negatives_df['UniProt_ID']))
-    
+
     overlap = positive_pairs & negative_pairs
     if overlap:
-        issues.append(f"⚠️  {len(overlap)} negative samples overlap with positive samples!")
-    
-    # Check for known interactions
+        issues.append("%d negative samples overlap with positive samples!" % len(overlap))
+
     false_negatives = negative_pairs & known_pairs
     if false_negatives:
-        issues.append(f"⚠️  {len(false_negatives)} negatives are actually known interactions!")
-    
-    # Check for duplicates within negatives
-    duplicates = negatives_df.duplicated(subset=['drugbank_id', 'UniProt_ID', 'Cavity_Index']).sum()
+        issues.append("%d negatives are actually known interactions!" % len(false_negatives))
+
+    duplicates = negatives_df.duplicated(
+        subset=['drugbank_id', 'UniProt_ID', 'Cavity_Index']).sum()
     if duplicates > 0:
-        issues.append(f"⚠️  {duplicates} duplicate negative samples found!")
-    
+        issues.append("%d duplicate negative samples found!" % duplicates)
+
     if issues:
         for issue in issues:
-            logging.warning(issue)
+            logger.warning(issue)
         return False
-    else:
-        logging.info("✅ All validations passed!")
-        logging.info(f"   No overlap with positive samples")
-        logging.info(f"   No known interactions included")
-        logging.info(f"   No duplicates found")
-        return True
+    logger.info("All validations passed: no overlap, no known interactions, no duplicates")
+    return True
 
 
-def generate_metadata(positive_df, negatives_df, known_pairs):
-    """Generate comprehensive metadata about the negative sampling process"""
-    
-    # Count different sample types in negatives
+def generate_metadata(positive_df, negatives_df, known_pairs, seed):
+    """Generate comprehensive metadata about the negative sampling process."""
     sample_type_counts = {}
     if 'sample_type' in negatives_df.columns:
         sample_type_counts = negatives_df['sample_type'].value_counts().to_dict()
-    
-    metadata = {
+
+    return {
         'timestamp': datetime.now().isoformat(),
+        'seed': seed,
         'positive_samples': {
             'total': len(positive_df),
             'unique_drugs': int(positive_df['drugbank_id'].nunique()),
             'unique_proteins': int(positive_df['UniProt_ID'].nunique()),
-            'unique_pairs': len(set(zip(positive_df['drugbank_id'], positive_df['UniProt_ID'])))
+            'unique_pairs': len(set(zip(positive_df['drugbank_id'],
+                                        positive_df['UniProt_ID']))),
         },
         'negative_samples': {
             'total': len(negatives_df),
             'unique_drugs': int(negatives_df['drugbank_id'].nunique()),
             'unique_proteins': int(negatives_df['UniProt_ID'].nunique()),
-            'unique_pairs': len(set(zip(negatives_df['drugbank_id'], negatives_df['UniProt_ID']))),
-            'sample_type_breakdown': sample_type_counts
+            'unique_pairs': len(set(zip(negatives_df['drugbank_id'],
+                                        negatives_df['UniProt_ID']))),
+            'sample_type_breakdown': sample_type_counts,
         },
         'validation': {
             'known_interactions_total': len(known_pairs),
-            'positive_negative_ratio': f"1:{len(negatives_df) / len(positive_df):.2f}"
-        }
+            'positive_negative_ratio': "1:%.2f" % (len(negatives_df) / len(positive_df)),
+        },
     }
-    
-    return metadata
 
 
-def save_results(combined_df, metadata):
-    """Save combined dataset and metadata"""
-    logging.info("\n" + "=" * 60)
-    logging.info("SAVING RESULTS")
-    logging.info("=" * 60)
-    
-    # Save combined CSV
-    combined_df.to_csv(OUTPUT_CSV, index=False)
-    logging.info(f"✅ Saved combined dataset: {OUTPUT_CSV}")
-    logging.info(f"   Total samples: {len(combined_df):,}")
-    logging.info(f"   Positive: {(combined_df['sample_type'] == 'positive').sum():,}")
-    logging.info(f"   Negative: {(combined_df['sample_type'].str.startswith('negative')).sum():,}")
-    
-    # Save metadata
-    with open(METADATA_JSON, 'w') as f:
-        json.dump(metadata, f, indent=2)
-    logging.info(f"✅ Saved metadata: {METADATA_JSON}")
-    
-    return OUTPUT_CSV, METADATA_JSON
+def save_results(combined_df, metadata, output_csv, metadata_json):
+    """Save combined dataset and metadata."""
+    logger.info("SAVING RESULTS")
+
+    for path in (output_csv, metadata_json):
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+    combined_df.to_csv(output_csv, index=False)
+    logger.info("Saved combined dataset: %s", output_csv)
+    logger.info("   Total samples: %d", len(combined_df))
+    logger.info("   Positive: %d", (combined_df['sample_type'] == 'positive').sum())
+    logger.info("   Negative: %d",
+                combined_df['sample_type'].str.startswith('negative').sum())
+
+    with open(metadata_json, 'w') as handle:
+        json.dump(metadata, handle, indent=2)
+    logger.info("Saved metadata: %s", metadata_json)
+
+    return output_csv, metadata_json
 
 
-def generate_balanced_negatives(positive_df, known_pairs, drugs_with_sdf, protein_cavities):
+def generate_balanced_negatives(positive_df, known_pairs, drugs_with_sdf,
+                                protein_cavities, seed=DEFAULT_SEED):
+    """Generate balanced negative samples using the Najm et al. greedy algorithm.
+
+    For each drug, draw as many negative targets as it has positives, always
+    preferring the target that is furthest from its own quota, so drugs and
+    targets end up equally represented on both sides.
+
+    ``seed`` seeds both the drug shuffle and the per-target cavity choice: it is
+    the only thing that makes a repeat of this draw reproducible.
     """
-    Generate balanced negative samples using the Najm et al. greedy algorithm.
-    
-    Strategy:
-    - For each drug: ensure it appears in equal number of positive and negative samples
-    - For each target: ensure it appears in equal number of positive and negative samples
-    
-    This prevents the model from learning spurious patterns like:
-    - "Drug X interacts with everything"
-    - "Target Y never interacts"
-    
-    Algorithm:
-    1. Count positive interactions for each drug (n_drug) and target (n_target)
-    2. For each drug: select (n_drug) negative targets
-    3. For each target: ensure it appears (n_target) times in negatives
-    4. Use greedy algorithm to satisfy both constraints simultaneously
-    
-    Reference: Najm et al. - Balanced negative sampling approach
-    """
-    logging.info("\n" + "=" * 60)
-    logging.info("GENERATING BALANCED NEGATIVE SAMPLES (Najm et al.)")
-    logging.info("=" * 60)
-    
-    # Step 1: Count positive interactions for each drug and target
+    logger.info("GENERATING BALANCED NEGATIVE SAMPLES (Najm et al.), seed=%s", seed)
+
     drug_positive_counts = positive_df.groupby('drugbank_id').size().to_dict()
     target_positive_counts = positive_df.groupby('UniProt_ID').size().to_dict()
-    
-    logging.info(f"Unique drugs in positives: {len(drug_positive_counts)}")
-    logging.info(f"Unique targets in positives: {len(target_positive_counts)}")
-    logging.info(f"Average positive interactions per drug: {np.mean(list(drug_positive_counts.values())):.2f}")
-    logging.info(f"Average positive interactions per target: {np.mean(list(target_positive_counts.values())):.2f}")
-    
-    # Step 2: Initialize tracking dictionaries
-    drug_negative_counts = defaultdict(int)  # Track how many negatives each drug has
-    target_negative_counts = defaultdict(int)  # Track how many negatives each target has
-    
-    # Get list of available drugs and targets
+
+    logger.info("Unique drugs in positives: %d", len(drug_positive_counts))
+    logger.info("Unique targets in positives: %d", len(target_positive_counts))
+    logger.info("Average positive interactions per drug: %.2f",
+                np.mean(list(drug_positive_counts.values())))
+    logger.info("Average positive interactions per target: %.2f",
+                np.mean(list(target_positive_counts.values())))
+
+    drug_negative_counts = defaultdict(int)
+    target_negative_counts = defaultdict(int)
+
     available_drugs = [d for d in drug_positive_counts.keys() if d in drugs_with_sdf]
     available_targets = list(protein_cavities.keys())
-    
-    logging.info(f"Available drugs with SDF files: {len(available_drugs)}")
-    logging.info(f"Available targets with structures: {len(available_targets)}")
-    
-    # Step 3: Greedy algorithm to generate negatives
+
+    logger.info("Available drugs with SDF files: %d", len(available_drugs))
+    logger.info("Available targets with structures: %d", len(available_targets))
+
     negatives = []
-    max_attempts = 1000000  # Prevent infinite loops
     attempts = 0
-    
-    # Create a shuffled list of drugs to process
-    np.random.seed(42)  # For reproducibility
+
+    rng = np.random.RandomState(seed)
     drugs_to_process = available_drugs.copy()
-    np.random.shuffle(drugs_to_process)
-    
-    logging.info("\nStarting greedy negative sample generation...")
-    
-    while drugs_to_process and attempts < max_attempts:
+    rng.shuffle(drugs_to_process)
+
+    logger.info("Starting greedy negative sample generation...")
+
+    while drugs_to_process and attempts < MAX_GREEDY_ATTEMPTS:
         attempts += 1
-        
-        # Get next drug that needs more negatives
+
         drug_found = False
         for drug_id in drugs_to_process[:]:
             needed_negatives = drug_positive_counts[drug_id] - drug_negative_counts[drug_id]
-            
             if needed_negatives <= 0:
                 drugs_to_process.remove(drug_id)
                 continue
-            
+
             drug_found = True
-            
-            # Find a target that:
-            # 1. Doesn't have a known interaction with this drug
-            # 2. Still needs more negative samples
-            # 3. Has available cavity structure
-            
-            # Create list of candidate targets (need more negatives)
+
+            # Prefer targets that still owe negatives; fall back to any target
+            # that is not a known interaction of this drug.
             candidate_targets = [
                 t for t in available_targets
                 if target_negative_counts[t] < target_positive_counts.get(t, 0)
                 and (drug_id, t) not in known_pairs
             ]
-            
             if not candidate_targets:
-                # If no candidates need negatives, use any available target
                 candidate_targets = [
-                    t for t in available_targets
-                    if (drug_id, t) not in known_pairs
+                    t for t in available_targets if (drug_id, t) not in known_pairs
                 ]
-            
             if not candidate_targets:
-                # This drug can't find any valid negative targets
                 drugs_to_process.remove(drug_id)
-                logging.warning(f"Drug {drug_id} cannot find valid negative targets")
+                logger.warning("Drug %s cannot find valid negative targets", drug_id)
                 continue
-            
-            # Select target that needs the most negatives (greedy choice)
+
             target_id = max(
                 candidate_targets,
                 key=lambda t: target_positive_counts.get(t, 0) - target_negative_counts[t]
             )
-            
-            # Randomly select a cavity for this target
-            cavity_info = np.random.choice(protein_cavities[target_id])
-            
-            # Create negative entry
-            negative_entry = {
+
+            # rng.shuffle/rng.choice on a fresh RandomState(seed) draw exactly the
+            # stream the old global np.random.seed(42) did, so an old run with
+            # --seed 42 reproduces bit for bit.
+            cavity_info = rng.choice(protein_cavities[target_id])
+
+            negatives.append({
                 'UniProt_ID': target_id,
                 'Fragment_ID': cavity_info['Fragment_ID'],
                 'Cavity_Index': cavity_info['Cavity_Index'],
@@ -589,46 +474,100 @@ def generate_balanced_negatives(positive_df, known_pairs, drugs_with_sdf, protei
                 'Gene_Name': cavity_info['Gene_Name'],
                 'Interaction_Count': 0,
                 'sample_type': 'negative_balanced',
-                'drugbank_id': drug_id
-            }
-            
-            negatives.append(negative_entry)
+                'drugbank_id': drug_id,
+            })
             drug_negative_counts[drug_id] += 1
             target_negative_counts[target_id] += 1
-            
-            # Log progress periodically
+
             if len(negatives) % 1000 == 0:
-                logging.info(f"  Generated {len(negatives):,} negatives...")
-            
+                logger.info("  Generated %d negatives...", len(negatives))
+
             break
-        
+
         if not drug_found:
             break
-    
-    logging.info(f"\n✅ Generated {len(negatives):,} balanced negative samples")
-    logging.info(f"   Attempts: {attempts:,}")
-    
-    # Step 4: Report statistics
-    logging.info("\nBalance Statistics:")
-    logging.info(f"  Drugs fully balanced: {sum(1 for d in drug_positive_counts if drug_negative_counts[d] == drug_positive_counts[d])}/{len(drug_positive_counts)}")
-    logging.info(f"  Targets fully balanced: {sum(1 for t in target_positive_counts if target_negative_counts[t] == target_positive_counts[t])}/{len(target_positive_counts)}")
-    
-    # Report drugs that couldn't be fully balanced
+
+    logger.info("Generated %d balanced negative samples in %d attempts",
+                len(negatives), attempts)
+    logger.info("  Drugs fully balanced: %d/%d",
+                sum(1 for d in drug_positive_counts
+                    if drug_negative_counts[d] == drug_positive_counts[d]),
+                len(drug_positive_counts))
+    logger.info("  Targets fully balanced: %d/%d",
+                sum(1 for t in target_positive_counts
+                    if target_negative_counts[t] == target_positive_counts[t]),
+                len(target_positive_counts))
+
     underbalanced_drugs = [
         (d, drug_positive_counts[d], drug_negative_counts[d])
         for d in drug_positive_counts
         if drug_negative_counts[d] < drug_positive_counts[d]
     ]
-    
     if underbalanced_drugs:
-        logging.warning(f"\n⚠️  {len(underbalanced_drugs)} drugs are underbalanced:")
-        for drug_id, needed, got in underbalanced_drugs[:5]:  # Show first 5
-            logging.warning(f"  {drug_id}: needed {needed}, got {got}")
+        logger.warning("%d drugs are underbalanced:", len(underbalanced_drugs))
+        for drug_id, needed, got in underbalanced_drugs[:5]:
+            logger.warning("  %s: needed %d, got %d", drug_id, needed, got)
         if len(underbalanced_drugs) > 5:
-            logging.warning(f"  ... and {len(underbalanced_drugs) - 5} more")
-    
+            logger.warning("  ... and %d more", len(underbalanced_drugs) - 5)
+
     return negatives
 
+
+def run_legacy_sampling(args):
+    """The whole superseded workflow, with every path stated by the caller."""
+    start_time = datetime.now()
+
+    positive_df = load_positive_samples(
+        edges_path=args.edges,
+        drugs_path=args.drugs,
+        uniprot_mapping_path=args.uniprot_mapping,
+        cavity_mapping_path=args.cavity_mapping,
+        ligand_folder=args.ligands,
+    )
+    known_pairs = load_known_interactions(
+        edges_path=args.edges,
+        drugs_path=args.drugs,
+        uniprot_mapping_path=args.uniprot_mapping,
+    )
+    drugs_with_sdf, protein_cavities = load_available_resources(
+        positive_df, cavity_mapping_path=args.cavity_mapping, ligand_folder=args.ligands)
+
+    logger.info("RESOURCES LOADED - READY FOR NEGATIVE SAMPLING")
+    logger.info("Positive samples: %d", len(positive_df))
+    logger.info("Available drugs with SDF: %d", len(drugs_with_sdf))
+    logger.info("Available proteins: %d", len(protein_cavities))
+    logger.info("Known interactions to avoid: %d", len(known_pairs))
+
+    negatives = generate_balanced_negatives(
+        positive_df, known_pairs, drugs_with_sdf, protein_cavities, seed=args.seed)
+
+    negatives_df = pd.DataFrame(negatives)
+    if negatives_df.empty:
+        raise MissingInput("failed to generate any negative samples")
+
+    validate_negatives(negatives_df, positive_df, known_pairs)
+
+    combined_df = pd.concat([positive_df, negatives_df], ignore_index=True)
+
+    metadata = generate_metadata(positive_df, negatives_df, known_pairs, args.seed)
+    metadata['strategy'] = {
+        'name': 'Balanced Negative Sampling',
+        'reference': 'Najm et al.',
+        'description': 'Each drug and target appears in equal number of '
+                       'positive and negative samples',
+        'superseded_by': list(REPLACEMENT_STAGES),
+    }
+
+    save_results(combined_df, metadata, args.out, args.metadata_out)
+
+    duration = (datetime.now() - start_time).total_seconds()
+    logger.info("NEGATIVE SAMPLE GENERATION COMPLETE in %.2f seconds", duration)
+    logger.info("Total samples: %d (positive %d, negative %d)",
+                len(combined_df),
+                (combined_df['sample_type'] == 'positive').sum(),
+                combined_df['sample_type'].str.startswith('negative').sum())
+    logger.info("Actual ratio: 1:%.2f", len(negatives_df) / len(positive_df))
+    return combined_df
 
 
 # ---------------------------------------------------------------------------
@@ -653,12 +592,16 @@ class CorruptedResolverRefused(RuntimeError):
     """
 
 
+LEGACY_WARNING = (
+    "*** --legacy-gene-resolution: using the CORRUPTED symbol resolver. "
+    "57.73% of the mapping rows name a different protein. Nothing this run "
+    "produces may be trusted as identity. ***")
+
+
 def assert_resolver_not_used(allow_legacy=False):
     """Refuse the corrupted path unless explicitly opted into."""
     if allow_legacy:
-        logging.warning(
-            "*** --legacy-gene-resolution: using the CORRUPTED symbol resolver. "
-            "57.73%% of the mapping rows name a different protein. ***")
+        logger.warning(LEGACY_WARNING)
         return
     raise CorruptedResolverRefused(
         "generate_negative_samples.py resolves identity with dict(zip(Mapped_Gene_Name, Entry)), "
@@ -670,98 +613,67 @@ def assert_resolver_not_used(allow_legacy=False):
     )
 
 
-
-def main():
-    import argparse as _ap
-    _p = _ap.ArgumentParser(description="superseded stage; see REPLACEMENT_STAGES")
-    _p.add_argument('--legacy-gene-resolution', action='store_true',
-                    help='run the superseded, corrupted symbol resolver anyway')
-    _a, _ = _p.parse_known_args()
-    try:
-        assert_resolver_not_used(_a.legacy_gene_resolution)
-    except CorruptedResolverRefused as _exc:
-        logging.error('%s', _exc)
-        return 2
-    """Main execution function"""
-    start_time = datetime.now()
-    
-    logging.info("=" * 60)
-    logging.info("NEGATIVE SAMPLE GENERATOR FOR CONSENSUS DOCKING")
-    logging.info("=" * 60)
-    logging.info(f"Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    logging.info("Strategy: Balanced sampling (Najm et al.)")
-    
-    # Step 1: Load positive samples
-    positive_df = load_positive_samples()
-    n_positives = len(positive_df)
-    
-    # Step 2: Load known interactions
-    known_pairs = load_known_interactions()
-    
-    # Step 3: Load available resources (restricted to drugs/proteins in interaction DB)
-    drugs_with_sdf, protein_cavities = load_available_resources(positive_df)
-    
-    logging.info("\n" + "=" * 60)
-    logging.info("RESOURCES LOADED - READY FOR NEGATIVE SAMPLING")
-    logging.info("=" * 60)
-    logging.info(f"Positive samples: {n_positives:,}")
-    logging.info(f"Available drugs with SDF: {len(drugs_with_sdf):,}")
-    logging.info(f"Available proteins: {len(protein_cavities):,}")
-    logging.info(f"Known interactions to avoid: {len(known_pairs):,}")
-    
-    # Step 4: Generate balanced negative samples
-    negatives = generate_balanced_negatives(
-        positive_df, known_pairs, drugs_with_sdf, protein_cavities
+def build_parser():
+    """The CLI. Nothing here is required, so a bare run reaches the refusal."""
+    parser = argparse.ArgumentParser(
+        prog="generate_negative_samples.py",
+        description="SUPERSEDED by %s -- refuses unless --legacy-gene-resolution."
+                    % ", ".join(REPLACEMENT_STAGES),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    
-    # Step 5: Create DataFrame and validate
-    negatives_df = pd.DataFrame(negatives)
-    
-    if negatives_df.empty:
-        logging.error("❌ Failed to generate any negative samples!")
-        sys.exit(1)
-    
-    validate_negatives(negatives_df, positive_df, known_pairs)
-    
-    # Step 6: Combine positive and negative samples
-    combined_df = pd.concat([positive_df, negatives_df], ignore_index=True)
-    
-    # Step 7: Generate metadata
-    metadata = generate_metadata(positive_df, negatives_df, known_pairs)
-    
-    # Add strategy information to metadata
-    metadata['strategy'] = {
-        'name': 'Balanced Negative Sampling',
-        'reference': 'Najm et al.',
-        'description': 'Each drug and target appears in equal number of positive and negative samples'
-    }
-    
-    # Step 8: Save results
-    save_results(combined_df, metadata)
-    
-    # Final summary
-    end_time = datetime.now()
-    duration = (end_time - start_time).total_seconds()
-    
-    logging.info("\n" + "=" * 60)
-    logging.info("NEGATIVE SAMPLE GENERATION COMPLETE")
-    logging.info("=" * 60)
-    logging.info(f"Duration: {duration:.2f} seconds")
-    logging.info(f"Total samples: {len(combined_df):,}")
-    logging.info(f"  Positive: {(combined_df['sample_type'] == 'positive').sum():,}")
-    logging.info(f"  Negative: {(combined_df['sample_type'].str.startswith('negative')).sum():,}")
-    logging.info(f"Actual ratio: 1:{len(negatives_df) / len(positive_df):.2f}")
-    logging.info("\n✅ Next step: Run extract_alphafold_models.py with the augmented structure list")
-    logging.info(f"   (It will use {OUTPUT_CSV} if available)")
+    parser.add_argument('--legacy-gene-resolution', action='store_true',
+                        help='run the superseded, corrupted symbol resolver anyway')
+    parser.add_argument('--edges', default=DEFAULT_DRUG_TO_PROTEIN_TSV,
+                        help='drug-protein interaction edges TSV (default: %(default)s)')
+    parser.add_argument('--drugs', default=DEFAULT_SMALL_MOLECULE_DRUGS_CSV,
+                        help='small-molecule DrugBank links CSV (default: %(default)s)')
+    parser.add_argument('--uniprot-mapping', default=DEFAULT_UNIPROT_MAPPING_CSV,
+                        help='UniProt/gene mapping CSV, resolved against the invocation '
+                             'directory (default: %(default)s). This is the 57.73%%-wrong '
+                             'file; see KNOWN_ISSUE_uniprot_gene_mapping.md')
+    parser.add_argument('--cavity-mapping', default=DEFAULT_CAVITY_MAPPING_CSV,
+                        help='cavity mapping CSV from extract_cavities.py (default: %(default)s)')
+    parser.add_argument('--ligands', default=DEFAULT_LIGAND_SDF_FOLDER,
+                        help='directory of per-drug SDF files; a drug without one is '
+                             'never sampled (default: %(default)s)')
+    parser.add_argument('--out', default=DEFAULT_OUTPUT_CSV,
+                        help='combined positives+negatives CSV to write (default: %(default)s)')
+    parser.add_argument('--metadata-out', default=DEFAULT_METADATA_JSON,
+                        help='sampling metadata JSON to write (default: %(default)s)')
+    parser.add_argument('--seed', type=int, default=DEFAULT_SEED,
+                        help='random seed for the greedy draw; the only thing that makes '
+                             'a repeat of this draw reproducible (default: %(default)s)')
+    parser.add_argument('--run-dir', default=None,
+                        help='campaign run directory; the step log goes to '
+                             '<run-dir>/steps/%s/ unless --out-dir says otherwise' % STEP_NAME)
+    add_runtime_arguments(parser, STEP_NAME)
+    return parser
 
+
+def main(argv=None):
+    """Refuse by default; run the legacy sampler only when told to, twice."""
+    args = build_parser().parse_args(argv)
+    try:
+        assert_resolver_not_used(args.legacy_gene_resolution)
+    except CorruptedResolverRefused as exc:
+        # Logging is deliberately not configured yet: a refused run creates no
+        # directory and no log file. The operator still has to be told why.
+        sys.stderr.write("%s\n" % exc)
+        return 2
+
+    resolve_out_dir(args, STEP_NAME, args.run_dir)
+    with step(STEP_NAME, args) as ctx:
+        ctx.logger.warning(LEGACY_WARNING)
+        try:
+            run_legacy_sampling(args)
+        except MissingInput as exc:
+            ctx.logger.error("%s", exc)
+            # SystemExit inside step() is reported as a failure, not a quiet return.
+            raise SystemExit(2)
+        ctx.logger.info("Next step: extract_alphafold_models.py, which will use %s",
+                        args.out)
+    return 0
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main() or 0)
-    except KeyboardInterrupt:
-        logging.warning("\n⚠️  Process interrupted by user")
-        sys.exit(1)
-    except Exception as e:
-        logging.error(f"\n❌ Error: {str(e)}", exc_info=True)
-        sys.exit(1)
+    sys.exit(main())

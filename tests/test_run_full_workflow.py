@@ -15,15 +15,22 @@ is a silent no-op wearing a success code.
 
 from __future__ import annotations
 
+import io
+import logging
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
+import urllib.parse
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 import run_full_workflow as wf  # noqa: E402
+from dock_selectivity.runtime import Pushover  # noqa: E402
 
 
 def plan(**overrides):
@@ -301,3 +308,288 @@ class TestInputOutputSeparation(unittest.TestCase):
                         produced.startswith(args.run_dir),
                         "%s writes %s outside the output directory"
                         % (phase.key, produced))
+
+
+class LoggingIsolation(unittest.TestCase):
+    """Keep a run's log handlers from outliving the temporary directory.
+
+    ``configure_logging`` attaches a FileHandler to the step logger *and* to the
+    shared ``dock_selectivity`` package logger. A test that calls ``main()``
+    inside a TemporaryDirectory and walks away leaves that handler attached to a
+    path that no longer exists, and the next test anywhere in the process that
+    logs through ``dock_selectivity.*`` gets a FileNotFoundError from logging
+    itself. Restore both loggers exactly, and drop any handler whose stream the
+    runtime legitimately closed while we were away.
+    """
+
+    LOGGERS = (wf.STEP_NAME, "dock_selectivity")
+
+    def setUp(self):
+        super().setUp()
+        self._saved = []
+        for name in self.LOGGERS:
+            logger = logging.getLogger(name)
+            self._saved.append((logger, list(logger.handlers), logger.level))
+        self._stderr = sys.stderr
+        sys.stderr = io.StringIO()
+
+    def tearDown(self):
+        sys.stderr = self._stderr
+        for logger, handlers, level in self._saved:
+            for handler in list(logger.handlers):
+                if handler not in handlers:
+                    logger.removeHandler(handler)
+                    try:
+                        handler.close()
+                    except Exception:
+                        pass
+            logger.handlers[:] = [h for h in handlers
+                                  if getattr(h, "stream", True) is not None]
+            logger.setLevel(level)
+        super().tearDown()
+
+
+class TestPerPhaseOutputDirectories(unittest.TestCase):
+    """Every phase writes its log into its own folder under <run-dir>/steps/.
+
+    Before this, twelve scripts logged into the invocation directory or into the
+    artifact tree, and their console output went nowhere at all once the terminal
+    was closed.
+    """
+
+    RUN = "/tmp/does-not-exist-run"
+
+    def test_every_phase_is_given_its_own_step_directory(self):
+        for phase in plan():
+            with self.subTest(phase=phase.key):
+                expected = os.path.join(self.RUN, "steps", phase.key)
+                if phase.key in wf.ARTIFACT_OUT_DIR_PHASES:
+                    self.assertIn("--log-file", phase.args)
+                    target = phase.args[phase.args.index("--log-file") + 1]
+                    self.assertEqual(os.path.dirname(target), expected)
+                else:
+                    self.assertIn("--out-dir", phase.args)
+                    self.assertEqual(
+                        phase.args[phase.args.index("--out-dir") + 1], expected)
+
+    def test_the_structure_phases_keep_out_dir_meaning_the_structures(self):
+        """--out-dir is the receptor destination for those four, not a log dir.
+
+        Handing them a step directory there would silently move where the
+        receptors land, and batch_dock.py would then dock against whatever older
+        structures were on the path.
+        """
+        by_key = {p.key: p for p in plan()}
+        for key, tail in (("cavity-structures", "cavities"), ("alphafold", "alphafold"),
+                          ("fix", "fixed"), ("pdbqt", "pdbqt")):
+            with self.subTest(phase=key):
+                args = by_key[key].args
+                destination = args[args.index("--out-dir") + 1]
+                self.assertEqual(destination,
+                                 os.path.join(self.RUN, "structures", tail))
+
+    def test_the_two_extract_cavities_phases_do_not_share_a_log(self):
+        """Phase 2 and phase 6a run the same script; one log would interleave them."""
+        by_key = {p.key: p for p in plan()}
+        first = by_key["cavities"].args[by_key["cavities"].args.index("--log-file") + 1]
+        second = by_key["cavity-structures"].args[
+            by_key["cavity-structures"].args.index("--log-file") + 1]
+        self.assertNotEqual(first, second)
+
+    def test_every_phase_script_accepts_the_flag_it_is_handed(self):
+        """The flags are real, not hopeful: parse each command with its own parser."""
+        import importlib
+
+        for phase in plan():
+            if phase.script == "batch_dock.py":
+                continue        # its parser is built under __main__, not importable
+            module = importlib.import_module(phase.script[:-len(".py")])
+            builder = (getattr(module, "build_parser", None)
+                       or getattr(module, "build_arg_parser"))
+            with self.subTest(phase=phase.key):
+                try:
+                    builder().parse_args(phase.args)
+                except SystemExit as exc:      # argparse rejected something
+                    self.fail("%s does not accept %s (%s)"
+                              % (phase.script, phase.args, exc))
+
+
+class TestWorkflowLogLocation(LoggingIsolation):
+    def test_the_workflow_log_is_under_run_dir_logs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = wf.build_parser().parse_args(["--run-dir", tmp])
+            path = wf.resolve_runtime_paths(args)
+            self.assertEqual(path, os.path.join(tmp, "logs", "workflow.log"))
+            self.assertEqual(args.out_dir, os.path.join(tmp, "logs"))
+
+    def test_an_explicit_log_file_wins(self):
+        args = wf.build_parser().parse_args(
+            ["--run-dir", "/tmp/x", "--log-file", "/tmp/elsewhere.log"])
+        self.assertEqual(wf.resolve_runtime_paths(args), "/tmp/elsewhere.log")
+
+    def test_a_real_run_writes_the_workflow_log_and_the_phase_logs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = os.path.join(tmp, "run")
+            with mock.patch.object(wf.subprocess, "run", _fake_phase()):
+                rc = wf.main(["--run-dir", run, "--only", "identity"])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.exists(os.path.join(run, "logs", "workflow.log")))
+            self.assertTrue(os.path.exists(
+                os.path.join(run, "steps", "identity", "identity.console.log")))
+
+
+class TestPhaseOutputIsCapturedNotSwallowed(LoggingIsolation):
+    def test_stdout_and_stderr_land_in_the_phase_console_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = os.path.join(tmp, "run")
+            with mock.patch.object(wf.subprocess, "run",
+                                   _fake_phase(output="hello from the phase\n")):
+                self.assertEqual(wf.main(["--run-dir", run, "--only", "identity"]), 0)
+            with open(os.path.join(run, "steps", "identity",
+                                   "identity.console.log")) as handle:
+                self.assertIn("hello from the phase", handle.read())
+
+    def test_a_failure_still_shows_the_operator_what_went_wrong(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = os.path.join(tmp, "run")
+            with mock.patch.object(wf.subprocess, "run",
+                                   _fake_phase(returncode=3, output="TRACEBACK HERE\n")):
+                self.assertEqual(wf.main(["--run-dir", run, "--only", "identity"]), 1)
+            with open(os.path.join(run, "logs", "workflow.log")) as handle:
+                workflow_log = handle.read()
+            self.assertIn("TRACEBACK HERE", workflow_log)   # not swallowed
+            self.assertIn("exited 3", workflow_log)
+
+
+class TestNotifications(LoggingIsolation):
+    NO_CREDENTIALS = {k: v for k, v in os.environ.items()
+                      if k not in (Pushover.ENV_TOKEN, Pushover.ENV_USER_KEY)}
+    CREDENTIALS = dict(NO_CREDENTIALS,
+                       **{Pushover.ENV_TOKEN: "t0ken", Pushover.ENV_USER_KEY: "us3r"})
+
+    def test_notify_parses_without_credentials(self):
+        """Parsing must not consult the environment; only running may."""
+        with mock.patch.dict(os.environ, self.NO_CREDENTIALS, clear=True):
+            args = wf.build_parser().parse_args(["--run-dir", "/tmp/x", "--notify"])
+        self.assertTrue(args.notify)
+
+    def test_notify_without_credentials_refuses_at_startup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, self.NO_CREDENTIALS, clear=True):
+                with mock.patch.object(wf.subprocess, "run", _fake_phase()) as runner:
+                    rc = wf.main(["--run-dir", tmp, "--only", "identity", "--notify"])
+            self.assertEqual(rc, 2)
+            # Before the first phase, not at hour 61.
+            self.assertEqual(runner.call_count, 0)
+
+    def test_a_failed_phase_notifies_with_its_name_and_exit_code(self):
+        sent = self._run_notified(["--only", "identity", "--notify"], returncode=4)
+        failures = [m for m in sent if int(m["priority"][0]) == 1]
+        self.assertEqual(len(failures), 1)
+        self.assertIn("identity", failures[0]["message"][0])
+        self.assertIn("exit 4", failures[0]["message"][0])
+
+    def test_completion_notifies_with_the_elapsed_time_and_a_per_phase_summary(self):
+        sent = self._run_notified(
+            ["--only", "identity", "--only", "cavities", "--notify"])
+        self.assertEqual(len(sent), 2, [m["message"][0] for m in sent])
+        start, done = sent
+        self.assertIn("started", start["message"][0])
+        self.assertIn("finished in", done["message"][0])
+        for key in ("identity", "cavities"):
+            self.assertIn(key, done["message"][0])
+
+    def test_notify_steps_forwards_the_flag_and_plain_notify_does_not(self):
+        with mock.patch.dict(os.environ, self.CREDENTIALS, clear=True):
+            plain = wf.build_parser().parse_args(["--run-dir", "/tmp/x", "--notify"])
+            forwarded = wf.build_parser().parse_args(
+                ["--run-dir", "/tmp/x", "--notify", "--notify-steps"])
+        for phase in wf.build_phases(plain):
+            with self.subTest(phase=phase.key, forwarded=False):
+                self.assertNotIn("--notify", phase.args)
+        for phase in wf.build_phases(forwarded):
+            with self.subTest(phase=phase.key, forwarded=True):
+                self.assertIn("--notify", phase.args)
+
+    def test_forwarded_phases_get_only_the_events_the_operator_asked_for(self):
+        """The workflow defaults itself to every event; twelve phases must not."""
+        args = wf.build_parser().parse_args(
+            ["--run-dir", "/tmp/x", "--notify", "--notify-steps"])
+        args._notify_on_given = []          # what main() records for a bare --notify
+        for phase in wf.build_phases(args):
+            with self.subTest(phase=phase.key):
+                self.assertNotIn("--notify-on", phase.args)
+
+        args = wf.build_parser().parse_args(
+            ["--run-dir", "/tmp/x", "--notify", "--notify-steps", "--notify-on", "start"])
+        args._notify_on_given = ["start"]
+        for phase in wf.build_phases(args):
+            with self.subTest(phase=phase.key, events=True):
+                self.assertIn("--notify-on", phase.args)
+
+    def _run_notified(self, extra, returncode=0):
+        """Run the workflow with credentials present and Pushover intercepted."""
+        sent = []
+
+        class _Response:
+            status = 200
+
+            def close(self):
+                pass
+
+        def _urlopen(request, timeout=None):
+            sent.append(urllib.parse.parse_qs(request.data.decode("utf-8")))
+            return _Response()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, self.CREDENTIALS, clear=True), \
+                    mock.patch("urllib.request.urlopen", _urlopen), \
+                    mock.patch.object(wf.subprocess, "run",
+                                      _fake_phase(returncode=returncode)):
+                wf.main(["--run-dir", os.path.join(tmp, "run")] + list(extra))
+        return sent
+
+
+class TestDryRunWritesNothing(LoggingIsolation):
+    def test_the_whole_plan_is_printed_and_nothing_is_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = os.path.join(tmp, "run")     # deliberately absent
+            with mock.patch.object(wf.subprocess, "run") as runner:
+                with self.assertLogs(wf.LOG, level="INFO") as captured:
+                    rc = wf.main(["--run-dir", run, "--dry-run"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(runner.call_count, 0)
+            self.assertFalse(os.path.exists(run), "a dry run created %s" % run)
+            self.assertEqual(os.listdir(tmp), [])
+            printed = "\n".join(captured.output)
+            for key in [p.key for p in plan()]:
+                with self.subTest(phase=key):
+                    self.assertIn(key, printed)
+
+    def test_a_dry_run_writes_no_log_of_its_own(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = wf.build_parser().parse_args(["--run-dir", tmp, "--dry-run"])
+            self.assertEqual(wf.resolve_runtime_paths(args), os.devnull)
+            wf.main(["--run-dir", tmp, "--dry-run"])
+            self.assertEqual(os.listdir(tmp), [])
+
+
+def _fake_phase(returncode=0, output=""):
+    """A stand-in for ``subprocess.run`` that satisfies the produces-check.
+
+    Each phase writes the paths it was given with ``--out`` / ``--redock-out``,
+    which is exactly what ``run_phase`` verifies afterwards -- so a fake that
+    touches them exercises the real control flow without running twelve scripts.
+    """
+    def runner(command, timeout=None, stdout=None, stderr=None):
+        if stdout is not None and output:
+            stdout.write(output.encode("utf-8"))
+        if returncode == 0:
+            for index, token in enumerate(command[:-1]):
+                if token in ("--out", "--redock-out"):
+                    target = command[index + 1]
+                    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+                    open(target, "a").close()
+        return subprocess.CompletedProcess(command, returncode)
+
+    return mock.Mock(side_effect=runner)

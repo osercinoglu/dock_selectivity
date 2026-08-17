@@ -1,23 +1,52 @@
 #!/usr/bin/env python3
 """
-High-Performance Consensus Docking Data Parser and Preparer
-===========================================================
+Phase 8 -- parse the docking output tree into the single analysis table.
 
-This script optimizes the parsing and preparation of consensus docking results
-with multiprocessing, progress bars, and performance optimizations.
+Discovers every job's ``final_results.csv`` / per-tool ``results.csv`` under the
+run directory, then: load -> clean -> annotate sample types -> filter to complete
+tool coverage -> balance positives against negatives -> and only *then* the
+expensive annotations (DTA-ATLAS affinities, cavity clusters, TTD IC50s, Louvain
+pocket clusters). That order is deliberate; reordering it exhausts memory on the
+full result set.
 
-Features:
-- Multiprocessing for file discovery and loading
-- Progress bars for all operations
-- Memory-efficient data processing
-- Fast file I/O with optimizations
-- Comprehensive performance monitoring
+Prerequisites
+    ``batch_dock.py`` has produced ``<run-dir>/docking_results/<job>/...``.
+    ``build_run_manifest.py`` has produced ``manifests/run_manifest.csv`` (pass it
+    as --manifest: discovery finding fewer jobs than the manifest is the failure
+    that silently dropped 58% of the 2025-06-29 campaign).
+
+Inputs
+    --results-dir       docking output tree      (default <run-dir>/docking_results)
+    --manifest          run_manifest.csv         (optional; enables the discovery check)
+    --sample-metadata   positive/negative labels (default <run-dir>/manifests/run_manifest.csv)
+    --cavity-clusters   CavitySpace cluster table (default under /opt/data)
+    --ic50-mapping      create_ic50_mapping.py output (default <run-dir>/ic50_mapping.csv)
+    --pocket-clusters   pocketmatch_clustering.py output directory
+    --dta-atlas-dir     DTA-ATLAS parquet shards (optional; skipped when unset)
+
+Outputs
+    --out               combined_filtered_annotated_docking_results.parquet
+                        (default <run-dir>/combined_filtered_annotated_docking_results.parquet)
+                        plus a timestamped data_preparation_summary_*.json beside it
+    <out-dir>/parse_prepare.log   the run log (see --out-dir)
+
+Usage::
+
+    python3 parse_prepare.py --run-dir /data/runs/2026_08_run \\
+        --manifest /data/runs/2026_08_run/manifests/run_manifest.csv
+
+    # explicit everything, notify when it finishes or fails
+    python3 parse_prepare.py --run-dir /data/runs/2026_08_run \\
+        --results-dir /data/runs/2026_08_run/docking_results \\
+        --out /data/runs/2026_08_run/analysis/combined.parquet \\
+        --load-workers 8 --search-workers 12 --notify --notify-on all
 """
 
 import os
 import re
 import sys
 import glob
+import logging
 from pathlib import Path
 import warnings
 import time
@@ -30,27 +59,41 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 
+from dock_selectivity.runtime import add_runtime_arguments, resolve_out_dir, step
+
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 pd.options.mode.chained_assignment = None
 
-# =============================================================================
-# GLOBAL CONFIGURATION - Modify these paths as needed
-# =============================================================================
-BASE_DIR = "/media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock"
-POCKET_CLUSTERS_DIR = os.path.join(BASE_DIR, "pocketmatch_results", "pocket_clusters")
+STEP_NAME = "parse_prepare"
 
-# DTA-ATLAS dataset (DL binding affinity predictions)
-DTA_ATLAS_DIR = os.path.join(
-    BASE_DIR,
-    "dta_atlas_data",
-    "home",
-    "madinasu",
-    "convertedData",
-    "dta_atlas_dataset_1_0",
-)
+#: Configured by ``main()`` through the shared runtime. Importing this module
+#: attaches no handler and writes no file.
+LOG = logging.getLogger(STEP_NAME)
 
-# DTA-ATLAS integration tunables
+# =============================================================================
+# Configuration -- defaults for flags, never fixed settings
+# =============================================================================
+# There is no BASE_DIR any more. It named one dead 2025-06-29 campaign on a
+# read-only drive, three other constants were derived from it at import time, and
+# --run-dir rebound only two of them -- so an explicit run directory still read
+# (and wrote) the wrong tree. Every path below is now a flag; the run directory
+# comes from the command line.
+
+#: Layout under --run-dir, used only to build the defaults in build_parser().
+RESULTS_SUBDIR = "docking_results"
+MANIFESTS_SUBDIR = "manifests"
+RUN_MANIFEST_BASENAME = "run_manifest.csv"
+IC50_BASENAME = "ic50_mapping.csv"
+POCKET_CLUSTERS_SUBDIR = os.path.join("pocketmatch_results", "pocket_clusters")
+OUTPUT_PARQUET_BASENAME = "combined_filtered_annotated_docking_results.parquet"
+
+#: A machine-wide reference dataset, not a run artifact -- so it may default to
+#: /opt/data. The "07" is a similarity threshold, i.e. a science parameter, which
+#: is why it is still overridable with --cavity-clusters.
+DEFAULT_CAVITY_CLUSTER_FILE = "/opt/data/cavity_space/cavity_cluster_similarity07.csv"
+
+# DTA-ATLAS integration tunables (--dta-batch-size / --dta-workers / --no-dta-parallel)
 # - Batch size controls how many rows are processed at a time per parquet shard.
 # - Max workers controls parallel file scanning (threads).
 #   Increase if you have fast storage; decrease if you see disk thrashing.
@@ -58,11 +101,9 @@ DTA_ATLAS_BATCH_SIZE = 200_000
 DTA_ATLAS_MAX_WORKERS = 24
 DTA_ATLAS_PARALLEL = True
 
-# Performance settings
-CHUNK_SIZE = 10000  # For chunked processing
-MAX_WORKERS_SEARCH = None  # Use all cores for search
-MAX_WORKERS_LOAD = 8  # Limit for I/O operations
-PROGRESS_UPDATE_INTERVAL = 0.1  # Progress bar update frequency
+# Performance settings (--search-workers / --load-workers)
+DEFAULT_MAX_WORKERS_SEARCH = 12  # processes walking the output tree
+DEFAULT_MAX_WORKERS_LOAD = 8     # processes reading result CSVs; I/O bound
 
 
 # =============================================================================
@@ -222,16 +263,17 @@ def optimized_walk_search(args):
     
     return results
 
-def find_consensus_results_files_optimized(base_directory, max_workers=None):
+def find_consensus_results_files_optimized(base_directory, max_workers=None,
+                                           file_cap=FILE_DISCOVERY_CAP):
     """
     Ultra-fast multiprocessing file discovery with intelligent search strategy.
     """
-    print(f"\n🔍 ULTRA-OPTIMIZED FILE DISCOVERY")
-    print(f"=" * 50)
-    print(f"📁 Searching in: {base_directory}")
+    LOG.info(f"\n🔍 ULTRA-OPTIMIZED FILE DISCOVERY")
+    LOG.info(f"=" * 50)
+    LOG.info(f"📁 Searching in: {base_directory}")
     
     if not os.path.exists(base_directory):
-        print(f"❌ Directory not found: {base_directory}")
+        LOG.error(f"❌ Directory not found: {base_directory}")
         return {}
     
     search_start = time.time()
@@ -241,7 +283,7 @@ def find_consensus_results_files_optimized(base_directory, max_workers=None):
     if max_workers is None:
         max_workers = min(system_info['cpu_count'], 16)  # Cap at 16 for I/O bound tasks
     
-    print(f"💻 Using {max_workers} cores for parallel search")
+    LOG.info(f"💻 Using {max_workers} cores for parallel search")
     
     # Define search patterns - search all at once for efficiency
     search_patterns = [
@@ -262,10 +304,12 @@ def find_consensus_results_files_optimized(base_directory, max_workers=None):
     # 58% of the campaign, 845 GB and 8,732 core-hours -- from the analysis. The
     # loss was differential (30.6% of negatives retained vs ~50% of positives),
     # which is the mechanism behind the unexplained 2.03:1 class imbalance.
-    # None is now the sentinel for "no cap"; a cap may only be set deliberately.
-    max_files_per_pattern = FILE_DISCOVERY_CAP
+    # None is now the sentinel for "no cap"; a cap may only be set deliberately
+    # (--file-cap), which is why it is a parameter rather than a module constant
+    # read out of the caller's back.
+    max_files_per_pattern = file_cap
     
-    print(f"📂 Partitioned search into {len(search_dirs)} segments")
+    LOG.info(f"📂 Partitioned search into {len(search_dirs)} segments")
     
     # Parallel file search with all patterns at once
     all_results = {pattern: [] for pattern in search_patterns}
@@ -293,7 +337,7 @@ def find_consensus_results_files_optimized(base_directory, max_workers=None):
                     pbar.set_postfix({'Found': f"{total_found:,}"})
                     pbar.update(1)
                 except Exception as e:
-                    print(f"⚠️ Search segment failed: {e}")
+                    LOG.warning(f"⚠️ Search segment failed: {e}")
                     pbar.update(1)
     
     # Categorize results intelligently
@@ -302,14 +346,14 @@ def find_consensus_results_files_optimized(base_directory, max_workers=None):
     search_time = time.time() - search_start
     total_files = sum(len(files) for files in categorized_results.values())
     
-    print(f"\n✅ File discovery completed in {search_time:.2f} seconds")
-    print(f"📊 Files found by category:")
+    LOG.info(f"\n✅ File discovery completed in {search_time:.2f} seconds")
+    LOG.info(f"📊 Files found by category:")
     for category, files in categorized_results.items():
-        print(f"  {category}: {len(files):,} files")
-    print(f"📋 Total files: {total_files:,}")
+        LOG.info(f"  {category}: {len(files):,} files")
+    LOG.info(f"📋 Total files: {total_files:,}")
     
     if total_files > 0:
-        print(f"⚡ Search rate: {total_files/search_time:,.0f} files/sec")
+        LOG.info(f"⚡ Search rate: {total_files/search_time:,.0f} files/sec")
     
     return categorized_results
 
@@ -510,17 +554,17 @@ def load_consensus_data_optimized(result_files, max_workers=6):
     """
     Ultra-high-performance data loading with intelligent batching and memory management.
     """
-    print(f"\n📖 ULTRA-OPTIMIZED DATA LOADING")
-    print(f"=" * 50)
+    LOG.info(f"\n📖 ULTRA-OPTIMIZED DATA LOADING")
+    LOG.info(f"=" * 50)
     
     # Flatten and prioritize files
     prioritized_files = prioritize_files_for_loading(result_files)
     
     if not prioritized_files:
-        print("❌ No files to load")
+        LOG.error("❌ No files to load")
         return pd.DataFrame()
     
-    print(f"📄 Loading {len(prioritized_files):,} files using {max_workers} processes")
+    LOG.info(f"📄 Loading {len(prioritized_files):,} files using {max_workers} processes")
     
     load_start = time.time()
     successful_chunks = []
@@ -538,7 +582,7 @@ def load_consensus_data_optimized(result_files, max_workers=6):
         except OSError:
             file_info_list.append((file_path, 0))
     
-    print(f"💾 Total data size: {total_size_mb:.1f} MB")
+    LOG.info(f"💾 Total data size: {total_size_mb:.1f} MB")
     
     # Load files with progress tracking and error handling
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -573,30 +617,30 @@ def load_consensus_data_optimized(result_files, max_workers=6):
                     else:
                         failed_files.append(file_path)
                         if result and 'error' in result:
-                            print(f"⚠️ Failed: {os.path.basename(file_path)} - {result['error']}")
+                            LOG.warning(f"⚠️ Failed: {os.path.basename(file_path)} - {result['error']}")
                     
                     pbar.update(1)
                     
                 except Exception as e:
                     failed_files.append(file_path)
-                    print(f"⚠️ Error loading {os.path.basename(file_path)}: {e}")
+                    LOG.warning(f"⚠️ Error loading {os.path.basename(file_path)}: {e}")
                     pbar.update(1)
     
     load_time = time.time() - load_start
     
-    print(f"\n⚡ Loading phase completed in {load_time:.2f} seconds")
-    print(f"✅ Successfully loaded: {len(successful_chunks)} files")
-    print(f"❌ Failed to load: {len(failed_files)} files")
-    print(f"📊 Total records loaded: {total_records:,}")
+    LOG.info(f"\n⚡ Loading phase completed in {load_time:.2f} seconds")
+    LOG.info(f"✅ Successfully loaded: {len(successful_chunks)} files")
+    LOG.info(f"❌ Failed to load: {len(failed_files)} files")
+    LOG.info(f"📊 Total records loaded: {total_records:,}")
     
     if failed_files and len(failed_files) <= 10:
-        print(f"⚠️  Failed files: {[os.path.basename(f) for f in failed_files]}")
+        LOG.warning(f"⚠️  Failed files: {[os.path.basename(f) for f in failed_files]}")
     elif failed_files:
-        print(f"⚠️  Failed files: {len(failed_files)} (showing first 5): {[os.path.basename(f) for f in failed_files[:5]]}")
+        LOG.warning(f"⚠️  Failed files: {len(failed_files)} (showing first 5): {[os.path.basename(f) for f in failed_files[:5]]}")
     
     # Combine DataFrames efficiently
     if successful_chunks:
-        print(f"\n🔄 Combining {len(successful_chunks)} DataFrames...")
+        LOG.info(f"\n🔄 Combining {len(successful_chunks)} DataFrames...")
         combine_start = time.time()
         
         # Sort chunks by size (largest first) for better memory usage
@@ -616,18 +660,18 @@ def load_consensus_data_optimized(result_files, max_workers=6):
         # Memory optimization
         memory_mb = consensus_data.memory_usage(deep=True).sum() / (1024**2)
         
-        print(f"✅ Data loading completed in {total_time:.2f} seconds")
-        print(f"  📖 Loading: {load_time:.2f}s")
-        print(f"  🔄 Combining: {combine_time:.2f}s")
-        print(f"📊 Final dataset:")
-        print(f"  📋 Records: {len(consensus_data):,}")
-        print(f"  📊 Columns: {len(consensus_data.columns)}")
-        print(f"  💾 Memory: {memory_mb:.1f} MB")
-        print(f"⚡ Processing rate: {len(consensus_data)/total_time:,.0f} records/sec")
+        LOG.info(f"✅ Data loading completed in {total_time:.2f} seconds")
+        LOG.info(f"  📖 Loading: {load_time:.2f}s")
+        LOG.info(f"  🔄 Combining: {combine_time:.2f}s")
+        LOG.info(f"📊 Final dataset:")
+        LOG.info(f"  📋 Records: {len(consensus_data):,}")
+        LOG.info(f"  📊 Columns: {len(consensus_data.columns)}")
+        LOG.info(f"  💾 Memory: {memory_mb:.1f} MB")
+        LOG.info(f"⚡ Processing rate: {len(consensus_data)/total_time:,.0f} records/sec")
         
         return consensus_data
     else:
-        print("❌ No valid data could be loaded")
+        LOG.error("❌ No valid data could be loaded")
         return pd.DataFrame()
 
 
@@ -676,9 +720,9 @@ def clean_and_prepare_data_optimized(df):
     if df.empty:
         return df
     
-    print(f"\n🧹 OPTIMIZED DATA CLEANING")
-    print(f"=" * 50)
-    print(f"📊 Input data: {len(df):,} records, {len(df.columns)} columns")
+    LOG.info(f"\n🧹 OPTIMIZED DATA CLEANING")
+    LOG.info(f"=" * 50)
+    LOG.info(f"📊 Input data: {len(df):,} records, {len(df.columns)} columns")
     
     clean_start = time.time()
     
@@ -722,8 +766,8 @@ def clean_and_prepare_data_optimized(df):
         if 'drugbank_id' in clean_df.columns and 'uniprot_id' in clean_df.columns:
             valid_drugbank = clean_df['drugbank_id'].str.startswith('DB', na=False)
             valid_uniprot = clean_df['uniprot_id'].str.match(r'^[A-Z0-9]{6}$', na=False)
-            print(f"🔍 Valid DrugBank IDs: {valid_drugbank.sum():,}/{len(clean_df):,}")
-            print(f"🔍 Valid UniProt IDs: {valid_uniprot.sum():,}/{len(clean_df):,}")
+            LOG.info(f"🔍 Valid DrugBank IDs: {valid_drugbank.sum():,}/{len(clean_df):,}")
+            LOG.info(f"🔍 Valid UniProt IDs: {valid_uniprot.sum():,}/{len(clean_df):,}")
         pbar.update(1)
         
         # Step 4: Create categorical variables
@@ -776,9 +820,9 @@ def clean_and_prepare_data_optimized(df):
     clean_time = time.time() - clean_start
     final_memory_mb = clean_df.memory_usage(deep=True).sum() / (1024**2)
     
-    print(f"✅ Cleaning completed in {clean_time:.2f} seconds")
-    print(f"📊 Output data: {len(clean_df):,} records, {len(clean_df.columns)} columns")
-    print(f"💾 Memory usage: {final_memory_mb:.1f} MB")
+    LOG.info(f"✅ Cleaning completed in {clean_time:.2f} seconds")
+    LOG.info(f"📊 Output data: {len(clean_df):,} records, {len(clean_df.columns)} columns")
+    LOG.info(f"💾 Memory usage: {final_memory_mb:.1f} MB")
     
     return clean_df
 
@@ -861,7 +905,7 @@ def add_tool_specific_scores(df):
     if df.empty or not all(col in df.columns for col in ['Tool1', 'Tool2', 'Score1', 'Score2']):
         return df
     
-    print(f"\n🏷️  STEP: Adding tool-specific score columns...")
+    LOG.info(f"\n🏷️  STEP: Adding tool-specific score columns...")
     
     # Create score columns for each tool
     tools = list(CANONICAL_TOOLS)  # DEFECT 3 (fixed): 'LeDock' never matched data 'LEDOCK'
@@ -879,11 +923,11 @@ def add_tool_specific_scores(df):
     for tool in tools:
         col_name = f'{tool}_Score'
         non_null = df[col_name].notna().sum()
-        print(f"   {col_name}: {non_null:,} non-null values ({non_null/len(df)*100:.1f}%)")
+        LOG.info(f"   {col_name}: {non_null:,} non-null values ({non_null/len(df)*100:.1f}%)")
     
     return df
 
-def integrate_cavity_clusters(df, cluster_file="/opt/data/cavity_space/cavity_cluster_similarity07.csv"):
+def integrate_cavity_clusters(df, cluster_file=DEFAULT_CAVITY_CLUSTER_FILE):
     """
     Integrate cavity cluster information from CavitySpace data.
     Maps cavities to similarity clusters for cluster-based analysis.
@@ -891,14 +935,14 @@ def integrate_cavity_clusters(df, cluster_file="/opt/data/cavity_space/cavity_cl
     if df.empty:
         return df
     
-    print(f"\n🗃️  STEP: Integrating cavity cluster data...")
+    LOG.info(f"\n🗃️  STEP: Integrating cavity cluster data...")
     
     try:
         import re
         
         # Load cluster data
         clusters_df = pd.read_csv(cluster_file, sep='\t')
-        print(f"   Loaded {len(clusters_df):,} clusters from CavitySpace")
+        LOG.info(f"   Loaded {len(clusters_df):,} clusters from CavitySpace")
         
         # Extract cavity identifiers from source_dir
         df['extracted_uniprot_id'] = df['source_dir'].str.extract(r'_([A-Z0-9]+)_cavity_\d+')[0]
@@ -906,8 +950,8 @@ def integrate_cavity_clusters(df, cluster_file="/opt/data/cavity_space/cavity_cl
         
         non_null_uniprot = df['extracted_uniprot_id'].notna().sum()
         non_null_cavity = df['extracted_cavity_index'].notna().sum()
-        print(f"   Extracted uniprot_id: {non_null_uniprot:,} non-null values")
-        print(f"   Extracted cavity_index: {non_null_cavity:,} non-null values")
+        LOG.info(f"   Extracted uniprot_id: {non_null_uniprot:,} non-null values")
+        LOG.info(f"   Extracted cavity_index: {non_null_cavity:,} non-null values")
         
         if non_null_uniprot > 0 and non_null_cavity > 0:
             # Build mapping table (vectorized merge later; avoids df.apply(axis=1) memory spikes)
@@ -933,42 +977,53 @@ def integrate_cavity_clusters(df, cluster_file="/opt/data/cavity_space/cavity_cl
             mapping_df['extracted_cavity_index'] = mapping_df['extracted_cavity_index'].astype('Int64')
             mapping_df = mapping_df.drop_duplicates(subset=['extracted_uniprot_id', 'extracted_cavity_index'], keep='first')
 
-            print(f"   Created mapping for {len(mapping_df):,} unique cavities")
+            LOG.info(f"   Created mapping for {len(mapping_df):,} unique cavities")
 
             # Vectorized merge
             df = df.merge(mapping_df, on=['extracted_uniprot_id', 'extracted_cavity_index'], how='left')
 
             mapped_count = df['cavity_cluster_id'].notna().sum()
             unique_clusters = df['cavity_cluster_id'].nunique()
-            print(f"   Mapped: {mapped_count:,}/{len(df):,} ({mapped_count/len(df)*100:.1f}%)")
-            print(f"   Unique clusters: {unique_clusters:,}")
+            LOG.info(f"   Mapped: {mapped_count:,}/{len(df):,} ({mapped_count/len(df)*100:.1f}%)")
+            LOG.info(f"   Unique clusters: {unique_clusters:,}")
         else:
             df['cavity_cluster_id'] = pd.NA
             
     except FileNotFoundError:
-        print(f"   ⚠️  Cluster file not found: {cluster_file}")
+        LOG.warning(f"   ⚠️  Cluster file not found: {cluster_file}")
         df['cavity_cluster_id'] = pd.NA
     except Exception as e:
-        print(f"   ⚠️  Error loading clusters: {e}")
+        LOG.warning(f"   ⚠️  Error loading clusters: {e}")
         df['cavity_cluster_id'] = pd.NA
     
     return df
 
-def integrate_ic50_data(df, ic50_file="/media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock/ic50_mapping.csv"):
+def integrate_ic50_data(df, ic50_file=None):
     """
     Integrate experimental IC50/Ki measurements from Therapeutic Target Database.
     Provides quantitative binding affinity data for validation.
+
+    ``ic50_file`` has no default path: the old one named a specific past campaign,
+    so the enrichment silently read someone else's run. ``None`` means "not
+    configured" and skips the step loudly.
     """
     if df.empty:
         return df
-    
-    print(f"\n🧪 STEP: Integrating IC50 data...")
+
+    if not ic50_file:
+        LOG.warning("\n🧪 STEP: no --ic50-mapping given; skipping IC50 integration")
+        for col in ['ic50_value', 'ic50_unit', 'measurement_type', 'operator',
+                    'pubchem_cid', 'activity', 'n_measurements']:
+            df[col] = pd.NA
+        return df
+
+    LOG.info(f"\n🧪 STEP: Integrating IC50 data...")
     
     try:
         ic50_df = pd.read_csv(ic50_file)
-        print(f"   Loaded IC50 data: {len(ic50_df):,} measurements")
-        print(f"   Unique drugs: {ic50_df['drugbank_id'].nunique():,}")
-        print(f"   Unique targets: {ic50_df['uniprot_id'].nunique():,}")
+        LOG.info(f"   Loaded IC50 data: {len(ic50_df):,} measurements")
+        LOG.info(f"   Unique drugs: {ic50_df['drugbank_id'].nunique():,}")
+        LOG.info(f"   Unique targets: {ic50_df['uniprot_id'].nunique():,}")
         
         # Handle duplicates - keep best (lowest) IC50 per drug-target pair
         ic50_aggregated = ic50_df.groupby(['drugbank_id', 'uniprot_id']).agg({
@@ -981,21 +1036,21 @@ def integrate_ic50_data(df, ic50_file="/media/onur/Elements/cavity_space_consens
         }).reset_index()
         ic50_aggregated['n_measurements'] = ic50_df.groupby(['drugbank_id', 'uniprot_id']).size().values
         
-        print(f"   After aggregation: {len(ic50_aggregated):,} unique pairs")
+        LOG.info(f"   After aggregation: {len(ic50_aggregated):,} unique pairs")
         
         # Merge with docking data
         df = df.merge(ic50_aggregated, on=['drugbank_id', 'uniprot_id'], how='left')
         
         matched_ic50 = df['ic50_value'].notna().sum()
-        print(f"   Matched {matched_ic50:,} docking results with IC50 data")
-        print(f"   Coverage: {matched_ic50/len(df)*100:.2f}%")
+        LOG.info(f"   Matched {matched_ic50:,} docking results with IC50 data")
+        LOG.info(f"   Coverage: {matched_ic50/len(df)*100:.2f}%")
         
     except FileNotFoundError:
-        print(f"   ⚠️  IC50 file not found: {ic50_file}")
+        LOG.warning(f"   ⚠️  IC50 file not found: {ic50_file}")
         for col in ['ic50_value', 'ic50_unit', 'measurement_type', 'operator', 'pubchem_cid', 'activity', 'n_measurements']:
             df[col] = pd.NA
     except Exception as e:
-        print(f"   ⚠️  Error loading IC50 data: {e}")
+        LOG.warning(f"   ⚠️  Error loading IC50 data: {e}")
         for col in ['ic50_value', 'ic50_unit', 'measurement_type', 'operator', 'pubchem_cid', 'activity', 'n_measurements']:
             df[col] = pd.NA
     
@@ -1130,7 +1185,9 @@ def _process_dta_parquet_file(
         return None
 
 
-def integrate_dta_atlas_data(df, dta_dir=None):
+def integrate_dta_atlas_data(df, dta_dir=None, batch_size=DTA_ATLAS_BATCH_SIZE,
+                             max_workers=DTA_ATLAS_MAX_WORKERS,
+                             parallel=DTA_ATLAS_PARALLEL):
     """
     Integrate DTA-ATLAS binding affinity predictions.
 
@@ -1146,19 +1203,22 @@ def integrate_dta_atlas_data(df, dta_dir=None):
     if df.empty:
         return df
 
-    if dta_dir is None:
-        dta_dir = DTA_ATLAS_DIR
+    # No default directory: the old one was derived from the dead BASE_DIR and
+    # pointed inside another user's home. Unset means "this run has no DTA-ATLAS".
+    if not dta_dir:
+        LOG.info("\n🧬 STEP: no --dta-atlas-dir given; skipping DTA-ATLAS predictions")
+        return df
 
-    print(f"\n🧬 STEP: Integrating DTA-ATLAS predictions...")
-    print(f"   DTA-ATLAS directory: {dta_dir}")
+    LOG.info(f"\n🧬 STEP: Integrating DTA-ATLAS predictions...")
+    LOG.info(f"   DTA-ATLAS directory: {dta_dir}")
 
     if not os.path.exists(dta_dir):
-        print("   ⚠️  DTA-ATLAS directory not found, skipping")
+        LOG.warning("   ⚠️  DTA-ATLAS directory not found, skipping")
         return df
 
     # Determine which pairs we actually need
     if "drugbank_id" not in df.columns or "uniprot_id" not in df.columns:
-        print("   ⚠️  Missing join keys in docking dataframe, skipping DTA-ATLAS")
+        LOG.warning("   ⚠️  Missing join keys in docking dataframe, skipping DTA-ATLAS")
         return df
 
     needed_drugs = set(_normalize_identifier_series(df["drugbank_id"], uppercase=True).dropna().unique())
@@ -1172,16 +1232,16 @@ def integrate_dta_atlas_data(df, dta_dir=None):
     )
 
     if not needed_pairs:
-        print("   ⚠️  No valid (drugbank_id, uniprot_id) pairs found, skipping DTA-ATLAS")
+        LOG.warning("   ⚠️  No valid (drugbank_id, uniprot_id) pairs found, skipping DTA-ATLAS")
         return df
 
     parquet_files = sorted(glob.glob(os.path.join(dta_dir, "*.parquet")))
     if not parquet_files:
-        print(f"   ⚠️  No parquet files found in {dta_dir}")
+        LOG.warning(f"   ⚠️  No parquet files found in {dta_dir}")
         return df
 
-    print(f"   Docking pairs needed: {len(needed_pairs):,}")
-    print(f"   Scanning DTA-ATLAS shards: {len(parquet_files):,}")
+    LOG.info(f"   Docking pairs needed: {len(needed_pairs):,}")
+    LOG.info(f"   Scanning DTA-ATLAS shards: {len(parquet_files):,}")
 
     # Streaming aggregation across shards: keep only per-pair running sums/counts
     agg_sum = None
@@ -1189,9 +1249,9 @@ def integrate_dta_atlas_data(df, dta_dir=None):
     agg_rows = None
     agg_entry = None
 
-    batch_size = int(DTA_ATLAS_BATCH_SIZE)
-    max_workers = min(int(DTA_ATLAS_MAX_WORKERS), multiprocessing.cpu_count(), len(parquet_files))
-    if not DTA_ATLAS_PARALLEL:
+    batch_size = int(batch_size)
+    max_workers = min(int(max_workers), multiprocessing.cpu_count(), len(parquet_files))
+    if not parallel:
         max_workers = 1
 
     if max_workers <= 1:
@@ -1239,7 +1299,7 @@ def integrate_dta_atlas_data(df, dta_dir=None):
                     agg_entry = part["entry"] if agg_entry is None else agg_entry.combine_first(part["entry"])
 
     if agg_rows is None:
-        print("   ⚠️  No matching DTA-ATLAS records found for required pairs")
+        LOG.warning("   ⚠️  No matching DTA-ATLAS records found for required pairs")
         return df
 
     # Compute per-column means from sum/count
@@ -1254,36 +1314,76 @@ def integrate_dta_atlas_data(df, dta_dir=None):
             out[col] = (agg_sum[col] / denom).astype('float32')
 
     dta_agg = out.reset_index()
-    print(f"   Unique DTA pairs matched: {len(dta_agg):,}")
+    LOG.info(f"   Unique DTA pairs matched: {len(dta_agg):,}")
 
     before_cols = len(df.columns)
     df = df.merge(dta_agg, on=["drugbank_id", "uniprot_id"], how="left")
     after_cols = len(df.columns)
     matched = df["dta_n_rows"].notna().sum() if "dta_n_rows" in df.columns else 0
-    print(f"   Matched: {matched:,}/{len(df):,} ({matched/len(df)*100:.2f}%)")
-    print(f"   Columns: {before_cols} → {after_cols}")
+    LOG.info(f"   Matched: {matched:,}/{len(df):,} ({matched/len(df)*100:.2f}%)")
+    LOG.info(f"   Columns: {before_cols} → {after_cols}")
 
     return df
 
-def annotate_sample_types(df, metadata_file="/media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock/required_structures_with_negatives.csv"):
+#: The two spellings the sample-label table has been written in. The legacy
+#: required_structures_with_negatives.csv used the left-hand names; the rebuilt
+#: manifests/run_manifest.csv uses the right-hand ones. Accepting both is what
+#: lets --sample-metadata default to the current manifest without stranding the
+#: archived campaigns.
+_SAMPLE_METADATA_VOCABULARIES = (
+    {'accession': 'uniprot_id', 'cavity_index': 'cavity_index',
+     'drugbank_id': 'drugbank_id', 'sample_type': 'sample_type', 'gene': 'Gene_Name'},
+    {'UniProt_ID': 'uniprot_id', 'Cavity_Index': 'cavity_index',
+     'drugbank_id': 'drugbank_id', 'sample_type': 'sample_type', 'Gene_Name': 'Gene_Name'},
+)
+
+
+def normalize_sample_metadata(sample_metadata):
+    """Reduce either sample-label vocabulary to the columns the merge needs.
+
+    Raises ``KeyError`` naming the file's columns rather than merging on a key
+    that half exists -- an unlabelled sample_type column silently empties the
+    balancing step downstream.
+    """
+    for vocabulary in _SAMPLE_METADATA_VOCABULARIES:
+        if set(vocabulary).issubset(sample_metadata.columns):
+            return sample_metadata[list(vocabulary)].rename(columns=vocabulary)
+    raise KeyError(
+        "sample metadata has none of the known column vocabularies; it needs "
+        "either (%s) or (%s) but has (%s)"
+        % (", ".join(sorted(_SAMPLE_METADATA_VOCABULARIES[0])),
+           ", ".join(sorted(_SAMPLE_METADATA_VOCABULARIES[1])),
+           ", ".join(map(str, sample_metadata.columns))))
+
+
+def annotate_sample_types(df, metadata_file=None):
     """
     Annotate sample types (positive vs negative) based on metadata.
     Critical for distinguishing known interactions from random controls.
+
+    ``metadata_file`` is supplied by --sample-metadata; it used to default to one
+    past campaign's CSV, so --run-dir did not move it and a stale file mislabelled
+    positives and negatives without a word.
     """
     if df.empty:
         return df
-    
-    print(f"\n🏷️  STEP: Annotating sample types (positive vs negative)...")
-    
+
+    LOG.info(f"\n🏷️  STEP: Annotating sample types (positive vs negative)...")
+
+    if not metadata_file:
+        LOG.warning("   ⚠️  No sample metadata given (--sample-metadata); "
+                    "every sample_type will be NA and balancing will find nothing")
+        df['sample_type'] = pd.NA
+        df['Gene_Name'] = pd.NA
+        return df
+
     try:
         sample_metadata = pd.read_csv(metadata_file)
-        print(f"   Loaded {len(sample_metadata):,} rows from metadata")
-        
+        LOG.info(f"   Loaded {len(sample_metadata):,} rows from metadata")
+
         # Prepare metadata for merging
-        merge_metadata = sample_metadata[['UniProt_ID', 'drugbank_id', 'Cavity_Index', 'sample_type', 'Gene_Name']].rename(
-            columns={'UniProt_ID': 'uniprot_id', 'Cavity_Index': 'cavity_index'}
-        )
-        
+        merge_metadata = normalize_sample_metadata(sample_metadata)
+
         # Ensure cavity_index exists in df
         if 'extracted_cavity_index' in df.columns:
             df['cavity_index'] = df['extracted_cavity_index']
@@ -1305,24 +1405,25 @@ def annotate_sample_types(df, metadata_file="/media/onur/Elements/cavity_space_c
                 % (_before, len(df), len(df) - _before))
         
         annotated_rows = df['sample_type'].notna().sum()
-        print(f"   Annotated: {annotated_rows:,}/{len(df):,} ({annotated_rows/len(df)*100:.1f}%)")
+        LOG.info(f"   Annotated: {annotated_rows:,}/{len(df):,} ({annotated_rows/len(df)*100:.1f}%)")
         
         if annotated_rows > 0:
             sample_counts = df['sample_type'].value_counts()
-            print(f"   Sample type distribution:")
+            LOG.info(f"   Sample type distribution:")
             for sample_type, count in sample_counts.items():
-                print(f"      {sample_type}: {count:,}")
+                LOG.info(f"      {sample_type}: {count:,}")
         
-    except MergeFanOut:
+    except (MergeFanOut, KeyError):
         # Integrity failure, not a load failure. Degrading this to NA columns is
-        # how 410,087 duplicated rows reached the analysis unremarked.
+        # how 410,087 duplicated rows reached the analysis unremarked -- and a
+        # metadata file whose columns we cannot read is the same class of defect.
         raise
     except FileNotFoundError:
-        print(f"   ⚠️  Metadata file not found: {metadata_file}")
+        LOG.warning(f"   ⚠️  Metadata file not found: {metadata_file}")
         df['sample_type'] = pd.NA
         df['Gene_Name'] = pd.NA
     except Exception as e:
-        print(f"   ⚠️  Error loading metadata: {e}")
+        LOG.warning(f"   ⚠️  Error loading metadata: {e}")
         df['sample_type'] = pd.NA
         df['Gene_Name'] = pd.NA
     
@@ -1343,11 +1444,14 @@ def integrate_louvain_pocket_clusters(df, pocket_clusters_dir=None):
     if df.empty:
         return df
     
-    if pocket_clusters_dir is None:
-        pocket_clusters_dir = POCKET_CLUSTERS_DIR
-    
-    print(f"\n🔗 STEP: Integrating Louvain pocket cluster data...")
-    print(f"   Cluster directory: {pocket_clusters_dir}")
+    # Supplied by --pocket-clusters; there is no module-level default any more,
+    # because the old one was derived from a hardcoded run directory.
+    if not pocket_clusters_dir:
+        LOG.info("\n🔗 STEP: no --pocket-clusters given; skipping Louvain pocket clusters")
+        return df
+
+    LOG.info(f"\n🔗 STEP: Integrating Louvain pocket cluster data...")
+    LOG.info(f"   Cluster directory: {pocket_clusters_dir}")
     
     try:
         import re
@@ -1355,17 +1459,17 @@ def integrate_louvain_pocket_clusters(df, pocket_clusters_dir=None):
         
         cluster_dir = Path(pocket_clusters_dir)
         if not cluster_dir.exists():
-            print(f"   ⚠️  Cluster directory not found: {pocket_clusters_dir}")
+            LOG.warning(f"   ⚠️  Cluster directory not found: {pocket_clusters_dir}")
             return df
         
         # Find all cluster files
         cluster_files = sorted(cluster_dir.glob('pocket_louvain_clusters_*.csv'))
         
         if not cluster_files:
-            print(f"   ⚠️  No cluster files found in {pocket_clusters_dir}")
+            LOG.warning(f"   ⚠️  No cluster files found in {pocket_clusters_dir}")
             return df
         
-        print(f"   Found {len(cluster_files)} cluster files")
+        LOG.info(f"   Found {len(cluster_files)} cluster files")
         
         # Create pocket identifier column from source_dir if not exists
         # Format: AF-{uniprot_id}-F1-model_v1_cavity_{cavity_num}.pdb
@@ -1385,7 +1489,7 @@ def integrate_louvain_pocket_clusters(df, pocket_clusters_dir=None):
                 
                 df['pocket_id'] = df['source_dir'].apply(extract_pocket_id)
                 valid_pocket_ids = df['pocket_id'].notna().sum()
-                print(f"   Extracted pocket_id: {valid_pocket_ids:,} non-null values")
+                LOG.info(f"   Extracted pocket_id: {valid_pocket_ids:,} non-null values")
             else:
                 # Try to construct from uniprot_id and cavity_index
                 if 'uniprot_id' in df.columns and 'cavity_index' in df.columns:
@@ -1395,9 +1499,9 @@ def integrate_louvain_pocket_clusters(df, pocket_clusters_dir=None):
                         axis=1
                     )
                     valid_pocket_ids = df['pocket_id'].notna().sum()
-                    print(f"   Constructed pocket_id: {valid_pocket_ids:,} non-null values")
+                    LOG.info(f"   Constructed pocket_id: {valid_pocket_ids:,} non-null values")
                 else:
-                    print(f"   ⚠️  Cannot construct pocket_id - missing required columns")
+                    LOG.warning(f"   ⚠️  Cannot construct pocket_id - missing required columns")
                     return df
         
         # Load and merge each cluster file
@@ -1434,14 +1538,14 @@ def integrate_louvain_pocket_clusters(df, pocket_clusters_dir=None):
             
             matched = df[cluster_col_name].notna().sum()
             n_clusters = df[cluster_col_name].nunique()
-            print(f"   Pmax >= {pmax_val}: {matched:,} matched ({matched/len(df)*100:.1f}%), {n_clusters} unique clusters")
+            LOG.info(f"   Pmax >= {pmax_val}: {matched:,} matched ({matched/len(df)*100:.1f}%), {n_clusters} unique clusters")
         
         # Summary
         louvain_cols = [col for col in df.columns if col.startswith('louvain_cluster_pmax')]
-        print(f"   ✅ Added {len(louvain_cols)} Louvain cluster columns")
+        LOG.info(f"   ✅ Added {len(louvain_cols)} Louvain cluster columns")
         
     except Exception as e:
-        print(f"   ⚠️  Error integrating Louvain clusters: {e}")
+        LOG.warning(f"   ⚠️  Error integrating Louvain clusters: {e}")
         import traceback
         traceback.print_exc()
     
@@ -1456,17 +1560,17 @@ def filter_complete_tool_coverage(df):
     if df.empty:
         return df
     
-    print(f"\n🔍 STEP: Filtering for complete tool coverage...")
+    LOG.info(f"\n🔍 STEP: Filtering for complete tool coverage...")
     
     original_rows = len(df)
     
     # First filter for final_results source_type
     if 'source_type' in df.columns:
         df = df[df['source_type'] == 'final_results'].copy()
-        print(f"   After final_results filter: {len(df):,} ({len(df)/original_rows*100:.1f}%)")
+        LOG.info(f"   After final_results filter: {len(df):,} ({len(df)/original_rows*100:.1f}%)")
     
     if 'Tool1' not in df.columns or 'Tool2' not in df.columns:
-        print(f"   ⚠️  Tool columns not found, skipping coverage filter")
+        LOG.warning(f"   ⚠️  Tool columns not found, skipping coverage filter")
         return df
     
     # Define expected tools
@@ -1484,15 +1588,15 @@ def filter_complete_tool_coverage(df):
             complete_pairs.append((drug, target))
     
     if complete_pairs:
-        print(f"   Found {len(complete_pairs):,} pairs with complete tool coverage")
+        LOG.info(f"   Found {len(complete_pairs):,} pairs with complete tool coverage")
         
         # Filter for complete pairs
         pair_set = set(complete_pairs)
         df = df[df.apply(lambda row: (row['drugbank_id'], row['uniprot_id']) in pair_set, axis=1)].copy()
         
-        print(f"   After coverage filter: {len(df):,} ({len(df)/original_rows*100:.1f}%)")
+        LOG.info(f"   After coverage filter: {len(df):,} ({len(df)/original_rows*100:.1f}%)")
     else:
-        print(f"   ⚠️  No pairs with complete tool coverage found")
+        LOG.warning(f"   ⚠️  No pairs with complete tool coverage found")
     
     return df
 
@@ -1504,7 +1608,7 @@ def balance_positive_negative_samples(df):
     if df.empty or 'sample_type' not in df.columns:
         return df
     
-    print(f"\n⚖️  STEP: Balancing positive/negative samples per drug...")
+    LOG.info(f"\n⚖️  STEP: Balancing positive/negative samples per drug...")
     
     original_rows = len(df)
     
@@ -1521,7 +1625,7 @@ def balance_positive_negative_samples(df):
             n_neg = drug_data['sample_type'].str.contains('negative', na=False).sum()
             drugs_with_both.append((drug, min(n_pos, n_neg)))
     
-    print(f"   Drugs with both sample types: {len(drugs_with_both):,}")
+    LOG.info(f"   Drugs with both sample types: {len(drugs_with_both):,}")
     
     if drugs_with_both:
         # Balance samples for each drug
@@ -1543,37 +1647,40 @@ def balance_positive_negative_samples(df):
         
         df = pd.concat(balanced_chunks, ignore_index=True)
         
-        print(f"   After balancing: {len(df):,} ({len(df)/original_rows*100:.1f}%)")
+        LOG.info(f"   After balancing: {len(df):,} ({len(df)/original_rows*100:.1f}%)")
         
         # Verify balance
         final_counts = df['sample_type'].value_counts()
-        print(f"   Final distribution:")
+        LOG.info(f"   Final distribution:")
         for sample_type, count in final_counts.items():
-            print(f"      {sample_type}: {count:,}")
+            LOG.info(f"      {sample_type}: {count:,}")
     
     return df
 
-def export_prepared_data_optimized(df, output_dir="./"):
+def export_prepared_data_optimized(df, out_parquet):
     """
     Export final prepared data as a single Parquet file ready for analysis.
     No intermediate files - just the final analysis-ready dataset.
+
+    ``out_parquet`` is the full path of the analysis table (--out); the timestamped
+    summary JSON is written beside it. It is a required argument: the old
+    ``output_dir="./"`` default meant a caller who forgot still wrote *somewhere*.
     """
     if df.empty:
-        print("⚠️  No data to export")
+        LOG.warning("⚠️  No data to export")
         return {}
-    
-    print(f"\n💾 EXPORTING FINAL PREPARED DATA")
-    print(f"=" * 50)
-    
+
+    LOG.info(f"\n💾 EXPORTING FINAL PREPARED DATA")
+    LOG.info(f"=" * 50)
+
     export_start = time.time()
-    
-    # Create output directory if needed
-    if output_dir != "./":
+
+    final_parquet = os.path.abspath(out_parquet)
+    output_dir = os.path.dirname(final_parquet)
+    if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-    
-    # Define output path for final analysis-ready file
+
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    final_parquet = os.path.join(output_dir, "combined_filtered_annotated_docking_results.parquet")
     summary_path = os.path.join(output_dir, f"data_preparation_summary_{timestamp}.json")
     
     # Prepare export dataframe
@@ -1596,20 +1703,20 @@ def export_prepared_data_optimized(df, output_dir="./"):
     missing_cols = [col for col in required_columns if col not in export_df.columns]
     
     if missing_cols:
-        print(f"⚠️  Missing required columns: {missing_cols}")
+        LOG.warning(f"⚠️  Missing required columns: {missing_cols}")
         for col in missing_cols:
             export_df[col] = pd.NA
     
-    print(f"📊 Final dataset ready for export:")
-    print(f"   Records: {len(export_df):,}")
-    print(f"   Columns: {len(export_df.columns)}")
-    print(f"   Memory: {export_df.memory_usage(deep=True).sum() / (1024**2):.1f} MB")
+    LOG.info(f"📊 Final dataset ready for export:")
+    LOG.info(f"   Records: {len(export_df):,}")
+    LOG.info(f"   Columns: {len(export_df.columns)}")
+    LOG.info(f"   Memory: {export_df.memory_usage(deep=True).sum() / (1024**2):.1f} MB")
     
     # Export single Parquet file
-    print(f"\n💾 Saving final analysis-ready Parquet file...")
+    LOG.info(f"\n💾 Saving final analysis-ready Parquet file...")
     export_df.to_parquet(final_parquet, index=False)
     file_size_mb = os.path.getsize(final_parquet) / (1024**2)
-    print(f"   ✅ Saved: {final_parquet} ({file_size_mb:.1f} MB)")
+    LOG.info(f"   ✅ Saved: {final_parquet} ({file_size_mb:.1f} MB)")
     
     # Export summary
     summary = generate_data_summary(export_df)
@@ -1638,11 +1745,11 @@ def export_prepared_data_optimized(df, output_dir="./"):
     
     export_time = time.time() - export_start
     
-    print(f"\n✅ Export completed in {export_time:.2f} seconds")
-    print(f"📄 Files created:")
-    print(f"   Final Parquet: {final_parquet}")
-    print(f"   Summary: {summary_path}")
-    print(f"\n🎯 Dataset is now ready for analysis workflows!")
+    LOG.info(f"\n✅ Export completed in {export_time:.2f} seconds")
+    LOG.info(f"📄 Files created:")
+    LOG.info(f"   Final Parquet: {final_parquet}")
+    LOG.info(f"   Summary: {summary_path}")
+    LOG.info(f"\n🎯 Dataset is now ready for analysis workflows!")
     
     return {
         'parquet_path': final_parquet,
@@ -1650,151 +1757,314 @@ def export_prepared_data_optimized(df, output_dir="./"):
         'analysis_ready': True
     }
 
+class DiscoveryShortfall(Exception):
+    """Discovery found fewer jobs than the manifest says exist.
+
+    The 2025-06-29 campaign lost 14,173 of 24,173 job directories to a file cap
+    and nobody noticed, because a short pass and a complete pass look identical
+    once the parquet is written. Checking against the manifest is the only way to
+    tell them apart, so a shortfall stops the run instead of annotating it.
+    """
+
+
+def job_directory_of(path):
+    """The job directory a result file belongs to, or ``None``.
+
+    Per-tool results live one level deeper (``<job>/smina/results.csv``), so the
+    immediate parent is not always the job: walk up until a component parses as a
+    job directory name.
+    """
+    current = os.path.dirname(os.path.abspath(path))
+    while current and current != os.path.dirname(current):
+        name = os.path.basename(current)
+        if parse_job_dir_name(name):
+            return name
+        current = os.path.dirname(current)
+    return None
+
+
+def check_discovery_against_manifest(result_files, manifest_path, allow_shortfall=False):
+    """Compare discovered job directories with ``run_manifest.csv``.
+
+    Returns the (discovered, expected) counts. Raises :class:`DiscoveryShortfall`
+    when fewer jobs were discovered than the manifest declares, unless
+    ``allow_shortfall`` (--allow-discovery-shortfall) says a partial pass is
+    deliberate.
+    """
+    discovered = set()
+    unidentified = 0
+    for files in result_files.values():
+        for path in files:
+            job = job_directory_of(path)
+            if job is None:
+                unidentified += 1
+            else:
+                discovered.add(job)
+
+    manifest = pd.read_csv(manifest_path)
+    key = 'job_id' if 'job_id' in manifest.columns else manifest.columns[0]
+    expected = int(manifest[key].nunique())
+
+    LOG.info(f"\n🧾 Manifest check ({manifest_path}):")
+    LOG.info(f"   Jobs in manifest: {expected:,}")
+    LOG.info(f"   Job directories discovered: {len(discovered):,}")
+    if unidentified:
+        LOG.warning(f"   ⚠️  {unidentified:,} result files sit in no recognisable "
+                    f"job directory and are not counted here")
+
+    if len(discovered) < expected:
+        message = (
+            "discovery found %d job directories but %s declares %d. %d jobs are "
+            "missing from the analysis table." % (
+                len(discovered), manifest_path, expected, expected - len(discovered)))
+        if not allow_shortfall:
+            raise DiscoveryShortfall(
+                message + " Re-run discovery, or pass --allow-discovery-shortfall "
+                "if this partial pass is deliberate.")
+        LOG.warning(f"   ⚠️  {message} (allowed by --allow-discovery-shortfall)")
+    else:
+        LOG.info("   ✅ Discovery covers the manifest")
+    return len(discovered), expected
+
+
 def build_parser():
     """CLI. Without one this script scanned its hardcoded BASE_DIR regardless of
-    what the caller passed -- so the workflow's --run-dir was ignored and Phase 7
-    read the wrong tree entirely."""
+    what the caller passed -- so the workflow's --run-dir was ignored and Phase 8
+    read the wrong tree entirely. Three of the four original flags were declared
+    and never read, which is the same lie in the opposite direction."""
     import argparse
     parser = argparse.ArgumentParser(
         description="Parse docking results into the analysis table.")
-    parser.add_argument("--run-dir", default=None,
-                        help="run directory; results are read from <run-dir>/docking_results")
+    parser.add_argument("--run-dir", required=True,
+                        help=("campaign run directory. Every other path below "
+                              "defaults to the standard layout underneath it"))
     parser.add_argument("--results-dir", default=None,
-                        help="explicit results tree (overrides --run-dir)")
-    parser.add_argument("--out", default=None, help="output parquet")
+                        help=("docking output tree to discover results in. "
+                              "Default: <run-dir>/" + RESULTS_SUBDIR + ". Discovery "
+                              "used to search the PARENT of the run directory, so a "
+                              "run beside other campaigns ingested their jobs"))
+    parser.add_argument("--out", default=None,
+                        help=("output parquet; the timestamped summary JSON is "
+                              "written beside it. Default: <run-dir>/"
+                              + OUTPUT_PARQUET_BASENAME))
     parser.add_argument("--manifest", default=None,
                         help=("run_manifest.csv to check discovery against. Discovery "
                               "finding fewer jobs than the manifest is the failure that "
-                              "silently dropped 58%% of the last campaign."))
+                              "silently dropped 58%% of the last campaign. Default: no "
+                              "check, with a warning"))
+    parser.add_argument("--allow-discovery-shortfall", action="store_true",
+                        help=("continue when discovery finds fewer jobs than "
+                              "--manifest declares; for a deliberate partial pass"))
+    parser.add_argument("--sample-metadata", default=None,
+                        help=("CSV labelling each (drug, target, cavity) positive or "
+                              "negative -- the input to balancing. Accepts the "
+                              "run_manifest vocabulary and the legacy "
+                              "required_structures_with_negatives one. Default: "
+                              "<run-dir>/" + os.path.join(MANIFESTS_SUBDIR,
+                                                          RUN_MANIFEST_BASENAME)))
+    parser.add_argument("--cavity-clusters", default=DEFAULT_CAVITY_CLUSTER_FILE,
+                        help=("CavitySpace cavity-cluster table. The '07' in the "
+                              "default filename is a similarity threshold, so this is "
+                              "a science parameter. Default: "
+                              + DEFAULT_CAVITY_CLUSTER_FILE))
+    parser.add_argument("--ic50-mapping", default=None,
+                        help=("create_ic50_mapping.py output (TTD IC50/Ki values). "
+                              "Default: <run-dir>/" + IC50_BASENAME))
+    parser.add_argument("--pocket-clusters", default=None,
+                        help=("pocketmatch_clustering.py output directory "
+                              "(pocket_louvain_clusters_*.csv). Default: <run-dir>/"
+                              + POCKET_CLUSTERS_SUBDIR))
+    parser.add_argument("--dta-atlas-dir", default=None,
+                        help=("directory of DTA-ATLAS parquet shards. No default: the "
+                              "old one was derived from a dead run directory. Unset "
+                              "skips the affinity-prediction annotation"))
+    parser.add_argument("--dta-batch-size", type=int, default=DTA_ATLAS_BATCH_SIZE,
+                        help=("rows per batch when scanning a DTA-ATLAS shard "
+                              "(default: %d)" % DTA_ATLAS_BATCH_SIZE))
+    parser.add_argument("--dta-workers", type=int, default=DTA_ATLAS_MAX_WORKERS,
+                        help=("processes scanning DTA-ATLAS shards; lower it if the "
+                              "disk thrashes (default: %d)" % DTA_ATLAS_MAX_WORKERS))
+    parser.add_argument("--no-dta-parallel", action="store_true",
+                        help="scan DTA-ATLAS shards one at a time, ignoring --dta-workers")
+    parser.add_argument("--search-workers", type=int, default=DEFAULT_MAX_WORKERS_SEARCH,
+                        help=("processes walking the results tree during discovery "
+                              "(default: %d, capped at the CPU count)"
+                              % DEFAULT_MAX_WORKERS_SEARCH))
+    parser.add_argument("--load-workers", type=int, default=DEFAULT_MAX_WORKERS_LOAD,
+                        help=("processes reading result CSVs; I/O bound, so more is "
+                              "not always faster (default: %d, capped at the CPU "
+                              "count)" % DEFAULT_MAX_WORKERS_LOAD))
+    parser.add_argument("--file-cap", type=int, default=FILE_DISCOVERY_CAP,
+                        help=("stop discovery after this many files per pattern. "
+                              "Default: no cap. The 2025-06-29 run set 10000 here and "
+                              "lost 58%% of the campaign in silence -- set it only for "
+                              "a deliberate partial pass"))
+    add_runtime_arguments(parser, STEP_NAME)
     return parser
+
+
+def resolve_paths(args):
+    """Fill in every unset path from --run-dir and absolutise it, in one place."""
+    run_dir = os.path.abspath(args.run_dir)
+    args.run_dir = run_dir
+    if not args.results_dir:
+        args.results_dir = os.path.join(run_dir, RESULTS_SUBDIR)
+    if not args.out:
+        args.out = os.path.join(run_dir, OUTPUT_PARQUET_BASENAME)
+    if not args.sample_metadata:
+        args.sample_metadata = os.path.join(run_dir, MANIFESTS_SUBDIR,
+                                            RUN_MANIFEST_BASENAME)
+    if not args.ic50_mapping:
+        args.ic50_mapping = os.path.join(run_dir, IC50_BASENAME)
+    if not args.pocket_clusters:
+        args.pocket_clusters = os.path.join(run_dir, POCKET_CLUSTERS_SUBDIR)
+    return args
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    global BASE_DIR, POCKET_CLUSTERS_DIR
-    if args.run_dir:
-        BASE_DIR = os.path.abspath(args.run_dir)
-        POCKET_CLUSTERS_DIR = os.path.join(BASE_DIR, "pocketmatch_results", "pocket_clusters")
-        print("run directory: %s" % BASE_DIR)
-    return _main_impl(args)
+    resolve_paths(args)
+    resolve_out_dir(args, STEP_NAME, args.run_dir)
+    with step(STEP_NAME, args):
+        return _main_impl(args)
 
 
-def _main_impl(args=None):
+def _main_impl(args):
     """
     Main execution function with comprehensive performance monitoring.
     Now includes all notebook processing steps for complete analysis-ready data.
     """
     total_start_time = time.time()
     
-    print("🚀 COMPREHENSIVE CONSENSUS DOCKING DATA PREPARATION")
-    print("=" * 60)
-    print("This script integrates all preprocessing steps:")
-    print("  ✓ Data loading and cleaning")
-    print("  ✓ Tool-specific score columns")
-    print("  ✓ Cavity cluster integration")
-    print("  ✓ IC50 experimental data")
-    print("  ✓ Sample type annotation")
-    print("  ✓ Louvain pocket cluster integration (PocketMatch)")
-    print("  ✓ Complete tool coverage filtering")
-    print("  ✓ Balanced positive/negative sampling")
-    print("=" * 60)
+    LOG.info("🚀 COMPREHENSIVE CONSENSUS DOCKING DATA PREPARATION")
+    LOG.info("=" * 60)
+    LOG.info("This script integrates all preprocessing steps:")
+    LOG.info("  ✓ Data loading and cleaning")
+    LOG.info("  ✓ Tool-specific score columns")
+    LOG.info("  ✓ Cavity cluster integration")
+    LOG.info("  ✓ IC50 experimental data")
+    LOG.info("  ✓ Sample type annotation")
+    LOG.info("  ✓ Louvain pocket cluster integration (PocketMatch)")
+    LOG.info("  ✓ Complete tool coverage filtering")
+    LOG.info("  ✓ Balanced positive/negative sampling")
+    LOG.info("=" * 60)
     
     system_info = get_system_info()
-    print(f"💻 System: {system_info['cpu_count']} cores, {system_info['memory_gb']:.1f}GB RAM")
-    print(f"💾 Available: {system_info['available_memory_gb']:.1f}GB")
+    LOG.info(f"💻 System: {system_info['cpu_count']} cores, {system_info['memory_gb']:.1f}GB RAM")
+    LOG.info(f"💾 Available: {system_info['available_memory_gb']:.1f}GB")
     
-    print(f"\n📁 Using BASE_DIR: {BASE_DIR}")
-    
+    LOG.info(f"\n📁 Run directory: {args.run_dir}")
+    LOG.info(f"📁 Results tree:  {args.results_dir}")
+
     # Step 1: File Discovery
-    print(f"\n{'='*60}")
-    print(f"PHASE 1: FILE DISCOVERY")
-    print(f"{'='*60}")
-    # Search in parent directory to find all consensus docking files
-    search_dir = os.path.dirname(BASE_DIR)
+    LOG.info(f"\n{'='*60}")
+    LOG.info(f"PHASE 1: FILE DISCOVERY")
+    LOG.info(f"{'='*60}")
+    # Search the run's own results tree. This used to search os.path.dirname of
+    # the run directory, so a run sitting beside other campaigns silently ingested
+    # their job folders.
+    if not os.path.isdir(args.results_dir):
+        LOG.error("❌ Results tree not found: %s", args.results_dir)
+        LOG.error("   batch_dock.py must run first, or pass --results-dir.")
+        raise SystemExit(2)
+
     result_files = find_consensus_results_files_optimized(
-        base_directory=search_dir,
-        max_workers=min(multiprocessing.cpu_count(), 12)
+        base_directory=args.results_dir,
+        max_workers=min(multiprocessing.cpu_count(), args.search_workers),
+        file_cap=args.file_cap
     )
-    
+
     total_files = sum(len(files) for files in result_files.values())
     if total_files == 0:
-        print("❌ No consensus docking files found. Exiting.")
-        return
-    
+        LOG.error("❌ No consensus docking files found. Exiting.")
+        raise SystemExit(1)
+
+    if args.manifest:
+        check_discovery_against_manifest(
+            result_files, args.manifest,
+            allow_shortfall=args.allow_discovery_shortfall)
+    else:
+        LOG.warning("   ⚠️  No --manifest given: discovery is unchecked. A short "
+                    "pass and a complete pass look identical from here.")
+
     # Step 2: Data Loading
-    print(f"\n{'='*60}")
-    print(f"PHASE 2: DATA LOADING")
-    print(f"{'='*60}")
+    LOG.info(f"\n{'='*60}")
+    LOG.info(f"PHASE 2: DATA LOADING")
+    LOG.info(f"{'='*60}")
     consensus_data = load_consensus_data_optimized(
-        result_files, 
-        max_workers=min(8, system_info['cpu_count'])
+        result_files,
+        max_workers=min(args.load_workers, system_info['cpu_count'])
     )
-    
+
     if consensus_data.empty:
-        print("❌ No data could be loaded. Exiting.")
-        return
-    
+        LOG.error("❌ No data could be loaded. Exiting.")
+        raise SystemExit(1)
+
     # Step 3: Data Cleaning
-    print(f"\n{'='*60}")
-    print(f"PHASE 3: DATA CLEANING")
-    print(f"{'='*60}")
+    LOG.info(f"\n{'='*60}")
+    LOG.info(f"PHASE 3: DATA CLEANING")
+    LOG.info(f"{'='*60}")
     cleaned_data = clean_and_prepare_data_optimized(consensus_data)
     
     # Phase 4: FILTERING & BALANCING (before heavy annotations)
-    print(f"\n{'='*60}")
-    print(f"PHASE 4: FILTERING & BALANCING")
-    print(f"{'='*60}")
+    LOG.info(f"\n{'='*60}")
+    LOG.info(f"PHASE 4: FILTERING & BALANCING")
+    LOG.info(f"{'='*60}")
 
     # Needed for balancing
-    cleaned_data = annotate_sample_types(cleaned_data)
+    cleaned_data = annotate_sample_types(cleaned_data, metadata_file=args.sample_metadata)
 
     # Reduce dataset early to avoid OOM during heavy annotations
     cleaned_data = filter_complete_tool_coverage(cleaned_data)
     cleaned_data = balance_positive_negative_samples(cleaned_data)
 
     # Phase 5: ENRICHMENT & ANNOTATION (apply only to final set)
-    print(f"\n{'='*60}")
-    print(f"PHASE 5: ENRICHMENT & ANNOTATION")
-    print(f"{'='*60}")
+    LOG.info(f"\n{'='*60}")
+    LOG.info(f"PHASE 5: ENRICHMENT & ANNOTATION")
+    LOG.info(f"{'='*60}")
 
-    cleaned_data = integrate_dta_atlas_data(cleaned_data)
+    cleaned_data = integrate_dta_atlas_data(
+        cleaned_data,
+        dta_dir=args.dta_atlas_dir,
+        batch_size=args.dta_batch_size,
+        max_workers=args.dta_workers,
+        parallel=not args.no_dta_parallel,
+    )
     cleaned_data = add_tool_specific_scores(cleaned_data)
-    cleaned_data = integrate_cavity_clusters(cleaned_data)
-    cleaned_data = integrate_ic50_data(cleaned_data)
-    cleaned_data = integrate_louvain_pocket_clusters(cleaned_data, POCKET_CLUSTERS_DIR)
-    
+    cleaned_data = integrate_cavity_clusters(cleaned_data, cluster_file=args.cavity_clusters)
+    cleaned_data = integrate_ic50_data(cleaned_data, ic50_file=args.ic50_mapping)
+    cleaned_data = integrate_louvain_pocket_clusters(cleaned_data, args.pocket_clusters)
+
     # Step 11: Data Export
-    print(f"\n{'='*60}")
-    print(f"PHASE 6: FINAL EXPORT")
-    print(f"{'='*60}")
-    export_results = export_prepared_data_optimized(cleaned_data, output_dir=BASE_DIR)
+    LOG.info(f"\n{'='*60}")
+    LOG.info(f"PHASE 6: FINAL EXPORT")
+    LOG.info(f"{'='*60}")
+    export_results = export_prepared_data_optimized(cleaned_data, args.out)
     
     # Final Performance Summary
     total_time = time.time() - total_start_time
     
-    print(f"\n🎉 PROCESSING COMPLETE!")
-    print(f"=" * 60)
-    print(f"⏱️  Total execution time: {total_time:.2f} seconds ({total_time/60:.1f} minutes)")
-    print(f"📊 Final records: {len(cleaned_data):,}")
-    print(f"⚡ Processing rate: {len(cleaned_data)/total_time:,.0f} records/sec")
-    print(f"💾 Memory usage: {cleaned_data.memory_usage(deep=True).sum() / (1024**2):.1f} MB")
+    LOG.info(f"\n🎉 PROCESSING COMPLETE!")
+    LOG.info(f"=" * 60)
+    LOG.info(f"⏱️  Total execution time: {total_time:.2f} seconds ({total_time/60:.1f} minutes)")
+    LOG.info(f"📊 Final records: {len(cleaned_data):,}")
+    LOG.info(f"⚡ Processing rate: {len(cleaned_data)/total_time:,.0f} records/sec")
+    LOG.info(f"💾 Memory usage: {cleaned_data.memory_usage(deep=True).sum() / (1024**2):.1f} MB")
     
     if export_results.get('analysis_ready'):
-        print(f"\n✅ Analysis-ready file created!")
-        print(f"📁 Output: {export_results['parquet_path']}")
-        print(f"\n🚀 You can now run analysis notebooks directly!")
-        print(f"   No need to run notebook preprocessing steps.")
-    
-    return cleaned_data, export_results
+        LOG.info(f"\n✅ Analysis-ready file created!")
+        LOG.info(f"📁 Output: {export_results['parquet_path']}")
+        LOG.info(f"\n🚀 You can now run analysis notebooks directly!")
+        LOG.info(f"   No need to run notebook preprocessing steps.")
+
+    return 0
 
 if __name__ == "__main__":
     try:
-        cleaned_data, export_results = main()
+        # Anything else propagates: step() has already logged the traceback and
+        # sent the failure notification, and a non-zero exit is what the workflow
+        # runner reads.
+        sys.exit(main())
     except KeyboardInterrupt:
-        print("\n⚠️  Process interrupted by user")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
-        import traceback
-        traceback.print_exc()
+        LOG.warning("\n⚠️  Process interrupted by user")
         sys.exit(1)

@@ -53,9 +53,14 @@ SCRIPT = os.path.join(REPO_ROOT, "sample_negatives.py")
 
 
 def setUpModule() -> None:
-    """Silence the CLI's logging; ``main()`` calls ``basicConfig`` itself."""
-    logging.basicConfig(level=logging.CRITICAL)
-    logging.getLogger().setLevel(logging.CRITICAL)
+    """Silence this step's logging without touching the root logger.
+
+    This used to call ``logging.basicConfig``, on the strength of a comment that
+    said ``main()`` did too. It no longer does -- nothing in the repo configures
+    logging at import any more -- and the root handler that call installed was
+    what made every other step's records reappear on the console.
+    """
+    logging.getLogger("sample_negatives").setLevel(logging.CRITICAL)
 
 
 # --------------------------------------------------------------------------

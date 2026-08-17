@@ -76,6 +76,16 @@ Usage (``REBUILD_PLAN.md`` Phase 2)::
         --out-map      $NEW/manifests/job_classification.csv \\
         --out-pool     $NEW/manifests/negatives_pool.csv
 
+The shared runtime flags apply (``--out-dir``, ``--log-file``, ``--log-level``,
+``--quiet``, ``--notify``, ``--notify-on``, ``--notify-title``).  The log goes to
+``<run-dir>/steps/classify_existing/classify_existing.log``, where the run
+directory is the parent of ``--out-map``'s directory -- never under ``$OLD``, and
+never in the invocation directory.  A 24k-directory scan over a USB disk takes
+long enough to be worth a notification::
+
+    PUSHOVER_TOKEN=... PUSHOVER_USER_KEY=... \\
+        python $REPO/classify_existing.py --notify --notify-on all ...
+
 Python 3.9 compatible: no PEP 604 unions at runtime, no ``match``.
 """
 
@@ -115,6 +125,7 @@ from dock_selectivity.jobid import (
     parse_legacy_job_dir,
 )
 from dock_selectivity.joins import checked_merge_with_report
+from dock_selectivity.runtime import add_runtime_arguments, resolve_out_dir, step
 
 __all__ = [
     "CLASSIFICATIONS",
@@ -134,9 +145,15 @@ __all__ = [
     "negatives_pool_frame",
     "run_scan",
     "main",
+    "STEP_NAME",
 ]
 
-logger = logging.getLogger("classify_existing")
+#: Names the logger, the log file and the step directory
+#: (``<run-dir>/steps/classify_existing/classify_existing.log``). One string, so
+#: they cannot drift apart.
+STEP_NAME = "classify_existing"
+
+logger = logging.getLogger(STEP_NAME)
 
 # --------------------------------------------------------------------------
 # vocabulary -- kept in lockstep with dock_selectivity.schemas
@@ -1496,23 +1513,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="override the git revision recorded in the summary.",
     )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
-        help="Default: INFO",
-    )
+    add_runtime_arguments(parser, STEP_NAME)
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        stream=sys.stderr,
-    )
     manifests_dir = os.path.dirname(os.path.abspath(args.out_map))
+    # --out-map is <run-dir>/manifests/job_classification.csv, so the run
+    # directory is one level above it. Never $OLD: nothing this script runs may
+    # write there, its own log included.
+    resolve_out_dir(args, STEP_NAME, os.path.dirname(manifests_dir))
+    with step(STEP_NAME, args) as ctx:
+        return _classify(args, ctx, manifests_dir)
+
+
+def _classify(args: Any, ctx: Any, manifests_dir: str) -> int:
+    """The body of :func:`main`, inside the step's logging and notifications."""
     summary_path = args.out_summary or os.path.join(manifests_dir, DEFAULT_SUMMARY_NAME)
     evidence_path = args.out_evidence or (
         os.path.splitext(os.path.abspath(args.out_map))[0] + ".evidence.csv"
@@ -1523,7 +1540,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             manifests_dir, DEFAULT_CHECKPOINT_NAME
         )
     try:
-        run_scan(
+        result = run_scan(
             existing_results=args.existing_results,
             index_path=args.index,
             interactions_path=args.interactions,
@@ -1542,7 +1559,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     except FATAL_ERRORS as exc:
         logger.error("%s", exc)
+        ctx.notify("failure", "classify_existing: {0}".format(exc), priority=1)
         return 1
+    counts = result.counts()
+    ctx.notify("success",
+               "classify_existing: {0} job(s) classified ({1} true_positive, "
+               "{2} valid_non_interaction)".format(
+                   sum(counts.values()), counts.get(TRUE_POSITIVE, 0),
+                   counts.get(VALID_NON_INTERACTION, 0)))
     return 0
 
 

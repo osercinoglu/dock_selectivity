@@ -5,11 +5,22 @@
 program those gates run.  It reads; it never writes anything except the optional
 ``--json`` report, and it never touches ``$OLD``.
 
+Usage::
+
     python3 audit.py identity --index $NEW/identity/identity_index.parquet
     python3 audit.py curated  --dir   $NEW/docking_results \\
                               --manifest $NEW/manifests/run_manifest.csv \\
                               --index  $NEW/identity/identity_index.parquet
-    python3 audit.py run      --run-dir $NEW
+    python3 audit.py run      --run-dir $NEW --json $NEW/analysis/audit.json
+
+The shared runtime flags (``--out-dir``, ``--log-file``, ``--log-level``,
+``--quiet``, ``--notify``, ``--notify-on``, ``--notify-title``) are accepted
+before the subcommand.  The run log goes to ``<run-dir>/steps/audit/audit.log``;
+with no ``--run-dir`` the run directory is inferred from ``--dir`` or ``--index``
+so a log never lands in the invocation directory::
+
+    PUSHOVER_TOKEN=... PUSHOVER_USER_KEY=... \\
+        python3 audit.py --notify --notify-on all run --run-dir $NEW
 
 Why an auditor at all
 ---------------------
@@ -67,6 +78,11 @@ from dock_selectivity.jobid import (  # noqa: E402
     format_job_dir,
     read_job_identity_record,
 )
+from dock_selectivity.runtime import (  # noqa: E402
+    add_runtime_arguments,
+    resolve_out_dir,
+    step,
+)
 from dock_selectivity.schemas import SchemaViolation, read_checked  # noqa: E402
 
 __all__ = [
@@ -82,9 +98,14 @@ __all__ = [
     "format_table",
     "exit_code",
     "main",
+    "STEP_NAME",
 ]
 
-logger = logging.getLogger("audit")
+#: Names the logger, the log file and the step directory
+#: (``<run-dir>/steps/audit/audit.log``). One string, so they cannot drift.
+STEP_NAME = "audit"
+
+logger = logging.getLogger(STEP_NAME)
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -1388,9 +1409,14 @@ def _add_common(parser: argparse.ArgumentParser, suppress: bool) -> None:
         help="exit 0 even if some checks could not run",
         **common
     )
-    parser.add_argument(
-        "--quiet", action="store_true", help="warnings and errors only", **common
-    )
+    if suppress:
+        # --quiet belongs to the shared runtime and is declared once, on the
+        # top-level parser. The subcommand still needs a suppressed copy so that
+        # `audit.py run --quiet` keeps working without overwriting the value the
+        # top-level parser already resolved.
+        parser.add_argument(
+            "--quiet", action="store_true", help="warnings and errors only", **common
+        )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1461,16 +1487,55 @@ def _build_parser() -> argparse.ArgumentParser:
 
     for subparser in (identity, curated, run):
         _add_common(subparser, suppress=True)
+    add_runtime_arguments(parser, STEP_NAME)
     return parser
+
+
+def infer_run_dir(args: Any) -> Optional[str]:
+    """Which run directory this invocation is about, for the log's sake only.
+
+    ``audit run`` says so directly.  The other two subcommands name an artifact
+    inside a run directory instead, and the layout is fixed, so the run directory
+    is one level up from ``docking_results/`` and two up from
+    ``identity/identity_index.parquet``.  Nothing here is written except the log:
+    an auditor that could not find a run directory still audits, it just logs
+    into ``--out-dir``.
+    """
+    run_dir = getattr(args, "run_dir", None)
+    if run_dir:
+        return os.path.abspath(run_dir)
+    curated_dir = getattr(args, "curated_dir", None)
+    if curated_dir:
+        return os.path.dirname(os.path.abspath(curated_dir))
+    index = getattr(args, "index", None)
+    if index:
+        return os.path.dirname(os.path.dirname(os.path.abspath(index)))
+    return None
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.WARNING if args.quiet else logging.INFO,
-        format="%(levelname)s %(name)s: %(message)s",
-    )
+    resolve_out_dir(args, STEP_NAME, infer_run_dir(args))
+    with step(STEP_NAME, args) as ctx:
+        results = _run_command(args)
+        sys.stdout.write(format_table(results))
+        if args.json_out:
+            write_invariant_report([r.to_dict() for r in results], args.json_out)
+        code = exit_code(results, allow_skips=args.allow_skips)
+        if code:
+            # A STOP gate that did not clear is exactly the thing worth a phone
+            # buzz: the run after it is about to be built on a broken premise.
+            ctx.notify("failure",
+                       "audit {0}: exit {1} ({2} FAIL, {3} SKIP)".format(
+                           args.command, code,
+                           sum(1 for r in results if r.status == FAIL),
+                           sum(1 for r in results if r.status == SKIP)),
+                       priority=1)
+        return code
 
+
+def _run_command(args: Any) -> List["CheckResult"]:
+    """Dispatch one subcommand. Split out so :func:`main` reads as one flow."""
     if args.command == "identity":
         results = audit_identity(
             args.index,
@@ -1496,11 +1561,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             check_excluded=not args.no_check_excluded,
             expect=args.expect,
         )
-
-    sys.stdout.write(format_table(results))
-    if args.json_out:
-        write_invariant_report([r.to_dict() for r in results], args.json_out)
-    return exit_code(results, allow_skips=args.allow_skips)
+    return results
 
 
 if __name__ == "__main__":  # pragma: no cover

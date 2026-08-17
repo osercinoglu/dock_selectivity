@@ -1,22 +1,44 @@
 #!/usr/bin/env python3
 """
-PocketMatch Clustering Script
+PocketMatch clustering -- Louvain communities over pocket similarity scores.
 
-This script performs Louvain community detection on pocket similarity data.
-It handles:
-1. Converting CSV files to Parquet format (if not already done)
-2. Loading Parquet files into memory
-3. Running Louvain community detection at multiple Pmax thresholds
-4. Exporting results as GEXF (for Gephi) and CSV files
+Optional side branch of the campaign: it is not one of ``run_full_workflow.py``'s
+phases. ``parse_prepare.py`` is nevertheless a *consumer* of its output -- it joins
+``pocket_louvain_clusters_*.csv`` onto the docking table -- so this stage must run
+before phase 8 if you want the ``louvain_cluster_*`` columns populated.
 
-Usage:
-    python pocketmatch_clustering.py [--csv-dir PATH] [--output-dir PATH]
+Prerequisites
+    ``get_PM_scores.py`` has produced ``similarities_part_*.csv`` under
+    ``<run-dir>/pocketmatch_results/PocketMatch_similarities``.
+
+Inputs
+    --csv-dir       PocketMatch similarity CSVs (default <run-dir>/pocketmatch_results/PocketMatch_similarities)
+    --parquet-dir   where the CSV->Parquet conversion is cached (default <run-dir>/pocketmatch_results/parquet_data)
+
+Outputs
+    --output-dir    pocket_louvain_clusters_<pmax>.csv and pocket_network_louvain_<pmax>.gexf
+                    (default <run-dir>/pocketmatch_results/pocket_clusters -- the path
+                    parse_prepare.py --pocket-clusters defaults to)
+    <out-dir>/pocketmatch_clustering.log  the run log (see --out-dir)
+
+Usage::
+
+    python3 pocketmatch_clustering.py --run-dir /data/runs/2026_08_run
+
+    # explicit locations, a single threshold, notify on failure
+    python3 pocketmatch_clustering.py \
+        --csv-dir  ./pocketmatch_results/PocketMatch_similarities \
+        --parquet-dir ./pocketmatch_results/parquet_data \
+        --output-dir ./pocketmatch_results/pocket_clusters \
+        --pmax-thresholds 0.5 --resolution 1.2 --notify
 """
 
 import argparse
 import gc
+import logging
 import os
 import re
+import sys
 import warnings
 from collections import Counter
 from pathlib import Path
@@ -30,7 +52,36 @@ import pyarrow.parquet as pq
 from community import community_louvain
 from tqdm import tqdm
 
+from dock_selectivity.runtime import add_runtime_arguments, resolve_out_dir, step
+
 warnings.filterwarnings('ignore')
+
+STEP_NAME = "pocketmatch_clustering"
+
+#: Configured by ``main()`` through the shared runtime; a bare import attaches no
+#: handler, so importing this module still logs nowhere.
+LOG = logging.getLogger(STEP_NAME)
+
+
+# --- Configuration ------------------------------------------------------------
+# Every value below is a default for a flag of the same name, never a fixed
+# setting: a run directory belongs on the command line, not in the source.
+
+#: Layout under --run-dir. get_PM_scores.py writes the similarities here and
+#: parse_prepare.py --pocket-clusters reads the clusters back from here.
+SIMILARITIES_SUBDIR = os.path.join("pocketmatch_results", "PocketMatch_similarities")
+PARQUET_SUBDIR = os.path.join("pocketmatch_results", "parquet_data")
+CLUSTERS_SUBDIR = os.path.join("pocketmatch_results", "pocket_clusters")
+
+DEFAULT_MAX_MEMORY_MB = 8000
+DEFAULT_MIN_AVAILABLE_MB = 2000
+DEFAULT_CSV_CHUNK_ROWS = 100_000
+DEFAULT_RESOLUTION = 1.5
+DEFAULT_PMAX_THRESHOLDS = (0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
+
+#: Implementation detail, not configuration: the filename get_PM_scores.py emits.
+#: Changing it here without changing it there just finds nothing.
+SIMILARITY_GLOB = 'similarities_part_*.csv'
 
 
 # =============================================================================
@@ -52,8 +103,10 @@ def get_available_memory_mb():
 # CSV to Parquet Conversion
 # =============================================================================
 
-def convert_csv_to_parquet_chunked(csv_file, parquet_file, chunk_size=100000,
-                                    max_memory_mb=8000, min_available_mb=2000):
+def convert_csv_to_parquet_chunked(csv_file, parquet_file,
+                                    chunk_size=DEFAULT_CSV_CHUNK_ROWS,
+                                    max_memory_mb=DEFAULT_MAX_MEMORY_MB,
+                                    min_available_mb=DEFAULT_MIN_AVAILABLE_MB):
     """
     Convert CSV to Parquet using chunked reading to minimize memory usage.
     
@@ -68,11 +121,11 @@ def convert_csv_to_parquet_chunked(csv_file, parquet_file, chunk_size=100000,
         True if successful, False if memory limit exceeded
     """
     if get_memory_usage_mb() > max_memory_mb:
-        print(f"⚠️  Memory limit exceeded before starting: {get_memory_usage_mb():.1f} MB")
+        LOG.warning(f"⚠️  Memory limit exceeded before starting: {get_memory_usage_mb():.1f} MB")
         return False
     
     if get_available_memory_mb() < min_available_mb:
-        print(f"⚠️  Low available memory: {get_available_memory_mb():.1f} MB")
+        LOG.warning(f"⚠️  Low available memory: {get_available_memory_mb():.1f} MB")
         return False
     
     parquet_writer = None
@@ -90,7 +143,7 @@ def convert_csv_to_parquet_chunked(csv_file, parquet_file, chunk_size=100000,
             gc.collect()
             
             if get_memory_usage_mb() > max_memory_mb:
-                print(f"⚠️  Memory limit exceeded during processing: {get_memory_usage_mb():.1f} MB")
+                LOG.warning(f"⚠️  Memory limit exceeded during processing: {get_memory_usage_mb():.1f} MB")
                 if parquet_writer:
                     parquet_writer.close()
                 return False
@@ -101,37 +154,41 @@ def convert_csv_to_parquet_chunked(csv_file, parquet_file, chunk_size=100000,
         return True
         
     except Exception as e:
-        print(f"Error converting {csv_file.name}: {e}")
+        LOG.info(f"Error converting {csv_file.name}: {e}")
         if parquet_writer:
             parquet_writer.close()
         return False
 
 
-def ensure_parquet_files(csv_dir, parquet_dir, max_memory_mb=8000, min_available_mb=2000):
+def ensure_parquet_files(csv_dir, parquet_dir,
+                         max_memory_mb=DEFAULT_MAX_MEMORY_MB,
+                         min_available_mb=DEFAULT_MIN_AVAILABLE_MB,
+                         chunk_size=DEFAULT_CSV_CHUNK_ROWS):
     """
     Ensure all CSV files are converted to Parquet format.
-    
+
     Args:
         csv_dir: Directory containing CSV files
         parquet_dir: Directory to store Parquet files
         max_memory_mb: Maximum memory usage allowed (MB)
         min_available_mb: Minimum available memory required (MB)
-    
+        chunk_size: Rows read per chunk during conversion
+
     Returns:
         List of Parquet file paths
     """
     csv_dir = Path(csv_dir)
     parquet_dir = Path(parquet_dir)
     parquet_dir.mkdir(parents=True, exist_ok=True)
-    
-    csv_files = sorted(csv_dir.glob('similarities_part_*.csv'))
+
+    csv_files = sorted(csv_dir.glob(SIMILARITY_GLOB))
     
     if not csv_files:
-        print(f"No CSV files found in {csv_dir}")
+        LOG.info(f"No CSV files found in {csv_dir}")
         return []
     
-    print(f"Found {len(csv_files)} CSV files")
-    print(f"Total size: {sum(f.stat().st_size for f in csv_files) / 1024**3:.2f} GB")
+    LOG.info(f"Found {len(csv_files)} CSV files")
+    LOG.info(f"Total size: {sum(f.stat().st_size for f in csv_files) / 1024**3:.2f} GB")
     
     converted_files = []
     needs_conversion = False
@@ -145,12 +202,12 @@ def ensure_parquet_files(csv_dir, parquet_dir, max_memory_mb=8000, min_available
             needs_conversion = True
     
     if not needs_conversion:
-        print(f"✅ All {len(converted_files)} Parquet files already exist")
+        LOG.info(f"✅ All {len(converted_files)} Parquet files already exist")
         return sorted(converted_files)
     
     # Convert remaining files
-    print("\nConverting CSV files to Parquet format...")
-    print(f"Memory safety: Max process usage = {max_memory_mb} MB, Min available = {min_available_mb} MB\n")
+    LOG.info("\nConverting CSV files to Parquet format...")
+    LOG.info(f"Memory safety: Max process usage = {max_memory_mb} MB, Min available = {min_available_mb} MB\n")
     
     converted_files = []
     for csv_file in tqdm(csv_files, desc="Converting files"):
@@ -161,31 +218,31 @@ def ensure_parquet_files(csv_dir, parquet_dir, max_memory_mb=8000, min_available
             continue
         
         success = convert_csv_to_parquet_chunked(
-            csv_file, parquet_file, 
-            chunk_size=100000,
+            csv_file, parquet_file,
+            chunk_size=chunk_size,
             max_memory_mb=max_memory_mb,
             min_available_mb=min_available_mb
         )
         
         if not success:
-            print(f"\n❌ Stopped conversion due to memory constraints")
-            print(f"Converted {len(converted_files)} out of {len(csv_files)} files")
+            LOG.error(f"\n❌ Stopped conversion due to memory constraints")
+            LOG.info(f"Converted {len(converted_files)} out of {len(csv_files)} files")
             break
         
         converted_files.append(parquet_file)
         
         if len(converted_files) % 10 == 0:
-            print(f"  Memory: {get_memory_usage_mb():.1f} MB used, {get_available_memory_mb():.1f} MB available")
+            LOG.info(f"  Memory: {get_memory_usage_mb():.1f} MB used, {get_available_memory_mb():.1f} MB available")
     
-    print(f"\n✅ Converted {len(converted_files)} files to Parquet format")
+    LOG.info(f"\n✅ Converted {len(converted_files)} files to Parquet format")
     
     # Calculate compression ratio
     if converted_files:
         csv_size = sum(f.stat().st_size for f in csv_files[:len(converted_files)]) / 1024**3
         parquet_size = sum(f.stat().st_size for f in converted_files) / 1024**3
-        print(f"CSV size: {csv_size:.2f} GB")
-        print(f"Parquet size: {parquet_size:.2f} GB")
-        print(f"Compression ratio: {csv_size/parquet_size:.1f}x")
+        LOG.info(f"CSV size: {csv_size:.2f} GB")
+        LOG.info(f"Parquet size: {parquet_size:.2f} GB")
+        LOG.info(f"Compression ratio: {csv_size/parquet_size:.1f}x")
     
     return sorted(converted_files)
 
@@ -194,7 +251,9 @@ def ensure_parquet_files(csv_dir, parquet_dir, max_memory_mb=8000, min_available
 # Data Loading
 # =============================================================================
 
-def load_parquet_files(parquet_files, max_files=None, max_memory_mb=8000, min_available_mb=2000):
+def load_parquet_files(parquet_files, max_files=None,
+                       max_memory_mb=DEFAULT_MAX_MEMORY_MB,
+                       min_available_mb=DEFAULT_MIN_AVAILABLE_MB):
     """
     Load Parquet files into a single DataFrame with memory monitoring.
     
@@ -210,41 +269,41 @@ def load_parquet_files(parquet_files, max_files=None, max_memory_mb=8000, min_av
     dfs = []
     files_to_load = parquet_files[:max_files] if max_files else parquet_files
     
-    print(f"Loading {len(files_to_load)} Parquet files...")
-    print(f"Initial memory: {get_memory_usage_mb():.1f} MB\n")
+    LOG.info(f"Loading {len(files_to_load)} Parquet files...")
+    LOG.info(f"Initial memory: {get_memory_usage_mb():.1f} MB\n")
     
     for i, parquet_file in enumerate(tqdm(files_to_load, desc="Loading files")):
         current_memory = get_memory_usage_mb()
         available_memory = get_available_memory_mb()
         
         if current_memory > max_memory_mb:
-            print(f"\n⚠️  Memory limit exceeded: {current_memory:.1f} MB")
-            print(f"Loaded {i} out of {len(files_to_load)} files")
+            LOG.warning(f"\n⚠️  Memory limit exceeded: {current_memory:.1f} MB")
+            LOG.info(f"Loaded {i} out of {len(files_to_load)} files")
             break
         
         if available_memory < min_available_mb:
-            print(f"\n⚠️  Low available memory: {available_memory:.1f} MB")
-            print(f"Loaded {i} out of {len(files_to_load)} files")
+            LOG.warning(f"\n⚠️  Low available memory: {available_memory:.1f} MB")
+            LOG.info(f"Loaded {i} out of {len(files_to_load)} files")
             break
         
         df = pd.read_parquet(parquet_file)
         dfs.append(df)
         
         if (i + 1) % 20 == 0:
-            print(f"  Memory: {current_memory:.1f} MB used, {available_memory:.1f} MB available")
+            LOG.info(f"  Memory: {current_memory:.1f} MB used, {available_memory:.1f} MB available")
     
     if not dfs:
-        print("No files loaded!")
+        LOG.info("No files loaded!")
         return None
     
-    print(f"\nCombining {len(dfs)} DataFrames...")
+    LOG.info(f"\nCombining {len(dfs)} DataFrames...")
     combined_df = pd.concat(dfs, ignore_index=True)
     
     del dfs
     gc.collect()
     
-    print(f"✅ Loaded {len(combined_df):,} rows")
-    print(f"Final memory usage: {get_memory_usage_mb():.1f} MB")
+    LOG.info(f"✅ Loaded {len(combined_df):,} rows")
+    LOG.info(f"Final memory usage: {get_memory_usage_mb():.1f} MB")
     
     return combined_df
 
@@ -253,7 +312,7 @@ def load_parquet_files(parquet_files, max_files=None, max_memory_mb=8000, min_av
 # Louvain Clustering
 # =============================================================================
 
-def cluster_pockets_louvain(df_similarities, Pmax_min=0.3, resolution=1.5):
+def cluster_pockets_louvain(df_similarities, Pmax_min=0.3, resolution=DEFAULT_RESOLUTION):
     """
     Cluster pockets using Louvain community detection on a similarity graph.
     
@@ -267,12 +326,12 @@ def cluster_pockets_louvain(df_similarities, Pmax_min=0.3, resolution=1.5):
         df_clusters: DataFrame with columns ['Pocket', 'Cluster', 'ClusterSize']
     """
     # Step 1: Filter by Pmax threshold
-    print(f"Step 1: Filtering edges with Pmax >= {Pmax_min}...")
+    LOG.info(f"Step 1: Filtering edges with Pmax >= {Pmax_min}...")
     df_filtered = df_similarities[df_similarities['Pmax'] >= Pmax_min].copy()
-    print(f"  Kept {len(df_filtered):,} / {len(df_similarities):,} edges ({100*len(df_filtered)/len(df_similarities):.1f}%)")
+    LOG.info(f"  Kept {len(df_filtered):,} / {len(df_similarities):,} edges ({100*len(df_filtered)/len(df_similarities):.1f}%)")
     
     # Step 2: Build graph
-    print(f"\nStep 2: Building graph...")
+    LOG.info(f"\nStep 2: Building graph...")
     G = nx.from_pandas_edgelist(
         df_filtered,
         source='Pocket1',
@@ -281,24 +340,24 @@ def cluster_pockets_louvain(df_similarities, Pmax_min=0.3, resolution=1.5):
     )
     # Rename edge attribute to 'weight' for Louvain
     nx.set_edge_attributes(G, nx.get_edge_attributes(G, 'Pmax'), 'weight')
-    print(f"  ✅ Graph built: {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
+    LOG.info(f"  ✅ Graph built: {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
     
     # Step 3: Run Louvain community detection
-    print(f"\nStep 3: Running Louvain community detection (resolution={resolution})...")
+    LOG.info(f"\nStep 3: Running Louvain community detection (resolution={resolution})...")
     partition = community_louvain.best_partition(G, weight='weight', resolution=resolution)
     cluster_sizes = Counter(partition.values())
-    print(f"  ✅ Found {len(cluster_sizes)} communities")
-    print(f"  Largest 5: {cluster_sizes.most_common(5)}")
+    LOG.info(f"  ✅ Found {len(cluster_sizes)} communities")
+    LOG.info(f"  Largest 5: {cluster_sizes.most_common(5)}")
     
     # Step 4: Add cluster attributes to nodes
-    print(f"\nStep 4: Adding cluster attributes to graph nodes...")
+    LOG.info(f"\nStep 4: Adding cluster attributes to graph nodes...")
     for node in G.nodes():
         G.nodes[node]['cluster'] = partition.get(node, -1)
         G.nodes[node]['cluster_size'] = cluster_sizes.get(partition.get(node, -1), 0)
-    print(f"  ✅ Added 'cluster' and 'cluster_size' attributes to all nodes")
+    LOG.info(f"  ✅ Added 'cluster' and 'cluster_size' attributes to all nodes")
     
     # Step 5: Create cluster membership DataFrame
-    print(f"\nStep 5: Creating cluster membership DataFrame...")
+    LOG.info(f"\nStep 5: Creating cluster membership DataFrame...")
     df_clusters = pd.DataFrame([
         {'Pocket': pocket, 'Cluster': cluster_id}
         for pocket, cluster_id in partition.items()
@@ -308,18 +367,18 @@ def cluster_pockets_louvain(df_similarities, Pmax_min=0.3, resolution=1.5):
         ['ClusterSize', 'Cluster', 'Pocket'], 
         ascending=[False, True, True]
     ).reset_index(drop=True)
-    print(f"  ✅ Created DataFrame with {len(df_clusters):,} pockets in {df_clusters['Cluster'].nunique()} clusters")
+    LOG.info(f"  ✅ Created DataFrame with {len(df_clusters):,} pockets in {df_clusters['Cluster'].nunique()} clusters")
     
     # Summary
-    print(f"\n{'='*50}")
-    print(f"SUMMARY")
-    print(f"{'='*50}")
-    print(f"  Pmax threshold: >= {Pmax_min}")
-    print(f"  Total pockets: {len(df_clusters):,}")
-    print(f"  Total clusters: {df_clusters['Cluster'].nunique()}")
-    print(f"  Largest cluster: {cluster_sizes.most_common(1)[0][1]} pockets")
-    print(f"  Smallest cluster: {min(cluster_sizes.values())} pockets")
-    print(f"  Median cluster size: {np.median(list(cluster_sizes.values())):.0f} pockets")
+    LOG.info(f"\n{'='*50}")
+    LOG.info(f"SUMMARY")
+    LOG.info(f"{'='*50}")
+    LOG.info(f"  Pmax threshold: >= {Pmax_min}")
+    LOG.info(f"  Total pockets: {len(df_clusters):,}")
+    LOG.info(f"  Total clusters: {df_clusters['Cluster'].nunique()}")
+    LOG.info(f"  Largest cluster: {cluster_sizes.most_common(1)[0][1]} pockets")
+    LOG.info(f"  Smallest cluster: {min(cluster_sizes.values())} pockets")
+    LOG.info(f"  Median cluster size: {np.median(list(cluster_sizes.values())):.0f} pockets")
     
     return G, df_clusters
 
@@ -364,10 +423,11 @@ def export_graph_gexf(G, output_path):
         )
     
     nx.write_gexf(G_clean, output_path)
-    print(f"  Exported: {output_path}")
+    LOG.info(f"  Exported: {output_path}")
 
 
-def run_clustering_analysis(df_similarities, output_dir, pmax_thresholds=None, resolution=1.5):
+def run_clustering_analysis(df_similarities, output_dir, pmax_thresholds=None,
+                            resolution=DEFAULT_RESOLUTION):
     """
     Run Louvain clustering at multiple Pmax thresholds and export results.
     
@@ -381,17 +441,17 @@ def run_clustering_analysis(df_similarities, output_dir, pmax_thresholds=None, r
         Dictionary mapping threshold to (graph, df_clusters) tuples
     """
     if pmax_thresholds is None:
-        pmax_thresholds = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
-    
+        pmax_thresholds = list(DEFAULT_PMAX_THRESHOLDS)
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
     results = {}
     
     for pmax_min in pmax_thresholds:
-        print(f"\n{'='*60}")
-        print(f"CLUSTERING WITH Pmax >= {pmax_min}")
-        print(f"{'='*60}\n")
+        LOG.info(f"\n{'='*60}")
+        LOG.info(f"CLUSTERING WITH Pmax >= {pmax_min}")
+        LOG.info(f"{'='*60}\n")
         
         G, df_clusters = cluster_pockets_louvain(df_similarities, Pmax_min=pmax_min, resolution=resolution)
         
@@ -401,10 +461,10 @@ def run_clustering_analysis(df_similarities, output_dir, pmax_thresholds=None, r
         csv_path = output_dir / f'pocket_louvain_clusters_{pmax_str}.csv'
         
         # Export results
-        print(f"\nExporting results...")
+        LOG.info(f"\nExporting results...")
         export_graph_gexf(G, gexf_path)
         df_clusters.to_csv(csv_path, index=False)
-        print(f"  Exported: {csv_path}")
+        LOG.info(f"  Exported: {csv_path}")
         
         results[pmax_min] = (G, df_clusters)
     
@@ -415,121 +475,172 @@ def run_clustering_analysis(df_similarities, output_dir, pmax_thresholds=None, r
 # Main Entry Point
 # =============================================================================
 
-def main():
+def build_parser():
+    """The CLI. Every path is a flag: the old --csv-dir default named one dead
+    campaign directory on a read-only drive, and derived the *write* locations
+    from that input path's parent."""
     parser = argparse.ArgumentParser(
         description='Perform Louvain community detection on PocketMatch similarity data'
     )
     parser.add_argument(
+        '--run-dir',
+        required=True,
+        help=('campaign run directory. --csv-dir, --parquet-dir and --output-dir '
+              'default to the standard layout underneath it')
+    )
+    parser.add_argument(
         '--csv-dir',
         type=str,
-        default='/media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock/pocketmatch_results/PocketMatch_similarities',
-        help='Directory containing CSV similarity files'
+        default=None,
+        help=('directory of get_PM_scores.py similarity CSVs (%s). '
+              'Default: <run-dir>/%s' % (SIMILARITY_GLOB, SIMILARITIES_SUBDIR))
+    )
+    parser.add_argument(
+        '--parquet-dir',
+        type=str,
+        default=None,
+        help=('where the CSV->Parquet conversion is cached; written to, so it is '
+              'named rather than derived from an input directory. '
+              'Default: <run-dir>/%s' % PARQUET_SUBDIR)
     )
     parser.add_argument(
         '--output-dir',
         type=str,
         default=None,
-        help='Directory to save clustering results (default: <csv-dir>/../pocket_clusters)'
+        help=('directory to save clustering results. Default: <run-dir>/%s -- the '
+              'path parse_prepare.py --pocket-clusters reads back'
+              % CLUSTERS_SUBDIR)
     )
     parser.add_argument(
         '--max-memory-mb',
         type=int,
-        default=8000,
-        help='Maximum memory usage in MB (default: 8000)'
+        default=DEFAULT_MAX_MEMORY_MB,
+        help='stop before this process exceeds this RSS, in MB (default: %d)' % DEFAULT_MAX_MEMORY_MB
     )
     parser.add_argument(
         '--min-available-mb',
         type=int,
-        default=2000,
-        help='Minimum available memory in MB (default: 2000)'
+        default=DEFAULT_MIN_AVAILABLE_MB,
+        help='stop when system free memory falls below this, in MB (default: %d)' % DEFAULT_MIN_AVAILABLE_MB
+    )
+    parser.add_argument(
+        '--csv-chunk-rows',
+        type=int,
+        default=DEFAULT_CSV_CHUNK_ROWS,
+        help='rows read per chunk when converting a similarity CSV to Parquet (default: %d)' % DEFAULT_CSV_CHUNK_ROWS
+    )
+    parser.add_argument(
+        '--max-files',
+        type=int,
+        default=None,
+        help=('load at most this many Parquet shards -- a deliberate partial pass '
+              'for a smoke test. Default: all of them')
     )
     parser.add_argument(
         '--resolution',
         type=float,
-        default=1.5,
-        help='Louvain resolution parameter (default: 1.5)'
+        default=DEFAULT_RESOLUTION,
+        help='Louvain resolution; higher means more, smaller communities (default: %s)' % DEFAULT_RESOLUTION
     )
     parser.add_argument(
         '--pmax-thresholds',
         type=float,
         nargs='+',
-        default=[0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
-        help='Pmax thresholds for clustering (default: 0.3 0.4 0.5 0.6 0.7 0.8)'
+        default=list(DEFAULT_PMAX_THRESHOLDS),
+        help=('Pmax edge thresholds to cluster at; one output pair per threshold '
+              '(default: %s)' % ' '.join(str(t) for t in DEFAULT_PMAX_THRESHOLDS))
     )
-    
-    args = parser.parse_args()
-    
-    csv_dir = Path(args.csv_dir)
-    parquet_dir = csv_dir.parent / 'parquet_data'
-    
-    if args.output_dir:
-        output_dir = Path(args.output_dir)
-    else:
-        output_dir = csv_dir.parent / 'pocket_clusters'
-    
-    print("="*60)
-    print("PocketMatch Louvain Clustering Analysis")
-    print("="*60)
-    print(f"\nConfiguration:")
-    print(f"  CSV directory: {csv_dir}")
-    print(f"  Parquet directory: {parquet_dir}")
-    print(f"  Output directory: {output_dir}")
-    print(f"  Max memory: {args.max_memory_mb} MB")
-    print(f"  Min available memory: {args.min_available_mb} MB")
-    print(f"  Resolution: {args.resolution}")
-    print(f"  Pmax thresholds: {args.pmax_thresholds}")
-    print(f"\nInitial memory usage: {get_memory_usage_mb():.1f} MB")
-    print(f"Available memory: {get_available_memory_mb():.1f} MB")
+    add_runtime_arguments(parser, STEP_NAME)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    resolve_out_dir(args, STEP_NAME, args.run_dir)
+    with step(STEP_NAME, args):
+        return _run(args)
+
+
+def _run(args):
+    """The clustering pass itself, with logging and notifications already set up."""
+    run_dir = Path(args.run_dir)
+    csv_dir = Path(args.csv_dir) if args.csv_dir else run_dir / SIMILARITIES_SUBDIR
+    parquet_dir = Path(args.parquet_dir) if args.parquet_dir else run_dir / PARQUET_SUBDIR
+    output_dir = Path(args.output_dir) if args.output_dir else run_dir / CLUSTERS_SUBDIR
+
+    # A missing input directory is a prerequisite failure, not an empty result.
+    # SystemExit rather than `return 2` so step() reports it as a failure and the
+    # --notify path fires; a plain non-zero return reads as a clean exit.
+    if not csv_dir.is_dir():
+        LOG.error("❌ Similarity directory not found: %s", csv_dir)
+        LOG.error("   Run get_PM_scores.py first, or pass --csv-dir explicitly.")
+        raise SystemExit(2)
+
+    LOG.info("="*60)
+    LOG.info("PocketMatch Louvain Clustering Analysis")
+    LOG.info("="*60)
+    LOG.info(f"\nConfiguration:")
+    LOG.info(f"  CSV directory: {csv_dir}")
+    LOG.info(f"  Parquet directory: {parquet_dir}")
+    LOG.info(f"  Output directory: {output_dir}")
+    LOG.info(f"  Max memory: {args.max_memory_mb} MB")
+    LOG.info(f"  Min available memory: {args.min_available_mb} MB")
+    LOG.info(f"  Resolution: {args.resolution}")
+    LOG.info(f"  Pmax thresholds: {args.pmax_thresholds}")
+    LOG.info(f"\nInitial memory usage: {get_memory_usage_mb():.1f} MB")
+    LOG.info(f"Available memory: {get_available_memory_mb():.1f} MB")
     
     # Step 1: Ensure Parquet files exist
-    print(f"\n{'='*60}")
-    print("STEP 1: ENSURE PARQUET FILES EXIST")
-    print("="*60 + "\n")
+    LOG.info(f"\n{'='*60}")
+    LOG.info("STEP 1: ENSURE PARQUET FILES EXIST")
+    LOG.info("="*60 + "\n")
     
     parquet_files = ensure_parquet_files(
         csv_dir, parquet_dir,
         max_memory_mb=args.max_memory_mb,
-        min_available_mb=args.min_available_mb
+        min_available_mb=args.min_available_mb,
+        chunk_size=args.csv_chunk_rows
     )
     
     if not parquet_files:
-        print("❌ No parquet files available. Exiting.")
-        return 1
+        LOG.error("❌ No parquet files available. Exiting.")
+        raise SystemExit(1)
     
     # Step 2: Load data
-    print(f"\n{'='*60}")
-    print("STEP 2: LOAD DATA")
-    print("="*60 + "\n")
+    LOG.info(f"\n{'='*60}")
+    LOG.info("STEP 2: LOAD DATA")
+    LOG.info("="*60 + "\n")
     
     df_similarities = load_parquet_files(
         parquet_files,
+        max_files=args.max_files,
         max_memory_mb=args.max_memory_mb,
         min_available_mb=args.min_available_mb
     )
     
     if df_similarities is None:
-        print("❌ Failed to load data. Exiting.")
-        return 1
+        LOG.error("❌ Failed to load data. Exiting.")
+        raise SystemExit(1)
     
     # Remove self-comparisons
     original_len = len(df_similarities)
     df_similarities = df_similarities[df_similarities['Pocket1'] != df_similarities['Pocket2']]
-    print(f"\nRemoved {original_len - len(df_similarities):,} self-comparisons")
-    print(f"Final dataset: {len(df_similarities):,} rows")
+    LOG.info(f"\nRemoved {original_len - len(df_similarities):,} self-comparisons")
+    LOG.info(f"Final dataset: {len(df_similarities):,} rows")
     
     # Print data summary
-    print(f"\nData Summary:")
-    print(f"  Total rows: {len(df_similarities):,}")
+    LOG.info(f"\nData Summary:")
+    LOG.info(f"  Total rows: {len(df_similarities):,}")
     unique_pockets = set(df_similarities['Pocket1'].unique()) | set(df_similarities['Pocket2'].unique())
-    print(f"  Total unique pockets: {len(unique_pockets):,}")
-    print(f"  Pmax range: [{df_similarities['Pmax'].min():.3f}, {df_similarities['Pmax'].max():.3f}]")
-    print(f"  Pmax mean: {df_similarities['Pmax'].mean():.3f}")
-    print(f"  Pmax median: {df_similarities['Pmax'].median():.3f}")
+    LOG.info(f"  Total unique pockets: {len(unique_pockets):,}")
+    LOG.info(f"  Pmax range: [{df_similarities['Pmax'].min():.3f}, {df_similarities['Pmax'].max():.3f}]")
+    LOG.info(f"  Pmax mean: {df_similarities['Pmax'].mean():.3f}")
+    LOG.info(f"  Pmax median: {df_similarities['Pmax'].median():.3f}")
     
     # Step 3: Run clustering
-    print(f"\n{'='*60}")
-    print("STEP 3: LOUVAIN CLUSTERING")
-    print("="*60)
+    LOG.info(f"\n{'='*60}")
+    LOG.info("STEP 3: LOUVAIN CLUSTERING")
+    LOG.info("="*60)
     
     results = run_clustering_analysis(
         df_similarities,
@@ -539,19 +650,19 @@ def main():
     )
     
     # Final summary
-    print(f"\n{'='*60}")
-    print("FINAL SUMMARY")
-    print("="*60)
-    print(f"\nGenerated {len(results)} clustering results:")
+    LOG.info(f"\n{'='*60}")
+    LOG.info("FINAL SUMMARY")
+    LOG.info("="*60)
+    LOG.info(f"\nGenerated {len(results)} clustering results:")
     for pmax_min, (G, df_clusters) in results.items():
-        print(f"  Pmax >= {pmax_min}: {G.number_of_nodes():,} pockets, {df_clusters['Cluster'].nunique()} clusters")
+        LOG.info(f"  Pmax >= {pmax_min}: {G.number_of_nodes():,} pockets, {df_clusters['Cluster'].nunique()} clusters")
     
-    print(f"\nOutput files saved to: {output_dir}")
-    print(f"Final memory usage: {get_memory_usage_mb():.1f} MB")
-    print("\n✅ Analysis complete!")
+    LOG.info(f"\nOutput files saved to: {output_dir}")
+    LOG.info(f"Final memory usage: {get_memory_usage_mb():.1f} MB")
+    LOG.info("\n✅ Analysis complete!")
     
     return 0
 
 
 if __name__ == '__main__':
-    exit(main())
+    sys.exit(main())

@@ -61,13 +61,21 @@ Usage
 ::
 
     python3 plan_positives.py \\
-        --interactions manifests/interactions_resolved.csv \\
-        --index        identity/identity_index.parquet \\
-        --cavities     manifests/cavity_manifest.csv \\
-        --ligands      ligands/ \\
+        --run-dir      $RUN \\
+        --interactions $RUN/manifests/interactions_resolved.csv \\
+        --index        $RUN/identity/identity_index.parquet \\
+        --cavities     $RUN/manifests/cavity_manifest.csv \\
+        --ligands      $RUN/ligands/ \\
         --drugs        /opt/data/drugbank/small_molecule_drug_links.csv \\
-        --out          manifests/positives_planned.csv \\
-        --rejects      manifests/positives_rejected.csv
+        --out          $RUN/manifests/positives_planned.csv \\
+        --rejects      $RUN/manifests/positives_rejected.csv
+
+``--run-dir`` is optional and moves only this step's own log and scratch state to
+``$RUN/steps/plan_positives/``; the artifacts keep their explicit ``--out`` paths.
+Without it the step directory is inferred from ``--out``, so the log still lands in
+the campaign rather than in the invocation directory.  ``--notify`` (with
+``PUSHOVER_TOKEN`` / ``PUSHOVER_USER_KEY`` in the environment) sends a Pushover
+message when the stage finishes or fails.
 """
 
 from __future__ import annotations
@@ -83,11 +91,26 @@ import pandas as pd
 from dock_selectivity import jobid, schemas
 from dock_selectivity.identity import IdentityIndex
 from dock_selectivity.invariants import InvariantViolation, assert_total_accounting
+from dock_selectivity.runtime import add_runtime_arguments, resolve_out_dir, step
 
-LOG = logging.getLogger("plan_positives")
+#: Names the logger, the step directory and the log file. Must stay equal to the
+#: logger name below, or ``step()`` would configure a logger this module never uses.
+STEP_NAME = "plan_positives"
+
+LOG = logging.getLogger(STEP_NAME)
+
+#: Directories the fixed run layout puts artifacts in; their parent is the run
+#: directory. Consulted only to place this step's own log when ``--run-dir`` is
+#: absent -- the log must land in the campaign, never in the invocation directory.
+_LAYOUT_DIRS = ("manifests", "identity", "analysis", "structures", "docking_results")
 
 #: Matches ``resolve_interactions.py`` so ``selected_by`` provenance concatenates.
 _SELECTED_BY_SEP = "; "
+
+#: File extensions that count as a prepared ligand. Overridable with
+#: ``--ligand-extensions``: which formats the ligand folder holds is a property of
+#: the run, not of this module.
+DEFAULT_LIGAND_EXTENSIONS: Tuple[str, ...] = (".sdf", ".mol2", ".mol", ".pdb")
 
 #: Every reason an edge can fail to become a planned job. Exhaustive by design:
 #: :func:`plan_positives` asserts the rejects it writes use only these.
@@ -101,6 +124,20 @@ REJECT_REASONS: Tuple[str, ...] = (
 
 class PlanningError(InvariantViolation):
     """Raised when the planned set cannot be produced without losing an edge."""
+
+
+def infer_run_dir(artifact_path: str) -> str:
+    """Best guess at the run directory, from an artifact this step writes.
+
+    ``--run-dir`` is optional so every existing command line (including the ones
+    ``run_full_workflow.py`` builds) keeps working unchanged, but the step log may
+    not fall back to the invocation directory -- that is how the repository working
+    tree filled up with stray ``*.log`` files.
+    """
+    parent = os.path.dirname(os.path.abspath(artifact_path))
+    if os.path.basename(parent) in _LAYOUT_DIRS:
+        return os.path.dirname(parent)
+    return parent
 
 
 # ---------------------------------------------------------------------------
@@ -144,12 +181,19 @@ def load_cavity_index(path: str) -> Dict[Tuple[str, str], List[int]]:
     return {key: sorted(values) for key, values in out.items()}
 
 
-def load_available_ligands(ligand_dir: Optional[str]) -> Optional[Set[str]]:
+def load_available_ligands(
+    ligand_dir: Optional[str],
+    extensions: Optional[Sequence[str]] = None,
+) -> Optional[Set[str]]:
     """DrugBank ids that have a ligand file on disk.
 
     ``None`` disables the filter entirely (and is reported as such), so a run
     without a prepared ligand folder produces a plan that is explicitly larger
     than what can be docked, rather than a silently empty one.
+
+    ``extensions`` defaults to :data:`DEFAULT_LIGAND_EXTENSIONS`; a ligand set
+    written in some other format would otherwise reject every pair with
+    ``NO_LIGAND_SDF`` and look like a data problem.
     """
     if ligand_dir is None:
         return None
@@ -158,10 +202,14 @@ def load_available_ligands(ligand_dir: Optional[str]) -> Optional[Set[str]]:
             "--ligands {!r} is not a directory. Pass the prepared SDF folder, or omit "
             "--ligands to plan without the ligand-availability filter.".format(ligand_dir)
         )
+    wanted = tuple(
+        e.lower() if e.startswith(".") else "." + e.lower()
+        for e in (extensions if extensions is not None else DEFAULT_LIGAND_EXTENSIONS)
+    )
     ids: Set[str] = set()
     for entry in os.listdir(ligand_dir):
         stem, ext = os.path.splitext(entry)
-        if ext.lower() in (".sdf", ".mol2", ".mol", ".pdb"):
+        if ext.lower() in wanted:
             ids.add(stem.strip().upper())
     return ids
 
@@ -349,18 +397,32 @@ def build_parser() -> argparse.ArgumentParser:
             "audit.py's G2 check asserts its row count."
         ),
     )
+    parser.add_argument(
+        "--ligand-extensions",
+        default=",".join(DEFAULT_LIGAND_EXTENSIONS),
+        help=(
+            "comma-separated file extensions that count as a prepared ligand when "
+            "--ligands is given (default: %(default)s). A ligand set written in a "
+            "format not listed here would silently reject every pair."
+        ),
+    )
+    parser.add_argument(
+        "--run-dir",
+        default=None,
+        help=(
+            "campaign run directory. Optional: it only places this step's own log "
+            "and scratch state at <run-dir>/steps/plan_positives/. The artifacts "
+            "keep their explicit --out/--rejects paths."
+        ),
+    )
     parser.add_argument("-v", "--verbose", action="store_true",
-                        help="debug-level logging")
+                        help="debug-level logging (same as --log-level DEBUG)")
+    add_runtime_arguments(parser, STEP_NAME)
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(levelname)s %(message)s",
-    )
-
+def _plan(args: argparse.Namespace) -> int:
+    """The stage itself. ``main()`` runs this inside :func:`step`."""
     rejects_path = args.rejects or (args.out + ".rejects.csv")
     if os.path.basename(rejects_path) == "unresolved_targets.csv":
         LOG.error(
@@ -375,7 +437,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         interactions = schemas.read_checked(args.interactions, "interactions_resolved")
         cavities = load_cavity_index(args.cavities)
         small_molecules = load_small_molecules(args.drugs)
-        ligands = load_available_ligands(args.ligands)
+        ligands = load_available_ligands(
+            args.ligands,
+            extensions=[e for e in str(args.ligand_extensions).split(",") if e.strip()],
+        )
     except (InvariantViolation, OSError, ValueError) as exc:
         LOG.error("%s", exc)
         return 2
@@ -420,6 +485,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for reason, count in rejected["reason"].value_counts().items():
             LOG.info("  %-20s %d", reason, count)
     LOG.info("wrote %s", args.out)
+    return 0
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.verbose:
+        # -v predates --log-level and run_full_workflow may still pass it.
+        args.log_level = "DEBUG"
+    resolve_out_dir(args, STEP_NAME, args.run_dir or infer_run_dir(args.out))
+    try:
+        with step(STEP_NAME, args):
+            code = _plan(args)
+            if code:
+                # step() reports a non-zero SystemExit as a failure (and notifies
+                # about it); main() still owes its caller an int, so catch it back.
+                raise SystemExit(code)
+    except SystemExit as exc:
+        return int(exc.code or 0)
     return 0
 
 

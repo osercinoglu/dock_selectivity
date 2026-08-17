@@ -3,20 +3,33 @@
 Cavity Extraction Script
 This script extracts cavity/pocket PDB files from AlphaFold cavity tarballs.
 
-This is a separate preprocessing step that can be run independently of the main
-docking workflow, allowing for better organization and the ability to cache
-extracted cavity files. The receptor PDB information comes from AlphaFold 
-structures, not from the cavity tarballs.
+Runs in two steps. Step one derives the cavity manifest from tarball NAMES and
+unpacks nothing; step two unpacks only the cavities an explicit required set asks
+for. There is deliberately no "extract everything" mode: the 2025-06-29 campaign
+unpacked 38,709 archives (76.6 GB) for the 2,829 cavities it actually docked.
+
+Inputs:
+    - a folder of CavitySpace ``*.tar.gz`` cavity archives (--tarballs)
+    - the manifest from step one (--manifest) and the required set (--required)
+
+Outputs:
+    - --out-dir: the extracted cavity PDB files (one directory per archive)
+    - --out: cavity_mapping.csv / cavity_manifest.csv
+    - <run-dir>/steps/extract_cavities/extract_cavities.log (see --run-dir)
 
 Usage:
-    python extract_cavities.py
+    # 1. the manifest, from names alone -- unpacks nothing
+    python3 extract_cavities.py --manifest-only \\
+        --tarballs /opt/data/cavity_space/af_strong_cavities_data_all \\
+        --out <run-dir>/manifests/cavity_manifest.csv --run-dir <run-dir>
 
-Input:
-    - Cavity tarball folder containing .tar.gz files
-    
-Output:
-    - extracted_cavities/ folder with extracted cavity PDB files
-    - cavity_mapping.csv: CSV file mapping UniProt IDs to extracted cavities
+    # 2. unpack only what the job queue names
+    python3 extract_cavities.py \\
+        --tarballs /opt/data/cavity_space/af_strong_cavities_data_all \\
+        --manifest <run-dir>/manifests/cavity_manifest.csv \\
+        --required <run-dir>/manifests/redock_queue.csv \\
+        --out-dir <run-dir>/structures/cavities \\
+        --out <run-dir>/manifests/cavity_mapping.csv --run-dir <run-dir>
 """
 
 import argparse
@@ -30,21 +43,21 @@ import re
 import time
 import logging
 
+from dock_selectivity.runtime import add_runtime_arguments, artifact_step_dir, step
+
 # --- Configuration ---
-# --- IMPORTANT: ADJUST THESE PATHS AS PER YOUR SYSTEM ---
+# Defaults only. Every one of these is reachable as a flag; the tarball folder is
+# a machine-wide reference dataset under /opt/data, not a per-run location.
+STEP_NAME = "extract_cavities"
 CAVITY_TARBALL_FOLDER = "/opt/data/cavity_space/af_strong_cavities_data_all"
 EXTRACT_BASE_DIR = "extracted_cavities"  # Will be created in current working directory
 OUTPUT_CSV = "cavity_mapping.csv"
-LOG_FILE = "cavity_extraction.log"
 
-# Set up logging
-logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
-logging.getLogger().addHandler(console_handler)
+# Import-time logging configuration was removed on purpose: a module that writes a
+# log file merely because it was imported cannot be used as a library, and the
+# first such module imported used to win the single root FileHandler for the whole
+# process. Logging is configured from main(), after the command line is parsed.
+LOG = logging.getLogger(STEP_NAME)
 
 def extract_cavity_paths_from_tarballs(cavity_tarball_folder, extract_base_dir="extracted_cavities"):
     """
@@ -58,7 +71,7 @@ def extract_cavity_paths_from_tarballs(cavity_tarball_folder, extract_base_dir="
     Returns:
         dict: Dictionary mapping UniProt IDs to lists of (pocket_pdb, fragment_id, cavity_index) tuples
     """
-    logging.info(f"Extracting cavity paths from tarballs in '{cavity_tarball_folder}'...")
+    LOG.info(f"Extracting cavity paths from tarballs in '{cavity_tarball_folder}'...")
     cavity_info = {} # { "Q00577": [(cavity_pdb1, fragment_id1, cavity_index1), (cavity_pdb2, fragment_id2, cavity_index2)], ... }
 
     os.makedirs(extract_base_dir, exist_ok=True)
@@ -66,10 +79,10 @@ def extract_cavity_paths_from_tarballs(cavity_tarball_folder, extract_base_dir="
     tar_files = [f for f in os.listdir(cavity_tarball_folder) if f.endswith(".tar.gz")]
     
     if not tar_files:
-        logging.warning(f"No .tar.gz files found in '{cavity_tarball_folder}'.")
+        LOG.warning(f"No .tar.gz files found in '{cavity_tarball_folder}'.")
         return cavity_info
 
-    logging.info(f"Found {len(tar_files)} tarball files to process.")
+    LOG.info(f"Found {len(tar_files)} tarball files to process.")
     
     # Statistics tracking
     extracted_count = 0
@@ -144,8 +157,8 @@ def extract_cavity_paths_from_tarballs(cavity_tarball_folder, extract_base_dir="
             extraction_status = "existing" if existing_cavity_files else "extracted"
             tqdm.write(f"Found {cavities_found} cavity file(s) ({extraction_status}) for fragment F{fragment_id} in '{tar_gz_filename}'.")
 
-    logging.info(f"Finished extracting cavity paths. Found info for {len(cavity_info)} UniProt IDs.")
-    logging.info(f"Extraction statistics: {extracted_count} tarballs extracted, {skipped_count} tarballs skipped (already present)")
+    LOG.info(f"Finished extracting cavity paths. Found info for {len(cavity_info)} UniProt IDs.")
+    LOG.info(f"Extraction statistics: {extracted_count} tarballs extracted, {skipped_count} tarballs skipped (already present)")
     return cavity_info
 
 TARBALL_RE = re.compile(
@@ -179,7 +192,8 @@ def parse_tarball_name(filename):
     )
 
 
-def build_cavity_manifest(cavity_tarball_folder, verify_members=False):
+def build_cavity_manifest(cavity_tarball_folder, verify_members=False,
+                          extract_base_dir=EXTRACT_BASE_DIR):
     """Build the cavity manifest from tarball NAMES. Unpacks nothing.
 
     Args:
@@ -187,6 +201,9 @@ def build_cavity_manifest(cavity_tarball_folder, verify_members=False):
         verify_members: open each archive and confirm it really holds the cavity
             the name advertises. Correct but slow (38,709 gzip opens); off by
             default because the naming relation is one-to-one and verified.
+        extract_base_dir: prefix for the ``Pocket_PDB`` column -- the path
+            extraction *would* produce. Must match the ``--out-dir`` step two
+            will use, or the manifest advertises paths nobody writes.
 
     Returns:
         ``(DataFrame, stats)`` where the frame carries UniProt_ID, Fragment_ID,
@@ -231,7 +248,7 @@ def build_cavity_manifest(cavity_tarball_folder, verify_members=False):
             'Fragment_ID': fragment_id,
             'Cavity_Index': cavity_index,
             'Tarball': name,
-            'Pocket_PDB': os.path.join(EXTRACT_BASE_DIR, stem, member),
+            'Pocket_PDB': os.path.join(extract_base_dir, stem, member),
         })
 
     df = pd.DataFrame(
@@ -387,7 +404,7 @@ def save_cavity_mapping_to_csv(cavity_info_dict, output_csv):
         cavity_info_dict (dict): Dictionary mapping UniProt IDs to cavity files
         output_csv (str): Path to output CSV file
     """
-    logging.info(f"Saving cavity mapping to '{output_csv}'...")
+    LOG.info(f"Saving cavity mapping to '{output_csv}'...")
     
     rows = []
     for uniprot_id, cavity_list in cavity_info_dict.items():
@@ -402,7 +419,7 @@ def save_cavity_mapping_to_csv(cavity_info_dict, output_csv):
     df = pd.DataFrame(rows)
     df.to_csv(output_csv, index=False)
     
-    logging.info(f"Saved {len(rows)} cavity files for {len(cavity_info_dict)} UniProt IDs to '{output_csv}'.")
+    LOG.info(f"Saved {len(rows)} cavity files for {len(cavity_info_dict)} UniProt IDs to '{output_csv}'.")
     return df
 
 def load_cavity_mapping_from_csv(input_csv):
@@ -416,7 +433,7 @@ def load_cavity_mapping_from_csv(input_csv):
         dict: Dictionary mapping UniProt IDs to lists of (pocket_pdb, fragment_id, cavity_index) tuples
     """
     if not os.path.exists(input_csv):
-        logging.error(f"Cavity mapping file not found: {input_csv}")
+        LOG.error(f"Cavity mapping file not found: {input_csv}")
         return {}
     
     try:
@@ -425,7 +442,7 @@ def load_cavity_mapping_from_csv(input_csv):
         missing_columns = [col for col in required_columns if col not in df.columns]
         
         if missing_columns:
-            logging.error(f"Required columns missing from cavity mapping file: {missing_columns}")
+            LOG.error(f"Required columns missing from cavity mapping file: {missing_columns}")
             return {}
         
         cavity_info = {}
@@ -439,11 +456,11 @@ def load_cavity_mapping_from_csv(input_csv):
                 cavity_info[uniprot_id] = []
             cavity_info[uniprot_id].append((pocket_pdb, fragment_id, cavity_index))
         
-        logging.info(f"Loaded cavity mapping for {len(cavity_info)} UniProt IDs from '{input_csv}'.")
+        LOG.info(f"Loaded cavity mapping for {len(cavity_info)} UniProt IDs from '{input_csv}'.")
         return cavity_info
         
     except Exception as e:
-        logging.error(f"Error loading cavity mapping file: {e}")
+        LOG.error(f"Error loading cavity mapping file: {e}")
         return {}
 
 
@@ -452,8 +469,48 @@ def load_cavity_mapping_from_csv(input_csv):
 # ---------------------------------------------------------------------------
 
 
+def runtime_namespace(args, step_name):
+    """The namespace :func:`step` gets: its ``out_dir`` is the STEP's own folder.
+
+    ``--out-dir`` on this script names where cavity PDBs land -- a contract
+    ``run_full_workflow.py`` and the tests depend on -- so it cannot double as the
+    step's private folder the way it does elsewhere in the repo.
+    :func:`artifact_step_dir` supplies the log's home instead: ``<run-dir>/steps/<step>``
+    when a run directory is known, else ``./<step>``. Never the invocation cwd, and
+    never inside the extraction tree a later stage enumerates.
+    """
+    base = artifact_step_dir(step_name, getattr(args, 'run_dir', None))
+    runtime = argparse.Namespace(**vars(args))
+    runtime.artifact_out_dir = args.out_dir  # what --out-dir means here
+    runtime.out_dir = base
+    return runtime
+
+
+def _describe_out_dir(parser):
+    """Correct --out-dir's help text for this stage.
+
+    ``add_runtime_arguments()`` documents ``--out-dir`` as "this step's own
+    directory for its log and scratch state", which is true everywhere else in the
+    repo. Here the flag is the extraction destination, a contract
+    ``run_full_workflow.py`` and ``batch_dock.py`` depend on, and the step's log
+    goes to ``--run-dir``/``--log-file`` instead. argparse offers no public way to
+    amend an action after the fact, hence the ``_actions`` walk.
+    """
+    for action in parser._actions:
+        if action.dest == 'out_dir':
+            action.help = (
+                'extraction destination: the cavity PDBs are unpacked here, one '
+                'directory per archive. run_full_workflow.py points it at '
+                '<run-dir>/structures/cavities. The log for this step goes to --run-dir / '
+                '--log-file, not here (default: %s)' % EXTRACT_BASE_DIR)
+            return parser
+    raise AssertionError('add_runtime_arguments() no longer declares --out-dir')
+
+
 def build_parser():
+    """Build the command-line parser for the cavity extraction stage."""
     parser = argparse.ArgumentParser(
+        prog='extract_cavities.py',
         description=(
             'Build the cavity manifest from tarball names, and unpack only the '
             'cavities an explicit required set asks for.'
@@ -467,7 +524,8 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('--tarballs', default=CAVITY_TARBALL_FOLDER,
-                        help='folder of *.tar.gz cavity archives (default: %(default)s)')
+                        help='folder of *.tar.gz cavity archives; a machine-wide '
+                             'reference dataset, not a per-run path (default: %(default)s)')
     parser.add_argument('--manifest-only', action='store_true',
                         help='derive the manifest from tarball NAMES and exit. Unpacks nothing.')
     parser.add_argument('--verify-members', action='store_true',
@@ -482,31 +540,37 @@ def build_parser():
                         ))
     parser.add_argument('--out', default=OUTPUT_CSV,
                         help='where to write the manifest (default: %(default)s)')
-    parser.add_argument('--out-dir', default=EXTRACT_BASE_DIR,
-                        help='extraction destination (default: %(default)s)')
-    return parser
+    parser.add_argument('--run-dir', default=None,
+                        help='campaign run directory; when given, this step logs to '
+                             '<run-dir>/steps/' + STEP_NAME + '/ instead of beside --out')
+    # --out-dir keeps this script's own meaning (the extraction destination); the
+    # step's private folder is derived by runtime_namespace() instead.
+    add_runtime_arguments(parser, STEP_NAME, default_out_dir=EXTRACT_BASE_DIR)
+    return _describe_out_dir(parser)
 
 
-def main(argv=None):
-    args = build_parser().parse_args(argv)
+def _run(args, log):
+    """Do the work and return a process exit code. Logging is already configured."""
     start = time.time()
 
     if args.manifest_only:
-        manifest, stats = build_cavity_manifest(args.tarballs, verify_members=args.verify_members)
+        manifest, stats = build_cavity_manifest(args.tarballs,
+                                                verify_members=args.verify_members,
+                                                extract_base_dir=args.out_dir)
         manifest.to_csv(args.out, index=False)
-        logging.info('manifest: %d rows over %d accessions from %d tarballs (nothing unpacked)',
-                     stats['rows'], stats['accessions'], stats['tarballs_seen'])
+        log.info('manifest: %d rows over %d accessions from %d tarballs (nothing unpacked)',
+                 stats['rows'], stats['accessions'], stats['tarballs_seen'])
         if stats['unparseable']:
-            logging.warning('%d tarball name(s) did not parse, e.g. %s',
-                            len(stats['unparseable']), stats['unparseable'][:3])
+            log.warning('%d tarball name(s) did not parse, e.g. %s',
+                        len(stats['unparseable']), stats['unparseable'][:3])
         if stats['mismatched']:
-            logging.warning('%d tarball(s) did not hold the cavity their name advertises',
-                            len(stats['mismatched']))
-        logging.info('wrote %s in %.1fs', args.out, time.time() - start)
+            log.warning('%d tarball(s) did not hold the cavity their name advertises',
+                        len(stats['mismatched']))
+        log.info('wrote %s in %.1fs', args.out, time.time() - start)
         return 0
 
     if not args.required:
-        logging.error(
+        log.error(
             '--required is mandatory for extraction. Without it this script would '
             'unpack every tarball in the folder -- 38,709 archives and 76.6 GB for a '
             'campaign that needed 2,829. Run with --manifest-only first, compute the '
@@ -515,14 +579,14 @@ def main(argv=None):
         )
         return 2
     if not args.manifest:
-        logging.error('--manifest is required for extraction; produce it with --manifest-only.')
+        log.error('--manifest is required for extraction; produce it with --manifest-only.')
         return 2
 
     try:
         manifest = pd.read_csv(args.manifest)
         required = required_keys_from_frame(pd.read_csv(args.required))
     except (OSError, ValueError) as exc:
-        logging.error('%s', exc)
+        log.error('%s', exc)
         return 2
 
     out, stats = extract_required_cavities(
@@ -530,19 +594,33 @@ def main(argv=None):
     )
     out.to_csv(args.out, index=False)
 
-    logging.info('required %d cavities: %d newly extracted, %d already present, %d on disk',
-                 stats['required'], stats['extracted'], stats['reused'], stats['present'])
+    log.info('required %d cavities: %d newly extracted, %d already present, %d on disk',
+             stats['required'], stats['extracted'], stats['reused'], stats['present'])
     if stats['missing_from_manifest']:
-        logging.error('%d required cavit(ies) are not in the manifest at all, e.g. %s',
-                      len(stats['missing_from_manifest']), stats['missing_from_manifest'][:3])
+        log.error('%d required cavit(ies) are not in the manifest at all, e.g. %s',
+                  len(stats['missing_from_manifest']), stats['missing_from_manifest'][:3])
     if stats['failed']:
-        logging.error('%d tarball(s) failed to extract', len(stats['failed']))
+        log.error('%d tarball(s) failed to extract', len(stats['failed']))
     if stats['present'] != stats['required']:
-        logging.error('INVARIANT: %d cavities required but %d present on disk',
-                      stats['required'], stats['present'])
+        log.error('INVARIANT: %d cavities required but %d present on disk',
+                  stats['required'], stats['present'])
         return 3
-    logging.info('wrote %s in %.1fs', args.out, time.time() - start)
+    log.info('wrote %s in %.1fs', args.out, time.time() - start)
     return 0
+
+
+def main(argv=None):
+    """Build the manifest or unpack the required cavities; returns an exit code."""
+    args = build_parser().parse_args(argv)
+    with step(STEP_NAME, runtime_namespace(args, STEP_NAME)) as ctx:
+        rc = _run(args, ctx.logger)
+        if rc:
+            # step() only sees a clean return, so an exit code has to be reported
+            # (and notified) here or a failed run would be announced as a success.
+            ctx.logger.error('%s exited with code %d', STEP_NAME, rc)
+            ctx.notify('failure', '%s: FAILED (exit code %d)' % (STEP_NAME, rc),
+                       priority=1)
+    return rc
 
 
 if __name__ == "__main__":

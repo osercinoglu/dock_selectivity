@@ -23,6 +23,13 @@ import pandas as pd
 
 import extract_cavities as ec
 
+from tests.support import run_in_temp_cwd
+
+#: A step with no --run-dir logs into ./<step-name>/; tests must not
+#: create that inside the checkout.
+setUpModule, tearDownModule = run_in_temp_cwd()
+
+
 
 def make_tarball(folder: str, accession: str, fragment: int, cavity: int,
                  member_cavity: int = None) -> str:

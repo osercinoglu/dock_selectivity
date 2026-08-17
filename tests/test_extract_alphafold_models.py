@@ -22,6 +22,13 @@ import pandas as pd
 
 import extract_alphafold_models as eam
 
+from tests.support import run_in_temp_cwd
+
+#: A step with no --run-dir logs into ./<step-name>/; tests must not
+#: create that inside the checkout.
+setUpModule, tearDownModule = run_in_temp_cwd()
+
+
 
 class TestFallbackRemoved(unittest.TestCase):
     def test_no_path_raises(self):

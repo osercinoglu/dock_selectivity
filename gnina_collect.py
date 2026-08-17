@@ -52,6 +52,10 @@ Usage
     # one pass, collect whatever is ready, exit (what the tests drive)
     gnina_collect.py --run-dir $RUN --once
 
+    # tell me on my phone when the pump abandons a job or drains the queue
+    PUSHOVER_TOKEN=... PUSHOVER_USER_KEY=... \\
+        gnina_collect.py --run-dir $RUN --daemon --notify --notify-on all
+
     # read-only introspection; takes no lock, safe while a pump runs
     gnina_collect.py --run-dir $RUN --status
 
@@ -73,6 +77,15 @@ Exit codes
   2  usage / the queue is not there / no params.json
   1  an unexpected error
 ===  ============================================================
+
+Runtime flags
+-------------
+The shared runtime supplies ``--out-dir``, ``--log-file``, ``--log-level``,
+``--quiet``, ``--notify``, ``--notify-on`` and ``--notify-title``; the pump's log
+defaults to ``<run-dir>/steps/gnina_collect/gnina_collect.log`` and ``--log`` is
+kept as the spelling batch_dock spawns the collector with.  ``--status``,
+``--stop`` and ``--requeue`` are queries and deliberately configure nothing: a
+question about a running pump must not create a directory or a log file.
 """
 
 from __future__ import annotations
@@ -99,7 +112,19 @@ try:                                             # pragma: no cover - trivial
 except ImportError:                              # pragma: no cover - trivial
     gq = None
 
-LOG = logging.getLogger("gnina_collect")
+# Standard library only, like the rest of this module: importing the shared
+# runtime cannot pull in the science stack and cannot slow the pump's start.
+from dock_selectivity.runtime import (  # noqa: E402
+    add_runtime_arguments,
+    resolve_out_dir,
+    step,
+)
+
+#: Names the logger, the log file and the step directory
+#: (``<run-dir>/steps/gnina_collect/gnina_collect.log``).
+STEP_NAME = "gnina_collect"
+
+LOG = logging.getLogger(STEP_NAME)
 
 DEFAULT_POLL_SECONDS = 15.0
 DEFAULT_COLLECT_WORKERS = 2
@@ -1073,40 +1098,6 @@ class Collector(object):
 # --- CLI ---------------------------------------------------------------------
 
 
-#: Marks the handlers this module installed, so a second ``main()`` in the same
-#: interpreter replaces them instead of stacking a duplicate of every line.
-_OUR_HANDLER = "_gnina_collect_handler"
-
-
-def _configure_logging(log_path=None, quiet=False):
-    level = logging.WARNING if quiet else logging.INFO
-    root = logging.getLogger()
-    for handler in list(root.handlers):
-        if getattr(handler, _OUR_HANDLER, False):
-            root.removeHandler(handler)
-            try:
-                handler.close()
-            except Exception:                              # pragma: no cover
-                pass
-    root.setLevel(level)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-    stream = logging.StreamHandler(sys.stderr)
-    stream.setFormatter(fmt)
-    setattr(stream, _OUR_HANDLER, True)
-    root.addHandler(stream)
-    if log_path:
-        try:
-            os.makedirs(os.path.dirname(os.path.abspath(log_path)) or ".",
-                        exist_ok=True)
-            handler = logging.FileHandler(log_path)
-            handler.setFormatter(fmt)
-            setattr(handler, _OUR_HANDLER, True)
-            root.addHandler(handler)
-        except OSError as exc:
-            LOG.warning("cannot write the log file %s (%s); stderr only",
-                        log_path, exc)
-
-
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="gnina_collect.py",
@@ -1157,9 +1148,22 @@ def build_parser():
                         help="permit --job-deadline to rewrite params.json")
     parser.add_argument("--strict-caps", action="store_true",
                         help="treat capability warnings as fatal")
-    parser.add_argument("--log", default=None, help="also write logs to this file")
-    parser.add_argument("--quiet", action="store_true",
-                        help="warnings and errors only")
+    parser.add_argument("--reconcile-interval", type=float,
+                        default=RECONCILE_INTERVAL_SECONDS,
+                        help="seconds between full re-derivations of the queue "
+                             "state from disk and the remote (default %(default)s)")
+    parser.add_argument("--max-transient-attempts", type=int,
+                        default=MAX_TRANSIENT_ATTEMPTS,
+                        help="SSH-level failures one job may survive before it is "
+                             "abandoned; capped separately from docking attempts "
+                             "so a flaky link does not burn them (default %(default)s)")
+    add_runtime_arguments(parser, STEP_NAME)
+    # Same dest as --log-file, so it is one setting with two spellings rather
+    # than two settings that almost agree: batch_dock has always spawned the
+    # collector with --log <queue_root>/collector.log and that command line
+    # lives in running campaigns and in operators' shell history.
+    parser.add_argument("--log", dest="log_file", default=None,
+                        help="compatibility spelling of --log-file")
     return parser
 
 
@@ -1325,18 +1329,48 @@ def _exit_code(queue):
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
-    _configure_logging(args.log, args.quiet)
-    logger = LOG
+
+    # --status / --stop / --requeue are questions about a pump, not a pump run.
+    # A question must not create a step directory or a log file, for the same
+    # reason batch_dock's --print-config does not: a query with side effects is
+    # not a query. They print to stdout and take no lock.
+    if args.stop or args.requeue or args.status:
+        try:
+            if gq is None:
+                _require_queue()
+            if args.stop:
+                return cmd_stop(args)
+            if args.requeue:
+                return cmd_requeue(args)
+            return cmd_status(args)
+        except CollectorError as exc:
+            LOG.error("%s", exc)
+            print("gnina_collect: %s" % exc, file=sys.stderr)
+            return EXIT_USAGE
+
+    resolve_out_dir(args, STEP_NAME, os.path.abspath(args.run_dir))
+    with step(STEP_NAME, args) as ctx:
+        code = _pump(args, ctx)
+        if code not in (EXIT_OK,):
+            ctx.notify("failure",
+                       "gnina_collect: exit {0} (0 drained clean, 3 abandoned "
+                       "jobs, 4 work left, 5 locked, 78 caps)".format(code),
+                       priority=1)
+        return code
+
+
+def _pump(args, ctx):
+    """The pump itself, inside the step's logging and notifications."""
+    logger = ctx.logger
+    # Both are read as module globals from inside the retry policy and the
+    # reconcile clock, so the resolved values are written back over them once,
+    # here, rather than threaded through every call site.
+    globals()["RECONCILE_INTERVAL_SECONDS"] = float(args.reconcile_interval)
+    globals()["MAX_TRANSIENT_ATTEMPTS"] = int(args.max_transient_attempts)
 
     try:
         if gq is None:
             _require_queue()
-        if args.stop:
-            return cmd_stop(args)
-        if args.requeue:
-            return cmd_requeue(args)
-        if args.status:
-            return cmd_status(args)
 
         # Refuse rather than create. GninaQueue(create=True) would happily make
         # an empty queue under a mistyped --run-dir, and the pump would then

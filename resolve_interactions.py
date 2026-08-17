@@ -65,11 +65,19 @@ Usage
 ::
 
     python resolve_interactions.py \\
+        --run-dir $NEW \\
         --edges /opt/data/multiscale_interactome_data/1_drug_to_protein.tsv \\
         --index $NEW/identity/identity_index.parquet \\
         --drugs /opt/data/drugbank/small_molecule_drug_links.csv \\
         --out   $NEW/manifests/interactions_resolved.csv \\
-        --rejects $NEW/identity/unresolved_targets.csv
+        --rejects $NEW/identity/unresolved_interactions.csv
+
+``--run-dir`` is optional and moves only this step's own log and scratch state to
+``$NEW/steps/resolve_interactions/``; the artifacts keep their explicit ``--out`` /
+``--rejects`` / ``--report`` paths.  Without it the step directory is inferred from
+``--out``, so the log still lands in the campaign rather than in the invocation
+directory.  ``--notify`` (with ``PUSHOVER_TOKEN`` / ``PUSHOVER_USER_KEY`` in the
+environment) sends a Pushover message when the stage finishes or fails.
 
 Python 3.9 compatible: no PEP 604 unions at runtime, no ``match`` statements.
 """
@@ -116,6 +124,11 @@ from dock_selectivity.invariants import (  # noqa: E402
     write_invariant_report,
 )
 from dock_selectivity.joins import checked_merge_with_report  # noqa: E402
+from dock_selectivity.runtime import (  # noqa: E402
+    add_runtime_arguments,
+    resolve_out_dir,
+    step,
+)
 from dock_selectivity.schemas import SchemaViolation, coerce, validate, write_checked  # noqa: E402
 
 __all__ = [
@@ -143,7 +156,16 @@ __all__ = [
     "main",
 ]
 
-logger = logging.getLogger("resolve_interactions")
+#: Names the logger, the step directory and the log file. Must stay equal to the
+#: logger name below, or ``step()`` would configure a logger this module never uses.
+STEP_NAME = "resolve_interactions"
+
+logger = logging.getLogger(STEP_NAME)
+
+#: Directories the fixed run layout puts artifacts in; their parent is the run
+#: directory. Consulted only to place this step's own log when ``--run-dir`` is
+#: absent -- the log must land in the campaign, never in the invocation directory.
+_LAYOUT_DIRS = ("manifests", "identity", "analysis", "structures", "docking_results")
 
 #: DrugBank's own vocabulary export. On this machine the path is a *directory*
 #: holding ``drugbank vocabulary.csv``; :meth:`CompoundIndex.load` accepts either
@@ -1693,6 +1715,20 @@ def _format_summary(summary: Dict[str, Any]) -> str:
 # --------------------------------------------------------------------------
 
 
+def infer_run_dir(artifact_path: str) -> str:
+    """Best guess at the run directory, from an artifact this step writes.
+
+    ``--run-dir`` is optional so every existing command line (including the ones
+    ``run_full_workflow.py`` builds) keeps working unchanged, but the step log may
+    not fall back to the invocation directory -- that is how the repository working
+    tree filled up with stray ``*.log`` files.
+    """
+    parent = os.path.dirname(os.path.abspath(artifact_path))
+    if os.path.basename(parent) in _LAYOUT_DIRS:
+        return os.path.dirname(parent)
+    return parent
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="resolve_interactions.py",
@@ -1789,21 +1825,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Do not reject rows whose node_1_type/node_2_type are not drug/protein.",
     )
     parser.add_argument(
+        "--run-dir",
+        default=None,
+        help=(
+            "Campaign run directory. Optional: it only places this step's own log "
+            "and scratch state at <run-dir>/steps/resolve_interactions/. The "
+            "artifacts keep their explicit --out/--rejects/--report paths."
+        ),
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
-        help="Debug-level logging.",
+        help="Debug-level logging (same as --log-level DEBUG).",
     )
+    add_runtime_arguments(parser, STEP_NAME)
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_arg_parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
-
+def _resolve(args: argparse.Namespace) -> int:
+    """The stage itself. ``main()`` runs this inside :func:`step`."""
     out_path = os.fspath(args.out)
     base = os.path.splitext(out_path)[0]
     rejects_path = args.rejects or (base + ".rejects.csv")
@@ -1869,6 +1910,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("wrote %s", out_path)
     logger.info("wrote %s", rejects_path)
     logger.info("wrote %s", report_path)
+    return 0
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    if args.verbose:
+        # -v predates --log-level and existing command lines still pass it.
+        args.log_level = "DEBUG"
+    resolve_out_dir(args, STEP_NAME, args.run_dir or infer_run_dir(args.out))
+    try:
+        with step(STEP_NAME, args):
+            code = _resolve(args)
+            if code:
+                # step() reports a non-zero SystemExit as a failure (and notifies
+                # about it); main() still owes its caller an int, so catch it back.
+                raise SystemExit(code)
+    except SystemExit as exc:
+        return int(exc.code or 0)
     return 0
 
 

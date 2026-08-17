@@ -83,6 +83,15 @@ Usage::
 
     python3 curate_jobs.py ...same flags, minus --dry-run...
 
+The shared runtime flags apply (``--out-dir``, ``--log-file``, ``--log-level``,
+``--quiet``, ``--notify``, ``--notify-on``, ``--notify-title``).  The log lands in
+``<run-dir>/steps/curate_jobs/curate_jobs.log``, where the run directory is the
+parent of ``--dst``; ``--dry-run`` writes no log either, because it writes
+nothing.  A copy of 13,730 job directories is worth a notification::
+
+    PUSHOVER_TOKEN=... PUSHOVER_USER_KEY=... \\
+        python3 curate_jobs.py --notify --notify-on all ...
+
 Python 3.9 compatible.
 """
 
@@ -120,6 +129,11 @@ from dock_selectivity.jobid import (  # noqa: E402
     read_job_identity_record,
     write_job_identity,
 )
+from dock_selectivity.runtime import (  # noqa: E402
+    add_runtime_arguments,
+    resolve_out_dir,
+    step,
+)
 from dock_selectivity.schemas import read_checked, write_checked  # noqa: E402
 
 __all__ = [
@@ -141,9 +155,14 @@ __all__ = [
     "job_provenance",
     "execute_plan",
     "main",
+    "STEP_NAME",
 ]
 
-logger = logging.getLogger("curate_jobs")
+#: Names the logger, the log file and the step directory
+#: (``<run-dir>/steps/curate_jobs/curate_jobs.log``). One string, so they cannot drift.
+STEP_NAME = "curate_jobs"
+
+logger = logging.getLogger(STEP_NAME)
 
 #: Classification a reuse row must carry to be carried over as a positive.
 TRUE_POSITIVE = "true_positive"
@@ -1193,16 +1212,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="write run_manifest rows for the curated jobs here (schema: run_manifest)",
     )
     parser.add_argument("--code-revision", default=None, help="override the recorded git revision")
-    parser.add_argument("--quiet", action="store_true", help="warnings and errors only")
+    add_runtime_arguments(parser, STEP_NAME)
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.WARNING if args.quiet else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
 
     if args.dry_run and (args.report or args.rejects or args.manifest_out):
         _build_parser().error(
@@ -1212,6 +1227,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.workers < 1:
         _build_parser().error("--workers must be >= 1")
 
+    # The run directory is the parent of --dst ($NEW/docking_results), so the log
+    # sits beside the tree it describes instead of in whatever directory the
+    # operator happened to be standing in.
+    resolve_out_dir(args, STEP_NAME, os.path.dirname(os.path.abspath(args.dst)))
+    if args.dry_run and not args.log_file:
+        # "--dry-run writes nothing" has to include this program's own log, or
+        # the one command an operator is told to run first stops being harmless.
+        args.log_file = os.devnull
+
+    with step(STEP_NAME, args) as ctx:
+        return _curate(args, ctx)
+
+
+def _curate(args: Any, ctx: Any) -> int:
+    """The body of :func:`main`, inside the step's logging and notifications."""
     started_at = datetime.datetime.now().isoformat(timespec="seconds")
     try:
         _assert_disjoint(args.src, args.dst)
@@ -1235,6 +1265,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     except (CurationError, InvariantViolation, FileNotFoundError, JobIdError) as exc:
         logger.error("%s", exc)
+        ctx.notify("failure", "curate_jobs: could not plan: {0}".format(exc), priority=1)
         return 1
 
     logger.info(
@@ -1271,6 +1302,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     except CurationError as exc:
         logger.error("%s", exc)
+        ctx.notify("failure", "curate_jobs: copy aborted: {0}".format(exc), priority=1)
         return 1
 
     counts: Dict[str, int] = {}
@@ -1335,7 +1367,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         write_checked(_manifest_frame(plan, outcomes), args.manifest_out, "run_manifest")
 
     if n_failed or (plan.n_errors and not args.allow_errors):
+        ctx.notify("failure",
+                   "curate_jobs: {0} job(s) failed to copy, {1} unresolved "
+                   "candidate(s)".format(n_failed, plan.n_errors),
+                   priority=1)
         return 1
+    ctx.notify("success",
+               "curate_jobs: {0} copied, {1} already complete, {2:.1f} GB".format(
+                   counts.get("copied", 0), counts.get("skipped_complete", 0),
+                   total_bytes / (1024.0 ** 3)))
     return 0
 
 

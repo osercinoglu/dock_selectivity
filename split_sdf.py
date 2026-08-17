@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Split a multi-molecule SDF into one 3D-prepared file per DrugBank ID.
 
 Reads a combined SDF (e.g. DrugBank's approved-structures export), and for each
@@ -9,18 +10,51 @@ written under a guessed name.
 
 Run once per ligand set, ahead of the pipeline.
 
+The embedding seed and the optimisation iteration cap are flags, not literals:
+they determine the geometry of every ligand that every downstream docking pose is
+built from, so a run must be able to state (and reproduce) the values it used.
+
 Usage::
 
-    python3 split_sdf.py <input.sdf> <output_dir>
+    python3 split_sdf.py --in-sdf /opt/data/drugbank/approved_structures.sdf \
+        --out /opt/data/drugbank/drugbank_approved_split
+
+    # reproducibility knobs and a notification when it finishes
+    python3 split_sdf.py --in-sdf drugbank.sdf --out ligands \
+        --seed 42 --max-iters 1000 --remove-hydrogens --notify --notify-on all
+
+The ``--out`` folder is what you then hand to the pipeline as ``--ligands``.
 """
 
-from rdkit import Chem
-from rdkit.Chem import AllChem # Contains functions for 3D operations
+import argparse
+import logging
 import os
-import sys
+
+from rdkit import Chem
+from rdkit.Chem import AllChem  # Contains functions for 3D operations
 from tqdm import tqdm
 
-def split_and_process_sdf(input_sdf_file_path, output_directory_path, remove_hydrogens_before_save=False):
+from dock_selectivity.runtime import add_runtime_arguments, resolve_out_dir, step
+
+STEP_NAME = "split_sdf"
+
+# --- Configuration ------------------------------------------------------------
+# Defaults only: both are flags. They are the inputs to every ligand geometry the
+# campaign docks, so they belong in the run's logged configuration.
+DEFAULT_SEED = 42
+DEFAULT_MAX_ITERS = 1000
+
+# --- Implementation detail (the pipeline's naming contract, not configuration) -
+# Docking jobs look their ligand up as <DRUGBANK_ID>.sdf, so this property name
+# is fixed by the job-folder contract rather than chosen per run.
+ID_PROPERTY = "DRUGBANK_ID"
+
+LOG = logging.getLogger(STEP_NAME)
+
+
+def split_and_process_sdf(input_sdf_file_path, output_directory_path,
+                          remove_hydrogens_before_save=False,
+                          seed=DEFAULT_SEED, max_iters=DEFAULT_MAX_ITERS):
     """
     Loads an SDF file, processes each molecule to add hydrogens, build 3D coordinates,
     optimize geometry, and then saves each to a separate SDF file named by its <DRUGBANK_ID>.
@@ -33,25 +67,26 @@ def split_and_process_sdf(input_sdf_file_path, output_directory_path, remove_hyd
         remove_hydrogens_before_save (bool): If True, hydrogens added for 3D processing
                                              will be removed before saving the SDF file.
                                              Set to False to keep them (recommended for 3D data).
+        seed (int): ETKDG random seed; identical input plus identical seed gives
+                    identical coordinates.
+        max_iters (int): MMFF optimisation iteration cap.
+
+    Returns:
+        dict: counts of molecules read, saved, failed to embed and unconverged.
     """
     if not os.path.exists(input_sdf_file_path):
-        print(f"Error: Input SDF file not found at '{input_sdf_file_path}'")
-        sys.exit(1)
+        raise FileNotFoundError(
+            "input SDF file not found: {0}".format(input_sdf_file_path))
 
-    if not os.path.isdir(output_directory_path):
-        try:
-            os.makedirs(output_directory_path)
-            print(f"Created output directory: '{output_directory_path}'")
-        except OSError as e:
-            print(f"Error: Could not create output directory '{output_directory_path}': {e}")
-            sys.exit(1)
+    os.makedirs(output_directory_path, exist_ok=True)
 
-    print(f"Processing input file: '{input_sdf_file_path}'")
-    print(f"Saving processed molecules to: '{output_directory_path}'")
-    print(f"Remove hydrogens before saving: {remove_hydrogens_before_save}")
+    LOG.info("Processing input file: %s", input_sdf_file_path)
+    LOG.info("Saving processed molecules to: %s", output_directory_path)
+    LOG.info("Remove hydrogens before saving: %s", remove_hydrogens_before_save)
+    LOG.info("ETKDG seed: %s, MMFF max iterations: %s", seed, max_iters)
 
     supplier = Chem.SDMolSupplier(input_sdf_file_path)
-    
+
     molecules_processed = 0
     molecules_saved = 0
     molecules_failed_3d = 0
@@ -59,15 +94,15 @@ def split_and_process_sdf(input_sdf_file_path, output_directory_path, remove_hyd
 
     for i, mol in enumerate(tqdm(supplier, desc="Processing Molecules", unit="mol")):
         molecules_processed += 1
-        
+
         if mol is None:
-            tqdm.write(f"Warning: Could not read molecule {i+1}. Skipping.")
+            LOG.warning("Could not read molecule %d. Skipping.", i + 1)
             continue
 
-        drugbank_id = mol.GetProp("DRUGBANK_ID") if mol.HasProp("DRUGBANK_ID") else None
+        drugbank_id = mol.GetProp(ID_PROPERTY) if mol.HasProp(ID_PROPERTY) else None
 
         if not drugbank_id:
-            tqdm.write(f"Warning: Molecule {i+1} has no 'DRUGBANK_ID' property. Skipping.")
+            LOG.warning("Molecule %d has no '%s' property. Skipping.", i + 1, ID_PROPERTY)
             continue
 
         # 1. Add Hydrogens
@@ -76,23 +111,24 @@ def split_and_process_sdf(input_sdf_file_path, output_directory_path, remove_hyd
         # 2. Generate 3D Coordinates
         # Create an EmbedParameters object and set parameters on it
         params = AllChem.ETKDGv2()
-        params.randomSeed = 42 # Adjust randomSeed as needed for reproducibility
-        # You can add other parameters to 'params' as needed, e.g., params.maxAttempts = 1000
+        params.randomSeed = seed
 
-        embed_result = AllChem.EmbedMolecule(mol_with_hs, params) # Pass the parameters object
+        embed_result = AllChem.EmbedMolecule(mol_with_hs, params)  # Pass the parameters object
 
-        if embed_result == -1: # -1 indicates failure to embed
-            tqdm.write(f"Warning: Failed to generate 3D coordinates for '{drugbank_id}'. Skipping optimization and saving.")
+        if embed_result == -1:  # -1 indicates failure to embed
+            LOG.warning("Failed to generate 3D coordinates for '%s'. "
+                        "Skipping optimization and saving.", drugbank_id)
             molecules_failed_3d += 1
             continue
-        
+
         # 3. Optimize Geometry
         # mmffVariant='MMFF94' is default, can also be 'MMFF94s'
         # MMFFOptimizeMolecule returns 0 if converged, 1 if not converged
-        opt_result = AllChem.MMFFOptimizeMolecule(mol_with_hs, maxIters=1000) # Increased iterations for better optimization
+        opt_result = AllChem.MMFFOptimizeMolecule(mol_with_hs, maxIters=max_iters)
 
         if opt_result != 0:
-            tqdm.write(f"Warning: Geometry optimization for '{drugbank_id}' did not converge (result: {opt_result}). Saving anyway.")
+            LOG.warning("Geometry optimization for '%s' did not converge "
+                        "(result: %s). Saving anyway.", drugbank_id, opt_result)
             molecules_failed_opt += 1
 
         # 4. (Optional) Remove Hydrogens before saving
@@ -104,38 +140,77 @@ def split_and_process_sdf(input_sdf_file_path, output_directory_path, remove_hyd
         # 5. Save the molecule
         safe_drugbank_id = "".join(c for c in drugbank_id if c.isalnum() or c in ('-', '_', '.'))
         if not safe_drugbank_id:
-             safe_drugbank_id = f"molecule_{i+1}_no_clean_id"
+            safe_drugbank_id = "molecule_{0}_no_clean_id".format(i + 1)
 
-        output_filename = os.path.join(output_directory_path, f"{safe_drugbank_id}.sdf")
+        output_filename = os.path.join(output_directory_path, "{0}.sdf".format(safe_drugbank_id))
         writer = Chem.SDWriter(output_filename)
         writer.write(final_mol)
         writer.close()
-        # tqdm.write(f"Saved molecule '{drugbank_id}' to '{output_filename}'") # Too verbose for large runs
         molecules_saved += 1
 
-    print(f"\n--- Processing Summary ---")
-    print(f"Total molecules read: {molecules_processed}")
-    print(f"Molecules with DRUGBANK_ID saved: {molecules_saved}")
-    print(f"Molecules that failed 3D embedding: {molecules_failed_3d}")
-    print(f"Molecules where optimization did not converge: {molecules_failed_opt}")
-    print("Script finished.")
+    LOG.info("--- Processing Summary ---")
+    LOG.info("Total molecules read: %d", molecules_processed)
+    LOG.info("Molecules with %s saved: %d", ID_PROPERTY, molecules_saved)
+    LOG.info("Molecules that failed 3D embedding: %d", molecules_failed_3d)
+    LOG.info("Molecules where optimization did not converge: %d", molecules_failed_opt)
+
+    return {
+        "molecules_read": molecules_processed,
+        "molecules_saved": molecules_saved,
+        "failed_3d": molecules_failed_3d,
+        "unconverged": molecules_failed_opt,
+    }
+
+
+def build_parser():
+    """Build the command-line parser for the ligand-splitting stage."""
+    parser = argparse.ArgumentParser(
+        prog="split_sdf.py",
+        description=("Split one multi-molecule SDF into a folder of 3D-prepared "
+                     "<DRUGBANK_ID>.sdf files -- the folder the pipeline takes as "
+                     "--ligands."))
+    parser.add_argument('--in-sdf', required=True,
+                        help='combined input SDF (e.g. DrugBank approved structures). MANDATORY')
+    parser.add_argument('--out', required=True,
+                        help='directory to write one <DRUGBANK_ID>.sdf per molecule; '
+                             'this is the folder the pipeline passes as --ligands. MANDATORY')
+    parser.add_argument('--remove-hydrogens', action='store_true',
+                        help='strip the hydrogens added for 3D embedding before saving '
+                             '(default: keep them, which is what docking wants)')
+    parser.add_argument('--seed', type=int, default=DEFAULT_SEED,
+                        help='ETKDG embedding random seed; the same input and seed give the '
+                             'same coordinates (default: %(default)s)')
+    parser.add_argument('--max-iters', type=int, default=DEFAULT_MAX_ITERS,
+                        help='MMFF geometry-optimisation iteration cap (default: %(default)s)')
+    parser.add_argument('--run-dir', default=None,
+                        help='campaign run directory; when given, this step logs to '
+                             '<run-dir>/steps/' + STEP_NAME + '/ (default: ./' + STEP_NAME + ')')
+    return add_runtime_arguments(parser, STEP_NAME)
+
+
+def main(argv=None):
+    """Split the input SDF into per-ligand files; returns a process exit code."""
+    args = build_parser().parse_args(argv)
+    resolve_out_dir(args, STEP_NAME, args.run_dir)
+
+    try:
+        with step(STEP_NAME, args) as ctx:
+            if not os.path.exists(args.in_sdf):
+                ctx.logger.error("input SDF file not found: %s", args.in_sdf)
+                raise SystemExit(2)
+            summary = split_and_process_sdf(args.in_sdf, args.out,
+                                            remove_hydrogens_before_save=args.remove_hydrogens,
+                                            seed=args.seed, max_iters=args.max_iters)
+            if summary["molecules_saved"] == 0:
+                # An empty ligand folder is accepted silently by every downstream
+                # stage and shows up only as "no jobs planned" much later.
+                ctx.logger.error("no molecules were written to %s; the ligand folder "
+                                 "would be empty", args.out)
+                raise SystemExit(1)
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    return 0
+
 
 if __name__ == "__main__":
-    if len(sys.argv) not in [3, 4]:
-        print("Usage: python process_sdf.py <input_sdf_file_path> <output_directory_path> [remove_hydrogens_before_save]")
-        print("  <input_sdf_file_path>: Full path to the input SDF file.")
-        print("  <output_directory_path>: Full path to the directory where split SDF files will be saved.")
-        print("  [remove_hydrogens_before_save]: Optional. Set to 'true' or 'yes' to remove hydrogens before saving. Default is to keep them.")
-        print("Example: python process_sdf.py /home/user/data/drugbank.sdf /home/user/output/3d_drugs true")
-        sys.exit(1)
-
-    input_sdf = sys.argv[1]
-    output_dir = sys.argv[2]
-    
-    # Check for the optional argument to remove hydrogens
-    remove_hs = False
-    if len(sys.argv) == 4:
-        if sys.argv[3].lower() in ['true', 'yes', 't', 'y']:
-            remove_hs = True
-
-    split_and_process_sdf(input_sdf, output_dir, remove_hs)
+    raise SystemExit(main())

@@ -1,21 +1,56 @@
 #!/usr/bin/env python3
 """
 PocketMatch Similarity Calculator for Cavity Files (Parallelized)
+=================================================================
 
-This script runs PocketMatch on cavity PDB files extracted from AlphaFold structures
-to compute pairwise pocket similarity scores (Pmin and Pmax).
+Runs PocketMatch on the cavity PDB files extracted from AlphaFold structures and
+computes pairwise pocket similarity scores (Pmin and Pmax).
 
-Supports parallel processing by dividing pockets into chunks and using Step3-PM_typeB
-for comparisons between chunks and the full set.
+Pockets are divided into blocks; each block becomes one cabbage file, and
+Step3-PM_typeB compares block against block inside isolated temporary
+workspaces, so an all-pairs comparison over tens of thousands of pockets stays
+tractable and ``--resume`` can continue from the blocks and chunks already on
+disk.
 
-Input: Directory containing cavity PDB files in subdirectories
-Output: CSV file with pairwise pocket similarity scores
+This is the optional pocket-similarity side branch: it is not part of
+run_full_workflow.py's phase chain. Its output feeds pocketmatch_clustering.py,
+whose pocket_clusters/ directory parse_prepare.py joins back onto the docking
+results.
+
+Every timeout in the branch is a flag: on slower storage the defaults below are
+the first thing that needs changing, and editing the source to change them is
+not a run configuration.
+
+Usage:
+    python3 get_PM_scores.py \\
+        --cavities <run-dir>/extracted_cavities \\
+        --output-dir <run-dir>/pocketmatch_results \\
+        --pm-dir /home/onur/software/PocketMatch_v2.1/PocketMatch_v2.1 \\
+        --af-structures <run-dir>/alphafold_structures \\
+        --threads 8 --resume
+
+    # a quick shape check that touches only the first few blocks
+    python3 get_PM_scores.py --cavities ... --output-dir ... --pm-dir ... \\
+        --test-mode --test-blocks 2
+
+    The original single-dash spellings (-cavities, -output, -pm_dir,
+    -af_structures, -threads) still work, so shell history keeps running.
+
+Input:
+    --cavities       directory of cavity PDB files in per-structure subdirectories
+    --pm-dir         PocketMatch v2.1 installation (Step0-cabbage.sh, Step3-PM_typeB)
+    --af-structures  AlphaFold models, used to restore complete residues
+
+Output:
+    <output-dir>/PocketMatch_similarities/similarities_part_*.csv
+    <out-dir>/get_PM_scores.log   (see --out-dir / --log-file)
 """
 
 import pandas as pd
 import numpy as np
 import subprocess
 import os
+import sys
 import glob
 import shutil
 import argparse
@@ -29,31 +64,66 @@ import json
 import logging
 import faulthandler
 import signal
-import time
 import re
 from biopandas.pdb import PandasPdb
 
-faulthandler.register(signal.SIGUSR1)
-# Module-level logger (configured in main entry)
-logger = logging.getLogger("pocketmatch")
+from dock_selectivity.runtime import add_runtime_arguments, resolve_out_dir, step
 
-def _setup_logger(log_path: str):
-    """Configure file logger once (idempotent)."""
-    logger.setLevel(logging.INFO)
-    # Avoid adding multiple handlers on repeated calls
-    if not any(isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', None) == os.path.abspath(log_path) for h in logger.handlers):
-        # File handler - captures ALL levels (DEBUG and above)
-        fh = logging.FileHandler(log_path)
-        fh.setLevel(logging.DEBUG)  # File gets everything
-        fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
-        
-        # Console handler (stderr) - only INFO and above by default
-        ch = logging.StreamHandler()
-        ch.setLevel(logging.INFO)  # Console only shows INFO+ unless verbose mode
-        ch.setFormatter(fmt)
-        logger.addHandler(ch)
+faulthandler.register(signal.SIGUSR1)
+
+STEP_NAME = "get_PM_scores"
+
+# Module-level logger. Configured by the shared runtime in main(); importing
+# this module configures nothing.
+logger = logging.getLogger(STEP_NAME)
+
+# --- Configuration ---
+# Defaults only; every one of these is a flag (see build_parser). They are
+# module-level so the worker functions can read them without threading eight
+# timeouts through six call layers; main() rebinds them from the command line
+# before any work starts.
+RESIDUE_TIMEOUT = 30          # --residue-timeout   : one cavity's residue extraction
+CABBAGE_TIMEOUT = 300         # --cabbage-timeout   : one Step0-cabbage.sh run
+PM_TIMEOUT = 600              # --pm-timeout        : one Step3-PM_typeB run
+BLOCK_TIMEOUT = 1200          # --block-timeout     : one cabbage block, end to end
+BLOCK_PHASE_TIMEOUT = 7200    # --block-phase-timeout      : all blocks together
+COMPARISON_TIMEOUT = 300      # --comparison-timeout       : one block-vs-block pair
+COMPARISON_PHASE_TIMEOUT = 14400  # --comparison-phase-timeout : all pairs together
+IO_TIMEOUT = 300              # --io-timeout        : one background chunk save
+DEFAULT_THREAD_CAP = 20       # --thread-cap        : ceiling when --threads is absent
+
+#: PocketMatch's own cabbage limit. A property of the tool, not a run setting.
+MAX_BLOCK_SIZE = 1000
+
+#: Which settings main() may rebind, mapped to their argparse destination.
+RUNTIME_TUNABLES = (
+    ('RESIDUE_TIMEOUT', 'residue_timeout'),
+    ('CABBAGE_TIMEOUT', 'cabbage_timeout'),
+    ('PM_TIMEOUT', 'pm_timeout'),
+    ('BLOCK_TIMEOUT', 'block_timeout'),
+    ('BLOCK_PHASE_TIMEOUT', 'block_phase_timeout'),
+    ('COMPARISON_TIMEOUT', 'comparison_timeout'),
+    ('COMPARISON_PHASE_TIMEOUT', 'comparison_phase_timeout'),
+    ('IO_TIMEOUT', 'io_timeout'),
+    ('DEFAULT_THREAD_CAP', 'thread_cap'),
+)
+
+
+def apply_runtime_tunables(args):
+    """Rebind the module tunables from parsed arguments; return what changed.
+
+    The forked workers inherit these globals, so this must run before any pool
+    is created -- main() calls it immediately after parsing.
+    """
+    changed = {}
+    for constant, dest in RUNTIME_TUNABLES:
+        value = getattr(args, dest, None)
+        if value is None:
+            continue
+        if globals()[constant] != value:
+            changed[constant] = value
+        globals()[constant] = value
+    return changed
 
 
 def collect_cavity_files(cavities_dir):
@@ -346,7 +416,7 @@ def generate_cabbage_file(pm_dir, pocket_files, output_name="outfile.cabbage", a
         # Process results as they complete
         for future in concurrent.futures.as_completed(future_to_idx):
             try:
-                result = future.result(timeout=30)  # 30s per file
+                result = future.result(timeout=RESIDUE_TIMEOUT)
                 results.append(result)
                 idx = future_to_idx[future]
                 logger.debug(f"Extracted residues from file {idx+1}/{len(pocket_files)}")
@@ -382,9 +452,9 @@ def generate_cabbage_file(pm_dir, pocket_files, output_name="outfile.cabbage", a
     # Use cwd parameter instead of os.chdir() to avoid threading issues
     # Add timeout to prevent hanging (300s = 5 min should be enough for cabbage generation)
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd=cabbage_dir, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=cabbage_dir, timeout=CABBAGE_TIMEOUT)
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"Cabbage generation timed out after 300s for {output_name}")
+        raise RuntimeError(f"Cabbage generation timed out after {CABBAGE_TIMEOUT}s for {output_name}")
     
     if result.returncode != 0:
         raise RuntimeError(f"Cabbage generation failed: {result.stderr}")
@@ -403,7 +473,7 @@ def generate_cabbage_file(pm_dir, pocket_files, output_name="outfile.cabbage", a
     return cabbage_file, name_mapping
 
 
-def run_pocketmatch_typeB(pm_dir, cabbage_chunk, cabbage_full, timeout=600):
+def run_pocketmatch_typeB(pm_dir, cabbage_chunk, cabbage_full, timeout=None):
     """
     Run PocketMatch typeB comparison (chunk vs full set).
     
@@ -411,11 +481,14 @@ def run_pocketmatch_typeB(pm_dir, cabbage_chunk, cabbage_full, timeout=600):
         pm_dir: PocketMatch directory
         cabbage_chunk: Path to cabbage file for chunk
         cabbage_full: Path to cabbage file for full set
-        timeout: Maximum seconds to wait for comparison (default: 600 = 10 minutes)
-        
+        timeout: Maximum seconds to wait for comparison (default: --pm-timeout)
+
     Returns:
         Path to output file
     """
+    if timeout is None:
+        timeout = PM_TIMEOUT
+
     # Copy cabbage files to PM directory if not already there
     chunk_local = os.path.join(pm_dir, os.path.basename(cabbage_chunk))
     full_local = os.path.join(pm_dir, os.path.basename(cabbage_full))
@@ -1042,26 +1115,16 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
     # Create output directory FIRST
     os.makedirs(output_dir, exist_ok=True)
     
-    # Setup file logger after output directory exists
-    if resume:
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        log_path = os.path.join(output_dir, f'pocketmatch_resume_{timestamp}.log')
-        logger.info(f"RESUME MODE: Creating new log file")
-    else:
-        log_path = os.path.join(output_dir, 'pocketmatch_progress.log')
-    _setup_logger(log_path)
-    if verbose:
-        logger.setLevel(logging.DEBUG)
-        # Also set console handler to DEBUG level in verbose mode
-        for handler in logger.handlers:
-            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
-                handler.setLevel(logging.DEBUG)
+    # Logging belongs to the caller: main() configures it through the shared
+    # runtime before this function runs, so a library caller keeps its own.
     logger.info("Starting PocketMatch analysis")
-    logger.info(f"Logging to: {log_path}")
-    
-    # Determine number of threads (use conservative 20 instead of all CPUs to avoid resource exhaustion)
+    if resume:
+        logger.info("RESUME MODE: continuing from existing blocks and chunks")
+
+    # Determine number of threads (a conservative cap instead of all CPUs to avoid
+    # resource exhaustion; raise it with --thread-cap)
     if n_threads is None:
-        n_threads = min(20, cpu_count())
+        n_threads = min(DEFAULT_THREAD_CAP, cpu_count())
     
     logger.info(f"Configuration:")
     logger.info(f"Parallel threads: {n_threads}")
@@ -1073,8 +1136,8 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
         raise ValueError("No cavity PDB files found!")
     
     # Validate block size
-    if block_size < 1 or block_size > 1000:
-        raise ValueError(f"Block size must be between 1 and 1000, got {block_size}")
+    if block_size < 1 or block_size > MAX_BLOCK_SIZE:
+        raise ValueError(f"Block size must be between 1 and {MAX_BLOCK_SIZE}, got {block_size}")
     
     logger.info(f"Using block size: {block_size} pockets per block")
     
@@ -1174,10 +1237,10 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
                     ex.submit(build_cabbage_block, i, blocks[i], pm_base_dir, work_dir, af_base_dir, workers_per_block, False, verbose, block_workspaces[i]): i
                     for i in blocks_to_build
                 }
-                completed = tqdm(concurrent.futures.as_completed(futures, timeout=7200), total=len(futures), desc="   Blocks")
+                completed = tqdm(concurrent.futures.as_completed(futures, timeout=BLOCK_PHASE_TIMEOUT), total=len(futures), desc="   Blocks")
                 for fut in completed:
                     try:
-                        result = fut.result(timeout=1200)
+                        result = fut.result(timeout=BLOCK_TIMEOUT)
                         block_idx = futures[fut]
                         built_blocks[block_idx] = result
                     except concurrent.futures.TimeoutError:
@@ -1221,10 +1284,10 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
                     ex.submit(build_cabbage_block, i, blk, pm_base_dir, work_dir, af_base_dir, 1, False, verbose, block_workspaces[i]): i
                     for i, blk in enumerate(blocks)
                 }
-                completed = tqdm(concurrent.futures.as_completed(futures, timeout=7200), total=len(futures), desc="   Blocks")
+                completed = tqdm(concurrent.futures.as_completed(futures, timeout=BLOCK_PHASE_TIMEOUT), total=len(futures), desc="   Blocks")
                 for fut in completed:
                     try:
-                        result = fut.result(timeout=1200)  # 20min per block
+                        result = fut.result(timeout=BLOCK_TIMEOUT)
                         built_blocks.append(result)
                     except concurrent.futures.TimeoutError:
                         block_id = futures[fut]
@@ -1330,12 +1393,12 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
             logger.info(f"Submitted {len(futs)} comparison jobs (on-demand workspaces)")
             
             try:
-                completed = tqdm(concurrent.futures.as_completed(futs, timeout=14400), total=len(futs), desc="   Comparisons")
+                completed = tqdm(concurrent.futures.as_completed(futs, timeout=COMPARISON_PHASE_TIMEOUT), total=len(futs), desc="   Comparisons")
                 for fut in completed:
                     completed_count += 1
                     
                     try:
-                        result = fut.result(timeout=300)  # 5min per comparison
+                        result = fut.result(timeout=COMPARISON_TIMEOUT)
                         all_pair_results.append(result)
                         if result is None or len(result) == 0:
                             empty_result_count += 1
@@ -1411,7 +1474,7 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
         logger.info(f"Waiting for {len(io_futures)} background save operations to complete...")
         for i, io_fut in enumerate(io_futures):
             try:
-                result = io_fut.result(timeout=300)
+                result = io_fut.result(timeout=IO_TIMEOUT)
                 if result:
                     logger.debug(f"I/O operation {i+1}/{len(io_futures)} completed: {os.path.basename(result)}")
             except Exception as e:
@@ -1542,135 +1605,195 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
             logger.info(f"Debug mode: Keeping temporary workspaces at: {work_dir}")
 
 
-if __name__ == '__main__':
+def build_parser():
+    """The CLI: canonical kebab-case flags, single-dash spellings kept as aliases."""
     parser = argparse.ArgumentParser(
+        prog='get_PM_scores.py',
         description='Run PocketMatch similarity analysis on cavity files (parallelized).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example usage:
-  python get_PM_scores.py \\
-    -cavities /media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock/extracted_cavities \\
-    -output /media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock/pocketmatch_results \\
-    -pm_dir /home/onur/software/PocketMatch_v2.1/PocketMatch_v2.1 \\
-    -af_structures /media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock/alphafold_structures \\
-    -threads 8
+  python3 get_PM_scores.py \\
+    --cavities <run-dir>/extracted_cavities \\
+    --output-dir <run-dir>/pocketmatch_results \\
+    --pm-dir /home/onur/software/PocketMatch_v2.1/PocketMatch_v2.1 \\
+    --af-structures <run-dir>/alphafold_structures \\
+    --threads 8 --resume
 
 Note: Uses PocketMatch Step3-PM_typeB for parallelization.
       Each thread processes a chunk of pockets against the full set.
       Temporary isolated workspaces are created to avoid conflicts.
         """
     )
-    
+
+    # Paths. The single-dash spellings are the ones in the operator's shell
+    # history and in CLAUDE.md; they stay as aliases so nothing breaks.
     parser.add_argument(
-        '-cavities',
+        '--cavities', '-cavities',
         type=str,
         required=True,
         help='Path to extracted_cavities directory containing cavity PDB files'
     )
-    
     parser.add_argument(
-        '-output',
+        '--output-dir', '-output',
         type=str,
         required=True,
-        help='Path to output directory for results'
+        dest='output',
+        help='Path to output directory for results (similarity CSVs and chunks)'
     )
-    
     parser.add_argument(
-        '-pm_dir',
+        '--pm-dir', '-pm_dir',
         type=str,
         required=True,
-        help='Path to PocketMatch base directory'
+        dest='pm_dir',
+        help='Path to the PocketMatch v2.1 base directory (Step0-cabbage.sh, Step3-PM_typeB)'
     )
-    
     parser.add_argument(
-        '-af_structures',
+        '--af-structures', '-af_structures',
         type=str,
-        required=False,
         default=None,
-        help='Path to AlphaFold structures directory (for extracting complete residues)'
+        dest='af_structures',
+        help='Path to AlphaFold structures directory, used to restore complete '
+             'residues around each cavity. Without it the cavity files are compared '
+             'as-is, which PocketMatch may reject'
     )
-    
     parser.add_argument(
-        '-threads',
+        '--run-dir',
+        type=str,
+        default=None,
+        help='campaign run directory; the step log goes to <run-dir>/steps/%s/ '
+             'instead of under --output-dir' % STEP_NAME
+    )
+
+    # Parallelism and batching
+    parser.add_argument(
+        '--threads', '-threads',
         type=int,
         default=None,
-        help=f'Number of parallel threads (default: {cpu_count()} CPUs)'
+        help='Number of parallel workers (default: min(--thread-cap, %d CPUs))' % cpu_count()
     )
-    
+    parser.add_argument(
+        '--thread-cap',
+        type=int,
+        default=DEFAULT_THREAD_CAP,
+        help='Ceiling applied when --threads is not given; all CPUs at once '
+             'exhausts file handles on large runs (default: %(default)s)'
+    )
+    parser.add_argument(
+        '--chunk-rows',
+        type=int,
+        default=100000,
+        help='Number of rows per chunk file when saving intermediate results (default: %(default)s)'
+    )
+    parser.add_argument(
+        '--block-size',
+        type=int,
+        default=100,
+        help='Number of pockets per block for cabbage generation (default: %(default)s, '
+             'max: {0})'.format(MAX_BLOCK_SIZE)
+    )
+
+    # Timeouts. Every one of these was an inline literal; on slower storage they
+    # are the first thing that has to change.
+    parser.add_argument(
+        '--residue-timeout', type=int, default=RESIDUE_TIMEOUT,
+        help='seconds to extract complete residues for ONE cavity file (default: %(default)s)')
+    parser.add_argument(
+        '--cabbage-timeout', type=int, default=CABBAGE_TIMEOUT,
+        help='seconds for ONE Step0-cabbage.sh run (default: %(default)s)')
+    parser.add_argument(
+        '--pm-timeout', type=int, default=PM_TIMEOUT,
+        help='seconds for ONE Step3-PM_typeB comparison (default: %(default)s)')
+    parser.add_argument(
+        '--block-timeout', type=int, default=BLOCK_TIMEOUT,
+        help='seconds to build ONE cabbage block, end to end (default: %(default)s)')
+    parser.add_argument(
+        '--block-phase-timeout', type=int, default=BLOCK_PHASE_TIMEOUT,
+        help='seconds for the whole block-building phase (default: %(default)s)')
+    parser.add_argument(
+        '--comparison-timeout', type=int, default=COMPARISON_TIMEOUT,
+        help='seconds for ONE block-vs-block comparison job (default: %(default)s)')
+    parser.add_argument(
+        '--comparison-phase-timeout', type=int, default=COMPARISON_PHASE_TIMEOUT,
+        help='seconds for the whole comparison phase; on expiry the completed '
+             'pairs are saved and the incomplete ones listed for --resume '
+             '(default: %(default)s)')
+    parser.add_argument(
+        '--io-timeout', type=int, default=IO_TIMEOUT,
+        help='seconds to wait for ONE background chunk save (default: %(default)s)')
+
+    # Behaviour
     parser.add_argument(
         '--debug',
         action='store_true',
         help='Debug mode: keep temporary workspaces for inspection'
     )
-    
     parser.add_argument(
         '--verbose',
         action='store_true',
-        help='Verbose mode: print detailed progress for each block and comparison'
+        help='Verbose mode: log detailed progress for each block and comparison (implies DEBUG level)'
     )
-    
     parser.add_argument(
         '--test-mode',
         action='store_true',
-        help='Test mode: process only first N blocks for quick testing (use --test-blocks to set N)'
+        help='Test mode: process only the first N blocks (see --test-blocks)'
     )
-    
     parser.add_argument(
         '--test-blocks',
         type=int,
         default=3,
-        help='Number of blocks to process in test mode (default: 3, each block ~100 pockets)'
+        help='Number of blocks to process in test mode (default: %(default)s)'
     )
-    
-    parser.add_argument(
-        '--chunk-rows',
-        type=int,
-        default=100000,
-        help='Number of rows per chunk file when saving intermediate results (default: 100000)'
-    )
-    
-    parser.add_argument(
-        '--block-size',
-        type=int,
-        default=100,
-        help='Number of pockets per block for cabbage generation (default: 100, max: 1000)'
-    )
-    
     parser.add_argument(
         '--resume',
         action='store_true',
         help='Resume from existing progress (reuses existing blocks and continues from last chunk)'
     )
-    
-    args = parser.parse_args()
-    
-    # Convert to absolute paths
+
+    add_runtime_arguments(parser, STEP_NAME)
+    return parser
+
+
+def main(argv=None):
+    """Parse, configure the run, and compute the pocket similarities."""
+    args = build_parser().parse_args(argv)
+    apply_runtime_tunables(args)
+
     cavities_dir = os.path.abspath(args.cavities)
     output_dir = os.path.abspath(args.output)
     pm_base_dir = os.path.abspath(args.pm_dir)
     af_base_dir = os.path.abspath(args.af_structures) if args.af_structures else None
-    
-    # Run analysis
-    try:
-        df_sims = get_pm_similarities_parallel(
-            cavities_dir,
-            output_dir,
-            pm_base_dir,
-            af_base_dir=af_base_dir,
-            n_threads=args.threads,
-            debug=args.debug,
-            verbose=args.verbose,
-            test_mode=args.test_mode,
-            test_blocks=args.test_blocks,
-            chunk_rows=args.chunk_rows,
-            block_size=args.block_size,
-            resume=args.resume
-        )
-        logger.info("="*80)
-        logger.info("ANALYSIS COMPLETE!")
-        logger.info("="*80)
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-        exit(1)
+
+    # The step's log lives under --run-dir when there is one, and beside the
+    # results otherwise -- never in the invocation directory.
+    if args.verbose and args.log_level == 'INFO':
+        args.log_level = 'DEBUG'
+    resolve_out_dir(args, STEP_NAME, args.run_dir or output_dir)
+
+    with step(STEP_NAME, args) as ctx:
+        try:
+            get_pm_similarities_parallel(
+                cavities_dir,
+                output_dir,
+                pm_base_dir,
+                af_base_dir=af_base_dir,
+                n_threads=args.threads,
+                debug=args.debug,
+                verbose=args.verbose,
+                test_mode=args.test_mode,
+                test_blocks=args.test_blocks,
+                chunk_rows=args.chunk_rows,
+                block_size=args.block_size,
+                resume=args.resume,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            # A missing cavity tree or PocketMatch installation is an operator
+            # error, not a crash to read a traceback for.
+            ctx.logger.error("%s", exc)
+            raise SystemExit(2)
+        ctx.logger.info("ANALYSIS COMPLETE")
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
