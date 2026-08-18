@@ -65,6 +65,7 @@ alone — useful when a phase needs different arguments, or when re-running one.
 | 0 | `build_identity_index.py` | UniProt idmapping + proteome | `identity/identity_index.parquet` |
 | 1 | `resolve_interactions.py` | edges TSV, index | `manifests/interactions_resolved.csv` |
 | 2 | `extract_cavities.py --manifest-only` | cavity tarball **names** | `manifests/cavity_manifest.csv` |
+| 2b | `score_cavity_quality.py` | cavity manifest, cavity tarballs | `manifests/cavity_quality.csv` |
 | 3 | `plan_positives.py` | resolved edges, cavities, ligands | `manifests/positives_planned.csv` |
 | 4 | `sample_negatives.py` | positives, interactions | `manifests/negatives_drawn.csv` |
 | 5 | `build_run_manifest.py` | positives, negatives | `manifests/run_manifest.csv`, `redock_queue.csv` |
@@ -83,6 +84,16 @@ the Entrez gene id*. Unresolvable edges go to a rejects file with a reason.
 
 **2 — cavity manifest.** Derives every cavity's identity from the tarball
 filenames without unpacking anything (0.4 s for 38,709 archives).
+
+**2b — pocket quality.** A CavitySpace cavity file is the pocket-lining residues
+of an AlphaFold model, and those residues keep the model's pLDDT in the B-factor
+column. This phase reads it: one row per pocket with `n_residues`, the pLDDT
+distribution, and `residue_plddt` — every residue's value, so any later cutoff is
+a string split rather than a second pass over 7 GB of archives. Mean pocket pLDDT
+runs from 34 to 99, so a run that never looks docks into confident pockets and
+into disordered guesses with equal weight. About 6 CPU-minutes for all 38,709
+archives; a cavity that cannot be scored is recorded in
+`cavity_quality_rejected.csv` with a reason, never written as a zero row.
 
 **3 — positives.** Expands each resolved pair across every cavity of its target.
 Drops pairs with no ligand SDF, no cavity, or a non-small-molecule drug — each
@@ -108,6 +119,39 @@ compares every pose of every tool pair into `final_results.csv`.
 types, IC50s, cavity clusters and DTA predictions. Discovery is checked against
 `run_manifest.csv`: finding fewer jobs than the manifest declares stops the parse
 instead of quietly producing a smaller table.
+
+## Filtering pockets on model confidence
+
+Scoring always happens; **filtering is opt-in.** A pocket *passes* when
+
+```
+frac_ge(--plddt-min) >= --min-plddt-fraction
+```
+
+where `frac_ge(t)` is the fraction of the pocket's residues whose pLDDT is at
+least `t`. `--plddt-min` defaults to 70 (AlphaFold's "confident" band);
+`--min-plddt-fraction` has **no default**, and supplying it is what turns the
+filter on:
+
+```bash
+python3 run_full_workflow.py --run-dir $RUN --plddt-min 70 --min-plddt-fraction 0.80
+```
+
+Without `--min-plddt-fraction`, phases 3 and 4 are handed no quality arguments at
+all and plan exactly what they would have planned before this phase existed. With
+it, `plan_positives.py` and `sample_negatives.py` both get the same thresholds —
+one class filtered and the other not is a confound, not a filter, because a
+classifier could then separate the classes on pLDDT alone. Each stage records
+every pocket it drops with reason `pocket_quality` and the numbers behind it
+(`frac_ge_70=0.42 < 0.80 (n_residues=61)`), and a pocket the manifest names but
+`cavity_quality.csv` does not carry stops the stage rather than silently passing
+or silently vanishing (`--allow-missing-quality` downgrades that to a warning and
+treats those pockets as failing).
+
+`audit.py run` closes the loop: it checks that every pocket in `run_manifest.csv`
+is scored and clears the thresholds recorded in `negatives_drawn.report.json`, so
+a disagreement between what was filtered and what was docked surfaces there rather
+than in the analysis.
 
 ## Being told when it breaks
 
@@ -139,7 +183,7 @@ run. See `SETUP.md` for the Pushover account setup.
 ## Running part of the pipeline
 
 `--only` and `--skip` take a phase key from the table, or a group name —
-`planning` (phases 0–5) and `structures` (phase 6):
+`planning` (phases 0–5, including 2b) and `structures` (phase 6):
 
 ```bash
 python3 run_full_workflow.py --run-dir $RUN --only planning     # plan, don't dock

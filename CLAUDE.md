@@ -112,6 +112,9 @@ RUN=/media/onur/Elements/cavity_space_consensus_docking/runs/<date>
 python3 $REPO/run_full_workflow.py --inputs-dir $DATA/inputs --run-dir $RUN --mode balanced --dry-run
 python3 $REPO/run_full_workflow.py --inputs-dir $DATA/inputs --run-dir $RUN --mode balanced --notify
 
+# Pocket-quality filtering is opt-in; --min-plddt-fraction is the only switch
+python3 $REPO/run_full_workflow.py --run-dir $RUN --plddt-min 70 --min-plddt-fraction 0.80
+
 # Part of it: --only/--skip take a phase key or the groups 'planning' / 'structures'
 python3 $REPO/run_full_workflow.py --run-dir $RUN --only planning
 python3 $REPO/run_full_workflow.py --run-dir $RUN --skip dock --skip parse
@@ -131,7 +134,7 @@ python3 $REPO/get_PM_scores.py --cavities $RUN/structures/cavities \
 python3 $REPO/pocketmatch_clustering.py --run-dir $RUN
 ```
 
-**Testing:** `python3 -m unittest discover -s tests -t .` — ~1,490 tests, standard library only, no
+**Testing:** `python3 -m unittest discover -s tests -t .` — ~1,570 tests, standard library only, no
 network. Two of them are repo-wide AST lints: every argparse argument must carry a `help=` string
 (`tests/test_argument_help_coverage.py`) and no source file may name a dead run directory or resolve an
 identity by free-text search (`tests/test_g6_no_freetext_resolution.py`).
@@ -152,6 +155,7 @@ the pipeline's actual interface between stages, and `run_full_workflow.py` is it
 identity/identity_index.parquet          (accession ↔ Entrez ↔ symbol; downstream stages pin its SHA256)
 manifests/interactions_resolved.csv      (+ resolved drug–target edges, rejects recorded with a reason)
 manifests/cavity_manifest.csv            (every cavity's identity, from tarball names, nothing unpacked)
+  ├─ cavity_quality.csv                  (per-pocket AlphaFold pLDDT; phase 2b, always run, opt-in filter)
   └─ positives_planned.csv               (each pair × every cavity of its target)
        └─ negatives_drawn.csv            (balanced negative sampling)
             └─ run_manifest.csv          (authority on which jobs should exist)
@@ -175,6 +179,44 @@ Rules that fall out of this and are easy to break:
 - **`required_structures*.csv` is the legacy vocabulary.** `identify_required_structures.py` and
   `generate_negative_samples.py` produce it, are superseded (see Known issues), and refuse to run without
   an explicit opt-in.
+
+### Pocket quality (phase 2b)
+
+`score_cavity_quality.py` reads each cavity archive's `*_cavity_<n>.pdb` — the pocket-lining residues of
+an AlphaFold model, which keep the model's pLDDT in the B-factor column — and writes one row per
+`(accession, fragment_id, cavity_index)`. Only `ATOM` records count (the `surface_*`/`vacant_*` members
+of the same archive are HETATM grid points with an empty B-factor); a residue is keyed
+`(line[21], line[22:27].strip())` and its pLDDT is the mean of its atoms' B-factors. Two derived
+quantities are the whole vocabulary:
+
+```
+n_residues      distinct residues in the pocket
+frac_ge(t)      fraction of those residues with pLDDT >= t
+a pocket PASSES when frac_ge(--plddt-min) >= --min-plddt-fraction
+```
+
+`residue_plddt` stores every residue's value (2dp, `;`-joined) and every other column is derived from
+those same rounded values, so any cutoff is recomputed with `dock_selectivity.quality.fraction_at()`
+without re-reading 7 GB of archives. Read the file only through
+`dock_selectivity.quality.load_cavity_quality()` — it validates the schema on read as well as on write.
+
+Rules here, and they are the point of the stage:
+
+- **Scoring is unconditional, filtering is opt-in.** `run_full_workflow.py` always runs phase 2b (about six
+  CPU-minutes for 38,709 archives) and forwards `--cavity-quality` / `--plddt-min` /
+  `--min-plddt-fraction` to `plan_positives.py` and `sample_negatives.py` **only** when
+  `--min-plddt-fraction` is given. Without it those stages get no quality arguments at all.
+- **Both classes or neither.** The same threshold reaches positives and negatives; filtering one and not
+  the other is a confound a classifier can exploit, not a filter.
+- **An unscoreable or unscored pocket is never a silent pass or a silent drop.** `score_cavity_quality.py`
+  writes it to a reject ledger with a reason rather than a zero-filled row; a pocket a planning stage names
+  but the quality file does not carry exits 2 unless `--allow-missing-quality` downgrades it to a warning
+  that treats those pockets as failing.
+- **`audit.py run` closes the loop.** `xstage.docked_pockets_match_the_quality_filter` reads the
+  thresholds out of `negatives_drawn.report.json` — the run's own record of what phase 4 filtered on, not
+  a number retyped at audit time — and fails if a pocket in `run_manifest.csv` is unscored or misses them.
+  A run that declares no filter passes on that declaration; `--plddt-min` / `--min-plddt-fraction` on
+  `audit.py run` override the recorded pair.
 
 ### batch_dock.py — staged execution
 

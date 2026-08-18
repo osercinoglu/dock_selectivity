@@ -34,6 +34,31 @@ eligible, and *all* of the loss is on the target axis: 523 of 979 docked
 accessions have no corrected positives, because the 2025 corruption selected
 receptors that nobody targets.
 
+The optional fourth constraint: pocket confidence
+-------------------------------------------------
+
+``score_cavity_quality.py`` writes ``manifests/cavity_quality.csv``, the pLDDT the
+AlphaFold model carries in the pocket PDB's B-factor column.  Passing
+``--cavity-quality`` **and** ``--min-plddt-fraction`` drops every pocket whose
+confident fraction is too low from the **candidate pool, before the quotas are
+computed** -- from ``positives_planned`` (which is what every quota counts) and
+from ``negatives_pool`` (which is what a negative may reuse) alike.
+
+The placement is the whole point.  Filtering the *drawn* result afterwards would
+leave each quota believing it was met while the dataset that survives is short
+and skewed toward whichever drugs happen to sit on well-modelled pockets.
+Filtering the pool first makes the sampler draw a *balanced* design over the
+pockets that will actually be docked, and whatever it then cannot place is a
+deficit with a reason.  Filtering both sides also keeps the two classes on the
+same pocket universe: a positive set full of low-confidence pockets against a
+negative set of high-confidence ones is a confound, not a filter.
+
+Opt-in in both directions: without ``--min-plddt-fraction`` nothing is filtered
+and the draw is byte-identical to a run without the flags at all, and a pocket
+the manifests name but the quality file does not carry is an error (exit 2)
+rather than a silent pass or a silent drop, unless ``--allow-missing-quality``
+downgrades it to a warning and treats those pockets as failing.
+
 Balance unit
 ------------
 ``--balance-unit job`` (default) balances **cavity rows**, which is what the old
@@ -63,6 +88,14 @@ Usage
         --seed         42 \\
         --redock-queue $NEW/manifests/redock_queue_negatives.csv \\
         --out          $NEW/manifests/negatives_drawn.csv
+
+    # ...and the same draw, restricted to pockets where >=80% of the lining
+    # residues reach AlphaFold's "confident" band:
+    python3 sample_negatives.py \\
+        ... \\
+        --cavity-quality     $NEW/manifests/cavity_quality.csv \\
+        --plddt-min          70 \\
+        --min-plddt-fraction 0.80
 
 ``--run-dir`` is optional and moves only this step's own log and scratch state to
 ``$NEW/steps/sample_negatives/``; the manifests keep their explicit ``--out`` and
@@ -107,6 +140,7 @@ _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _REPO_ROOT not in sys.path:  # `python3 sample_negatives.py` from anywhere
     sys.path.insert(0, _REPO_ROOT)
 
+from dock_selectivity import quality  # noqa: E402
 from dock_selectivity.identity import (  # noqa: E402
     IdentityIndex,
     InvariantViolation as _IdentityInvariantViolation,
@@ -124,7 +158,11 @@ from dock_selectivity.invariants import (  # noqa: E402
 #: When identity.py adopts the canonical exception this tuple collapses to one
 #: class and nothing here changes.
 IDENTITY_ERRORS = (InvariantViolation, _IdentityInvariantViolation)
-from dock_selectivity.jobid import format_job_dir  # noqa: E402
+from dock_selectivity.jobid import (  # noqa: E402
+    JobIdError,
+    format_job_dir,
+    normalize_fragment_id,
+)
 from dock_selectivity.joins import checked_merge  # noqa: E402
 from dock_selectivity.runtime import (  # noqa: E402
     add_runtime_arguments,
@@ -145,6 +183,12 @@ __all__ = [
     "ELIGIBLE",
     "ELIGIBILITY_REASONS",
     "DEFAULT_SEED",
+    "DEFAULT_PLDDT_MIN",
+    "REASON_POCKET_QUALITY",
+    "DEFICIT_REASON_QUALITY",
+    "DEFICIT_REASON_NO_CANDIDATE",
+    "QUALITY_REJECT_COLUMNS",
+    "MissingQualityError",
     "SamplingResult",
     "build_avoid_list",
     "compute_quotas",
@@ -185,9 +229,16 @@ REASON_TARGET_NO_POSITIVES = "target_has_no_positives"
 REASON_DRUG_NO_POSITIVES = "drug_has_no_positives"
 REASON_NO_FINAL_RESULTS = "no_final_results"
 REASON_DUPLICATE_POCKET = "duplicate_pocket"
+#: Lower-case on purpose: this is the reason string the cavity-quality contract
+#: fixes across ``plan_positives.py`` and this module, so pockets lost to the
+#: pLDDT filter can be counted across both ledgers with one comparison.
+REASON_POCKET_QUALITY = "pocket_quality"
 
 #: Precedence, highest first.  A row gets the first reason that applies, so the
 #: ``*_no_positives`` counts remain comparable with the reuse analysis.
+#: ``pocket_quality`` sits *below* the structural reasons deliberately: a row
+#: that was ineligible anyway was not "lost to the quality filter", and counting
+#: it as such would overstate what the filter cost.
 ELIGIBILITY_REASONS = (
     ELIGIBLE,
     REASON_NOT_IN_INDEX,
@@ -195,8 +246,32 @@ ELIGIBILITY_REASONS = (
     REASON_BOTH_NO_POSITIVES,
     REASON_TARGET_NO_POSITIVES,
     REASON_DRUG_NO_POSITIVES,
+    REASON_POCKET_QUALITY,
     REASON_NO_FINAL_RESULTS,
     REASON_DUPLICATE_POCKET,
+)
+
+#: pLDDT a pocket residue must reach to count as confident.  AlphaFold's own
+#: "confident" band starts at 70; it is a default only for *where* the bar sits,
+#: never for whether the filter runs -- that is ``--min-plddt-fraction``, which
+#: has no default anywhere in the codebase.
+DEFAULT_PLDDT_MIN = 70.0
+
+#: Why an entity in the balance ledger is short of its quota.
+DEFICIT_REASON_QUALITY = REASON_POCKET_QUALITY
+DEFICIT_REASON_NO_CANDIDATE = "no_candidate"
+
+#: ``<out>.quality_rejects.csv`` -- one row per pocket the pLDDT filter judged
+#: unusable, in either input manifest, with the numbers that decided it.
+QUALITY_REJECT_COLUMNS = (
+    "frame",
+    "drugbank_id",
+    "accession",
+    "fragment_id",
+    "cavity_index",
+    "old_job_dir",
+    "reason",
+    "detail",
 )
 
 SOURCE_POOL = "pool"
@@ -260,6 +335,160 @@ def _pair_set(df: pd.DataFrame) -> FrozenSet[Tuple[str, str]]:
 def _counts_to_dict(series: pd.Series) -> Dict[str, int]:
     """A ``groupby().size()`` result as a plain, insertion-sorted dict."""
     return {str(k): int(v) for k, v in sorted(series.items())}
+
+
+# --------------------------------------------------------------------------
+# pocket quality (the optional pLDDT filter)
+# --------------------------------------------------------------------------
+
+
+class MissingQualityError(InvariantViolation):
+    """The manifests name a pocket ``cavity_quality.csv`` does not carry.
+
+    Its own class, because the stage answers it with exit 2 -- a missing
+    prerequisite -- rather than with the invariant exit code.  Neither treating
+    the pocket as a pass (silently admitting an unscored cavity) nor as a drop
+    (silently shrinking the design) is acceptable without the operator saying
+    which they meant: ``--allow-missing-quality`` says "treat it as failing".
+    """
+
+
+def _fragment_key(value: Any) -> str:
+    """``'1'`` and ``'F1'`` are the same fragment, on both sides of the join.
+
+    The old pipeline wrote ``'F1'`` on positives and bare ``'1'`` on negatives,
+    which is why every join on a fragment normalises first. A value that is not
+    a fragment id at all is left alone rather than repaired: it will match no
+    quality row, and the coverage check will name it.
+    """
+    try:
+        normalised = normalize_fragment_id(value)
+    except JobIdError:
+        return str(value).strip()
+    return normalised if normalised is not None else str(value).strip()
+
+
+class _Verdict(object):
+    """What the pLDDT filter decided about one pocket, and why."""
+
+    __slots__ = ("ok", "missing", "detail")
+
+    def __init__(self, ok: bool, missing: bool, detail: str) -> None:
+        self.ok = bool(ok)
+        self.missing = bool(missing)
+        self.detail = str(detail)
+
+
+class _QualityGate:
+    """``(accession, fragment_id, cavity_index)`` -> pass / fail, with numbers.
+
+    Built once from ``cavity_quality.csv`` and consulted per manifest row.  The
+    fraction is recomputed from the per-residue column by
+    :func:`dock_selectivity.quality.fraction_at`, so ``--plddt-min`` is free to
+    be any value, not only the three the producer precomputed.
+    """
+
+    def __init__(
+        self,
+        frame: pd.DataFrame,
+        plddt_min: float,
+        min_fraction: float,
+    ) -> None:
+        self.plddt_min = float(plddt_min)
+        self.min_fraction = float(min_fraction)
+        # passes() validates min_fraction and is the single definition of the
+        # predicate; fraction_at() supplies the number the reject detail quotes.
+        keep = quality.passes(frame, self.plddt_min, self.min_fraction)
+        fraction = quality.fraction_at(frame, self.plddt_min)
+        self._verdicts: Dict[Tuple[str, str, int], _Verdict] = {}
+        for accession, fragment, cavity, ok, frac, n_residues in zip(
+            frame["accession"].tolist(),
+            frame["fragment_id"].tolist(),
+            frame["cavity_index"].tolist(),
+            keep.tolist(),
+            fraction.tolist(),
+            frame["n_residues"].tolist(),
+        ):
+            detail = "" if ok else "frac_ge_{0:.0f}={1:.2f} < {2:.2f} (n_residues={3})".format(
+                self.plddt_min, float(frac), self.min_fraction, int(n_residues)
+            )
+            key = (str(accession), _fragment_key(fragment), int(cavity))
+            if key in self._verdicts:
+                raise InvariantViolation(
+                    "cavity_quality carries two rows for pocket {0}/{1}/cav{2} "
+                    "once the fragment id is normalised ('1' and 'F1' name the "
+                    "same fragment). Rebuild it with score_cavity_quality.py, "
+                    "which normalises before it writes.".format(*key),
+                    name="cavity_quality",
+                )
+            self._verdicts[key] = _Verdict(bool(ok), False, detail)
+        self.n_scored = len(self._verdicts)
+        self.n_passing = sum(1 for verdict in self._verdicts.values() if verdict.ok)
+
+    def verdict(self, accession: Any, fragment_id: Any, cavity_index: Any) -> _Verdict:
+        key = (str(accession), _fragment_key(fragment_id), int(cavity_index))
+        found = self._verdicts.get(key)
+        if found is not None:
+            return found
+        return _Verdict(
+            False,
+            True,
+            "not scored in cavity_quality.csv (treated as failing under "
+            "--allow-missing-quality)",
+        )
+
+
+def _pocket_verdicts(
+    frame: pd.DataFrame, gate: _QualityGate
+) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """``(passes, is_missing, detail)`` for every row of a pocket-bearing frame."""
+    if not len(frame):
+        empty_bool = pd.Series([], index=frame.index, dtype=bool)
+        return empty_bool, empty_bool.copy(), pd.Series([], index=frame.index, dtype=object)
+    verdicts = [
+        gate.verdict(accession, fragment, cavity)
+        for accession, fragment, cavity in zip(
+            frame["accession"].tolist(),
+            frame["fragment_id"].tolist(),
+            frame["cavity_index"].tolist(),
+        )
+    ]
+    return (
+        pd.Series([v.ok for v in verdicts], index=frame.index, dtype=bool),
+        pd.Series([v.missing for v in verdicts], index=frame.index, dtype=bool),
+        pd.Series([v.detail for v in verdicts], index=frame.index, dtype=object),
+    )
+
+
+def _quality_reject_rows(
+    frame: pd.DataFrame,
+    kind: str,
+    ok: pd.Series,
+    detail: pd.Series,
+) -> pd.DataFrame:
+    """The rejected half of a frame, as ``quality_rejects.csv`` rows."""
+    if not len(frame):
+        return pd.DataFrame(columns=list(QUALITY_REJECT_COLUMNS))
+    rejected = frame.loc[~ok]
+    if not len(rejected):
+        return pd.DataFrame(columns=list(QUALITY_REJECT_COLUMNS))
+    return pd.DataFrame(
+        {
+            "frame": kind,
+            "drugbank_id": rejected["drugbank_id"].astype(str).tolist(),
+            "accession": rejected["accession"].astype(str).tolist(),
+            "fragment_id": rejected["fragment_id"].astype(str).tolist(),
+            "cavity_index": [int(c) for c in rejected["cavity_index"].tolist()],
+            "old_job_dir": (
+                rejected["old_job_dir"].astype(str).tolist()
+                if "old_job_dir" in rejected.columns
+                else [""] * len(rejected)
+            ),
+            "reason": REASON_POCKET_QUALITY,
+            "detail": detail.loc[~ok].astype(str).tolist(),
+        },
+        columns=list(QUALITY_REJECT_COLUMNS),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -407,6 +636,8 @@ def classify_pool(
     target_quota: Mapping[str, int],
     avoid: FrozenSet[Tuple[str, str]],
     index: IdentityIndex,
+    fails_quality: Optional[pd.Series] = None,
+    quality_detail: Optional[pd.Series] = None,
 ) -> pd.DataFrame:
     """Label every pool row ``eligible`` or give it a reason it is not.
 
@@ -421,22 +652,47 @@ def classify_pool(
        index, so it cannot be relabelled.
     2. ``known_interaction`` -- contamination.  The 2025 negatives contained 5.
     3. ``*_no_positives`` -- structural ineligibility under balanced sampling.
-    4. ``no_final_results`` -- eligible by design, but carries no evidence, so
+    4. ``pocket_quality`` -- ``fails_quality`` says the pLDDT filter rejected
+       this pocket.  Below the structural reasons on purpose: a row that was
+       ineligible anyway was not lost *to the filter*, and attributing it to the
+       filter would overstate what the operator's threshold cost.
+    5. ``no_final_results`` -- eligible by design, but carries no evidence, so
        salvaging it would reuse nothing; the pocket stays available as a fresh
        docking job.
-    5. ``duplicate_pocket`` -- a second old directory for the same
+    6. ``duplicate_pocket`` -- a second old directory for the same
        ``(drug, accession, fragment, cavity)``; keeping both would break the
        primary key of ``negatives_drawn.csv``.
+
+    ``fails_quality`` / ``quality_detail`` are Series indexed like ``pool``
+    (``None`` when the filter is off).  They are re-ordered here rather than
+    assumed positional, because the first thing this function does is sort.
     """
     if not len(pool):
         out = pool.copy()
         out["eligibility"] = pd.Series([], dtype="string")
+        out["eligibility_detail"] = pd.Series([], dtype="string")
         out["eligible"] = pd.Series([], dtype=bool)
         return out
 
-    frame = pool.sort_values(
-        list(_JOB_COLUMNS) + ["old_job_dir"], kind="mergesort"
-    ).reset_index(drop=True)
+    ordered = pool.sort_values(list(_JOB_COLUMNS) + ["old_job_dir"], kind="mergesort")
+    order = ordered.index
+    frame = ordered.reset_index(drop=True)
+    if fails_quality is None:
+        quality_failed = pd.Series(False, index=frame.index, dtype=bool)
+        quality_reason = pd.Series("", index=frame.index, dtype=object)
+    else:
+        quality_failed = pd.Series(
+            fails_quality.reindex(order).tolist(), index=frame.index, dtype=bool
+        )
+        quality_reason = pd.Series(
+            (
+                quality_detail.reindex(order).tolist()
+                if quality_detail is not None
+                else [""] * len(frame)
+            ),
+            index=frame.index,
+            dtype=object,
+        )
 
     drug_quota_frame = pd.DataFrame(
         {
@@ -488,6 +744,7 @@ def classify_pool(
     # applied lowest-precedence first, so the highest-precedence mask wins
     reason = reason.mask(duplicate, REASON_DUPLICATE_POCKET)
     reason = reason.mask(~has_results, REASON_NO_FINAL_RESULTS)
+    reason = reason.mask(quality_failed, REASON_POCKET_QUALITY)
     reason = reason.mask(drug_ok & ~target_ok, REASON_TARGET_NO_POSITIVES)
     reason = reason.mask(~drug_ok & target_ok, REASON_DRUG_NO_POSITIVES)
     reason = reason.mask(~drug_ok & ~target_ok, REASON_BOTH_NO_POSITIVES)
@@ -496,6 +753,9 @@ def classify_pool(
 
     frame = frame.drop(columns=["_drug_quota", "_target_quota"])
     frame["eligibility"] = reason.astype("string")
+    frame["eligibility_detail"] = quality_reason.where(
+        reason == REASON_POCKET_QUALITY, ""
+    ).astype("string")
     frame["eligible"] = (reason == ELIGIBLE).astype(bool)
     return frame.sort_values("old_job_dir", kind="mergesort").reset_index(drop=True)
 
@@ -870,6 +1130,9 @@ class SamplingResult:
     deficits: pd.DataFrame
     report: Dict[str, Any]
     invariant_reports: List[Dict[str, Any]] = field(default_factory=list)
+    #: ``None`` when the pLDDT filter was off, so a run that did not filter
+    #: cannot be mistaken for one that filtered and rejected nothing.
+    quality_rejects: Optional[pd.DataFrame] = None
 
     @property
     def balance_ok(self) -> bool:
@@ -926,6 +1189,10 @@ def sample_negatives(
     seed: int = DEFAULT_SEED,
     balance_unit: str = UNIT_JOB,
     max_repair_scans: int = DEFAULT_MAX_REPAIR_SCANS,
+    cavity_quality: Optional[pd.DataFrame] = None,
+    plddt_min: float = DEFAULT_PLDDT_MIN,
+    min_plddt_fraction: Optional[float] = None,
+    allow_missing_quality: bool = False,
 ) -> SamplingResult:
     """Draw balanced negatives in accession space.  The core of this module.
 
@@ -934,11 +1201,24 @@ def sample_negatives(
     negative is a fresh docking job -- but the pool argument is **required**,
     because "no pool file, so dock everything" is precisely the kind of
     file-presence-driven mode switch that FIX_PLAN G8 bans.
+
+    ``cavity_quality`` is the frame :func:`dock_selectivity.quality.load_cavity_quality`
+    returns; the pLDDT filter runs only when ``min_plddt_fraction`` is given as
+    well, and it runs **before the quotas are computed** -- see the module
+    docstring for why that placement, and not a filter on the drawn result, is
+    the balanced-correct one.
     """
     if balance_unit not in BALANCE_UNITS:
         raise ValueError(
             "balance_unit must be one of {0}, got {1!r}".format(
                 BALANCE_UNITS, balance_unit
+            )
+        )
+    if min_plddt_fraction is not None and cavity_quality is None:
+        raise ValueError(
+            "min_plddt_fraction={0!r} was given without a cavity_quality frame; "
+            "there is nothing to evaluate the threshold against".format(
+                min_plddt_fraction
             )
         )
     if not len(positives):
@@ -999,6 +1279,126 @@ def sample_negatives(
             name="positives x interactions",
         )
 
+    # -- pocket quality, BEFORE the quotas --------------------------------
+    # Every quota is a count over positives_planned, and every negative is
+    # drawn into a pocket of positives_planned or of the pool. Filtering here
+    # means the quotas describe the design that will actually be docked; doing
+    # it after the draw would leave each quota believing it was met while the
+    # surviving dataset is short and skewed toward the drugs that happen to sit
+    # on well-modelled pockets.
+    quality_rejects: Optional[pd.DataFrame] = None
+    pool_fails_quality: Optional[pd.Series] = None
+    pool_quality_detail: Optional[pd.Series] = None
+    pool_pockets_frame = pool
+    quality_report: Dict[str, Any] = {"enabled": False}
+    planned_drug_quota: Dict[str, int] = {}
+    planned_target_quota: Dict[str, int] = {}
+    if cavity_quality is not None and min_plddt_fraction is not None:
+        gate = _QualityGate(cavity_quality, plddt_min, min_plddt_fraction)
+        positives_ok, positives_missing, positives_detail = _pocket_verdicts(
+            positives, gate
+        )
+        pool_ok, pool_missing, pool_detail = _pocket_verdicts(pool, gate)
+        n_missing = int(positives_missing.sum()) + int(pool_missing.sum())
+        if n_missing:
+            missing_keys = sorted(
+                {
+                    (str(a), str(f), int(c))
+                    for frame, mask in (
+                        (positives, positives_missing),
+                        (pool, pool_missing),
+                    )
+                    if len(frame)
+                    for a, f, c in zip(
+                        frame.loc[mask, "accession"].tolist(),
+                        frame.loc[mask, "fragment_id"].tolist(),
+                        frame.loc[mask, "cavity_index"].tolist(),
+                    )
+                }
+            )
+            examples = ", ".join(
+                "{0}/{1}/cav{2}".format(*key) for key in missing_keys[:_MAX_REPORTED]
+            )
+            if not allow_missing_quality:
+                raise MissingQualityError(
+                    "{0} manifest row(s) covering {1} pocket(s) are absent from "
+                    "cavity_quality.csv, e.g. {2}. Score them with "
+                    "score_cavity_quality.py, or pass --allow-missing-quality to "
+                    "treat an unscored pocket as failing. Neither passing them "
+                    "silently nor dropping them silently is acceptable: both "
+                    "change the size of the design without saying so.".format(
+                        n_missing, len(missing_keys), examples
+                    ),
+                    name="cavity_quality coverage",
+                )
+            logger.warning(
+                "--allow-missing-quality: %d manifest row(s) covering %d pocket(s) "
+                "are absent from cavity_quality.csv and are treated as FAILING, "
+                "e.g. %s",
+                n_missing,
+                len(missing_keys),
+                examples,
+            )
+
+        quality_rejects = pd.concat(
+            [
+                _quality_reject_rows(positives, "positives", positives_ok, positives_detail),
+                _quality_reject_rows(pool, "pool", pool_ok, pool_detail),
+            ],
+            ignore_index=True,
+        ).sort_values(
+            ["frame", "drugbank_id", "accession", "fragment_id", "cavity_index"],
+            kind="mergesort",
+        ).reset_index(drop=True)
+
+        planned_drug_quota, planned_target_quota = compute_quotas(
+            positives, balance_unit
+        )
+        n_positives_before = int(len(positives))
+        positives = positives.loc[positives_ok].reset_index(drop=True)
+        if not len(positives):
+            raise InvariantViolation(
+                "the pocket-quality filter (frac_ge_{0:.0f} >= {1:.2f}) rejected "
+                "every one of the {2} planned positive row(s), so there is no "
+                "design left to balance against. Lower --min-plddt-fraction or "
+                "--plddt-min, or re-plan the positives.".format(
+                    float(plddt_min), float(min_plddt_fraction), n_positives_before
+                ),
+                name="pocket quality",
+            )
+        positive_pairs = _pair_set(positives)
+        pool_fails_quality = ~pool_ok
+        pool_quality_detail = pool_detail
+        # The pocket *universe* fresh jobs are drawn from must shrink too: a
+        # failing pocket that appears only in the pool would otherwise still be
+        # handed out as a new docking job.
+        pool_pockets_frame = pool.loc[pool_ok] if len(pool) else pool
+        quality_report = {
+            "enabled": True,
+            "plddt_min": float(plddt_min),
+            "min_fraction": float(min_plddt_fraction),
+            "allow_missing": bool(allow_missing_quality),
+            "n_scored_pockets": int(gate.n_scored),
+            "n_scored_pockets_passing": int(gate.n_passing),
+            "n_rows_missing_quality": int(n_missing),
+            "positives": {
+                "n_rows_before": n_positives_before,
+                "n_rows_after": int(len(positives)),
+                "n_dropped": n_positives_before - int(len(positives)),
+            },
+            "pool": {
+                "n_rows_before": int(len(pool)),
+                "n_rows_passing": int(pool_ok.sum()) if len(pool) else 0,
+                "n_dropped": int((~pool_ok).sum()) if len(pool) else 0,
+            },
+        }
+    elif cavity_quality is not None:
+        logger.warning(
+            "--cavity-quality was given but --min-plddt-fraction was not, so "
+            "NOTHING is filtered. Supplying the fraction is what turns the "
+            "pocket-quality filter on."
+        )
+
     # -- quotas ------------------------------------------------------------
     drug_quota, target_quota = compute_quotas(positives, balance_unit)
     total_quota = sum(drug_quota.values())
@@ -1009,11 +1409,43 @@ def sample_negatives(
             name="quota accounting",
         )
 
+    # Units the filter took away from each entity, in the declared balance
+    # unit. An entity whose quota fell to zero left the design altogether, and
+    # is the "undrawable" case the log and the deficit ledger must name.
+    quality_dropped: Dict[str, Dict[str, int]] = {"drug": {}, "target": {}}
+    if quality_report["enabled"]:
+        for axis, planned, kept in (
+            ("drug", planned_drug_quota, drug_quota),
+            ("target", planned_target_quota, target_quota),
+        ):
+            quality_dropped[axis] = {
+                key: int(planned[key]) - int(kept.get(key, 0))
+                for key in sorted(planned)
+                if int(planned[key]) - int(kept.get(key, 0)) > 0
+            }
+        quality_report["units_dropped"] = {
+            axis: int(sum(quality_dropped[axis].values())) for axis in ("drug", "target")
+        }
+        quality_report["undrawable_drugs"] = [
+            key for key in sorted(planned_drug_quota) if key not in drug_quota
+        ]
+        quality_report["undrawable_targets"] = [
+            key for key in sorted(planned_target_quota) if key not in target_quota
+        ]
+
     positive_pockets = pockets_by_accession(positives)
-    all_pockets = pockets_by_accession(positives, pool)
+    all_pockets = pockets_by_accession(positives, pool_pockets_frame)
 
     # -- eligibility, BEFORE any drawing ----------------------------------
-    eligibility = classify_pool(pool, drug_quota, target_quota, avoid, index)
+    eligibility = classify_pool(
+        pool,
+        drug_quota,
+        target_quota,
+        avoid,
+        index,
+        fails_quality=pool_fails_quality,
+        quality_detail=pool_quality_detail,
+    )
     eligible_pool = (
         eligibility[eligibility["eligible"]].reset_index(drop=True)
         if len(eligibility)
@@ -1158,7 +1590,7 @@ def sample_negatives(
 
     # -- balance ledger ----------------------------------------------------
     deficits, balance = _balance_ledger(
-        drawn, drug_quota, target_quota, label, balance_unit
+        drawn, drug_quota, target_quota, label, balance_unit, quality_dropped
     )
 
     n_pool = int((drawn["source"] == SOURCE_POOL).sum()) if len(drawn) else 0
@@ -1218,6 +1650,7 @@ def sample_negatives(
         },
         "repair": repair_stats,
         "balance": balance,
+        "quality": quality_report,
         "contamination": {"n_drawn_known_interactions": 0},
     }
 
@@ -1227,6 +1660,7 @@ def sample_negatives(
         deficits=deficits,
         report=report,
         invariant_reports=invariants,
+        quality_rejects=quality_rejects,
     )
 
 
@@ -1311,11 +1745,37 @@ def _balance_ledger(
     target_quota: Mapping[str, int],
     label: Callable[[str], str],
     balance_unit: str,
+    quality_dropped: Optional[Mapping[str, Mapping[str, int]]] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """Per-drug and per-target quota / drawn / deficit ledger.
 
     Every entity with a quota appears, deficit or not, so the file is a complete
     balance statement rather than a list of complaints.
+
+    Two columns exist so that a shortfall is *explained* rather than merely
+    observed:
+
+    ``quality_dropped``
+        units the pLDDT filter removed from this entity before the quotas were
+        computed.  The demand the plan started from is
+        ``quota + quality_dropped``, which is how "we asked for 8,285 and got
+        5,100" reconciles.  An entity whose whole quota went this way still
+        appears -- with ``quota`` 0 -- because a target that silently vanishes
+        from the ledger is exactly the kind of disappearance this file exists to
+        prevent.
+
+    ``deficit_reason``
+        ``pocket_quality`` when the filter took units from this entity,
+        ``no_candidate`` when the draw fell short with no pocket lost to the
+        filter (the avoid-list or an exhausted pool), empty otherwise.  Quality
+        is named whenever it is implicated because it is the only cause the
+        operator can revisit with a flag; the residual is still visible as
+        ``deficit`` beside ``quality_dropped``.
+
+    ``quota``, ``drawn`` and ``deficit`` stay in *operative* terms -- the design
+    after filtering -- so ``--require-balance`` keeps meaning "the sampler
+    balanced what it was asked to balance", not "the operator's threshold cost
+    nothing".
 
     Counts are in the **declared balance unit**, which the ``unit`` column
     names: cavity rows under ``job``, distinct ``(drug, accession)`` pairs under
@@ -1339,11 +1799,13 @@ def _balance_ledger(
             {"drugbank_id": [], "accession": [], "_is_pool": []}, dtype=object
         )
 
+    dropped = quality_dropped or {}
     rows: List[Dict[str, Any]] = []
     for axis, column, quota in (
         ("drug", "drugbank_id", drug_quota),
         ("target", "accession", target_quota),
     ):
+        axis_dropped = dropped.get(axis, {})
         if len(counted):
             drawn_counts = counted.groupby(column).size().to_dict()
             pool_counts = (
@@ -1354,20 +1816,31 @@ def _balance_ledger(
             )
         else:
             drawn_counts, pool_counts = {}, {}
-        for key in sorted(quota):
+        for key in sorted(set(quota) | set(axis_dropped)):
             got = int(drawn_counts.get(key, 0))
             from_pool = int(pool_counts.get(key, 0))
+            quota_here = int(quota.get(key, 0))
+            lost = int(axis_dropped.get(key, 0))
+            deficit = quota_here - got
+            if lost > 0:
+                reason = DEFICIT_REASON_QUALITY
+            elif deficit > 0:
+                reason = DEFICIT_REASON_NO_CANDIDATE
+            else:
+                reason = ""
             rows.append(
                 {
                     "axis": axis,
                     "key": key,
                     "gene": label(key) if axis == "target" else "",
                     "unit": balance_unit,
-                    "quota": int(quota[key]),
+                    "quota": quota_here,
                     "drawn": got,
                     "from_pool": from_pool,
                     "from_new": got - from_pool,
-                    "deficit": int(quota[key]) - got,
+                    "deficit": deficit,
+                    "quality_dropped": lost,
+                    "deficit_reason": reason,
                 }
             )
     deficits = pd.DataFrame.from_records(
@@ -1382,6 +1855,8 @@ def _balance_ledger(
             "from_pool",
             "from_new",
             "deficit",
+            "quality_dropped",
+            "deficit_reason",
         ],
     )
     if len(deficits):
@@ -1412,6 +1887,8 @@ def _balance_ledger(
                 "total_from_new": 0,
                 "total_deficit": 0,
                 "max_deficit": 0,
+                "total_quality_dropped": 0,
+                "n_quality_dropped": 0,
                 "worst": [],
             }
         short = part[part["deficit"] > 0]
@@ -1419,6 +1896,8 @@ def _balance_ledger(
             "n_entities": int(len(part)),
             "n_balanced": int((part["deficit"] == 0).sum()),
             "n_short": int(len(short)),
+            "total_quality_dropped": int(part["quality_dropped"].sum()),
+            "n_quality_dropped": int((part["quality_dropped"] > 0).sum()),
             "total_quota": int(part["quota"].sum()),
             "total_drawn": int(part["drawn"].sum()),
             "total_from_pool": int(part["from_pool"].sum()),
@@ -1432,6 +1911,7 @@ def _balance_ledger(
                     "quota": int(row["quota"]),
                     "drawn": int(row["drawn"]),
                     "deficit": int(row["deficit"]),
+                    "reason": str(row["deficit_reason"]),
                 }
                 for _, row in short.head(_MAX_REPORTED).iterrows()
             ],
@@ -1475,6 +1955,7 @@ def write_outputs(
     eligibility_path: Optional[str] = None,
     deficits_path: Optional[str] = None,
     report_path: Optional[str] = None,
+    quality_rejects_path: Optional[str] = None,
 ) -> Dict[str, str]:
     """Write ``negatives_drawn.csv`` and its ledgers.  Returns the paths written."""
     written: Dict[str, str] = {}
@@ -1497,6 +1978,7 @@ def write_outputs(
             "has_final_results",
             "eligible",
             "eligibility",
+            "eligibility_detail",
         )
         if c in result.eligibility.columns
     ]
@@ -1504,6 +1986,17 @@ def write_outputs(
 
     deficits_path = deficits_path or _sidecar(out_path, "deficits.csv")
     written["deficits"] = _write_frame(result.deficits, deficits_path)
+
+    # Written only when the pLDDT filter actually ran, so an absent file means
+    # "no filtering was asked for" and an empty one means "filtered, nothing
+    # rejected" -- two different facts that must not share a representation.
+    if result.quality_rejects is not None:
+        quality_rejects_path = quality_rejects_path or _sidecar(
+            out_path, "quality_rejects.csv"
+        )
+        written["quality_rejects"] = _write_frame(
+            result.quality_rejects, quality_rejects_path
+        )
 
     report_path = report_path or _sidecar(out_path, "report.json")
     payload = dict(result.report)
@@ -1662,9 +2155,58 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="exit 5 if any drug or target could not be balanced",
     )
+    parser.add_argument(
+        "--cavity-quality",
+        default=None,
+        help=(
+            "manifests/cavity_quality.csv from score_cavity_quality.py. Without "
+            "it no pocket-quality filtering happens at all; with it, "
+            "--min-plddt-fraction is what turns the filter on."
+        ),
+    )
+    parser.add_argument(
+        "--plddt-min",
+        type=float,
+        default=DEFAULT_PLDDT_MIN,
+        help=(
+            "pLDDT a pocket residue must reach to count as confident (default "
+            "{0:.0f}, AlphaFold's 'confident' band). Only the bar's position has "
+            "a default; whether the filter runs is --min-plddt-fraction."
+        ).format(DEFAULT_PLDDT_MIN),
+    )
+    parser.add_argument(
+        "--min-plddt-fraction",
+        type=float,
+        default=None,
+        help=(
+            "fraction of a pocket's residues that must reach --plddt-min for it "
+            "to be usable, e.g. 0.80. NO DEFAULT: supplying it is what turns "
+            "pocket-quality filtering on, and it filters the candidate pool "
+            "BEFORE the quotas are computed, so the draw stays balanced over the "
+            "pockets that will actually be docked."
+        ),
+    )
+    parser.add_argument(
+        "--allow-missing-quality",
+        action="store_true",
+        help=(
+            "downgrade 'this pocket is not in cavity_quality.csv' from an error "
+            "(exit 2) to a warning, and treat those pockets as FAILING. Without "
+            "it an unscored pocket stops the run rather than being silently "
+            "passed or silently dropped."
+        ),
+    )
     parser.add_argument("--pool-eligibility", default=None, help="override sidecar path")
     parser.add_argument("--deficits", default=None, help="override sidecar path")
     parser.add_argument("--report", default=None, help="override sidecar path")
+    parser.add_argument(
+        "--quality-rejects",
+        default=None,
+        help=(
+            "override sidecar path for the pockets the pLDDT filter rejected "
+            "(written only when --min-plddt-fraction is given)"
+        ),
+    )
     parser.add_argument(
         "--max-repair-scans",
         type=int,
@@ -1691,6 +2233,60 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _log_quality(report: Mapping[str, Any]) -> None:
+    """Before/after for the pLDDT filter: what it saw, kept, and cost."""
+    quality_report = report.get("quality") or {"enabled": False}
+    if not quality_report.get("enabled"):
+        logger.info("pocket quality ....... not filtered (no --min-plddt-fraction)")
+        return
+    logger.info(
+        "pocket quality ....... frac_ge_%.0f >= %.2f: %d of %d scored pocket(s) "
+        "pass (%.1f%%)",
+        quality_report["plddt_min"],
+        quality_report["min_fraction"],
+        quality_report["n_scored_pockets_passing"],
+        quality_report["n_scored_pockets"],
+        100.0
+        * quality_report["n_scored_pockets_passing"]
+        / float(max(quality_report["n_scored_pockets"], 1)),
+    )
+    for name, part in (("positives", "positives"), ("pool", "pool")):
+        counts = quality_report[part]
+        before = counts["n_rows_before"]
+        after = counts.get("n_rows_after", counts.get("n_rows_passing", 0))
+        logger.info(
+            "    %-12s     %d -> %d row(s) (%d dropped)",
+            name,
+            before,
+            after,
+            counts["n_dropped"],
+        )
+    if quality_report["n_rows_missing_quality"]:
+        logger.warning(
+            "    %-12s     %d row(s) had no quality row and were treated as failing",
+            "unscored",
+            quality_report["n_rows_missing_quality"],
+        )
+    units = quality_report.get("units_dropped", {})
+    logger.info(
+        "    %-12s     %d drug-unit(s) and %d target-unit(s) left the design "
+        "before quotas were computed",
+        "demand",
+        units.get("drug", 0),
+        units.get("target", 0),
+    )
+    for axis in ("drugs", "targets"):
+        undrawable = quality_report.get("undrawable_{0}".format(axis[:-1] + "s"), [])
+        if undrawable:
+            logger.warning(
+                "    %-12s     %d %s lost EVERY pocket and left the design: %s",
+                "undrawable",
+                len(undrawable),
+                axis[:-1] + "(s)",
+                ", ".join(undrawable[:_MAX_REPORTED]),
+            )
+
+
 def _log_summary(result: SamplingResult) -> None:
     report = result.report
     pool = report["pool"]
@@ -1703,6 +2299,7 @@ def _log_summary(result: SamplingResult) -> None:
         report["positives"]["n_targets"],
         report["positives"]["n_pairs"],
     )
+    _log_quality(report)
     logger.info(
         "pool ................. %d rows, %d eligible (%.1f%%)",
         pool["n_rows"],
@@ -1752,18 +2349,41 @@ def _log_summary(result: SamplingResult) -> None:
         for axis in ("drugs", "targets"):
             for entry in report["balance"][axis]["worst"]:
                 logger.warning(
-                    "    %-7s %-10s %-10s quota %5d drawn %5d deficit %5d",
+                    "    %-7s %-10s %-10s quota %5d drawn %5d deficit %5d  %s",
                     axis[:-1],
                     entry["key"],
                     entry["gene"],
                     entry["quota"],
                     entry["drawn"],
                     entry["deficit"],
+                    entry.get("reason", ""),
                 )
 
 
 def _sample(args: argparse.Namespace) -> int:
     """The stage itself. ``main()`` runs this inside :func:`step`."""
+    if args.min_plddt_fraction is not None:
+        if not args.cavity_quality:
+            logger.error(
+                "--min-plddt-fraction %.3f was given without --cavity-quality. "
+                "There is no table to evaluate the threshold against, and this "
+                "stage will not proceed as though no filter had been asked for.",
+                args.min_plddt_fraction,
+            )
+            return 2
+        if not 0.0 <= args.min_plddt_fraction <= 1.0:
+            logger.error(
+                "--min-plddt-fraction must be a fraction in [0, 1]; got %r. (A "
+                "percentage such as 80 would pass nothing.)",
+                args.min_plddt_fraction,
+            )
+            return 2
+    if args.allow_missing_quality and args.min_plddt_fraction is None:
+        logger.warning(
+            "--allow-missing-quality has no effect without --min-plddt-fraction: "
+            "no pocket-quality filtering is being done."
+        )
+
     try:
         index = IdentityIndex.load(args.index, expect_sha256=args.index_sha256)
         interactions = read_checked(args.interactions, "interactions_resolved")
@@ -1778,6 +2398,11 @@ def _sample(args: argparse.Namespace) -> int:
             logger.info("--no-pool: every drawn negative will be new work")
         else:
             pool = read_checked(args.pool, "negatives_pool")
+        cavity_quality = (
+            quality.load_cavity_quality(args.cavity_quality)
+            if args.cavity_quality
+            else None
+        )
     except (FileNotFoundError, SchemaViolation) as exc:
         logger.error("input contract violation: %s", exc)
         return EXIT_INPUT
@@ -1795,7 +2420,16 @@ def _sample(args: argparse.Namespace) -> int:
             seed=args.seed,
             balance_unit=args.balance_unit,
             max_repair_scans=args.max_repair_scans,
+            cavity_quality=cavity_quality,
+            plddt_min=args.plddt_min,
+            min_plddt_fraction=args.min_plddt_fraction,
+            allow_missing_quality=args.allow_missing_quality,
         )
+    except MissingQualityError as exc:
+        # Listed before IDENTITY_ERRORS on purpose: a pocket nobody scored is a
+        # missing prerequisite (exit 2), not a broken invariant.
+        logger.error("%s", exc)
+        return 2
     except IDENTITY_ERRORS as exc:
         logger.error("invariant violation: %s", exc)
         return EXIT_INVARIANT
@@ -1808,6 +2442,7 @@ def _sample(args: argparse.Namespace) -> int:
             eligibility_path=args.pool_eligibility,
             deficits_path=args.deficits,
             report_path=args.report,
+            quality_rejects_path=args.quality_rejects,
         )
     except (SchemaViolation,) + IDENTITY_ERRORS as exc:
         logger.error("refusing to write a manifest that fails its contract: %s", exc)

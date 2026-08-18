@@ -171,6 +171,105 @@ class TestStructurePhases(unittest.TestCase):
         self.assertNotIn("--threads", by_key["cavity-structures"].args)
 
 
+class TestPocketQualityPhase(unittest.TestCase):
+    """Phase 2b scores every cavity; filtering on the score is opt-in.
+
+    The scoring pass is unconditional because it is cheap (~6 CPU-minutes for all
+    38,709 archives) and because it is the only place a pocket's model confidence
+    is ever measured. What is *not* unconditional is acting on it: a filter that
+    quietly changes the size of a scientific dataset is the defect class this
+    repository was rebuilt to eliminate, so ``--min-plddt-fraction`` is the single
+    switch that turns it on, and without it phases 3 and 4 are handed no quality
+    flags at all.
+    """
+
+    QUALITY_FLAGS = ("--cavity-quality", "--plddt-min", "--min-plddt-fraction")
+
+    def test_the_phase_exists_and_runs_the_scoring_script(self):
+        by_key = {p.key: p for p in plan()}
+        self.assertIn("quality", by_key)
+        self.assertEqual(by_key["quality"].script, "score_cavity_quality.py")
+
+    def test_it_sits_between_the_cavity_manifest_and_the_positives(self):
+        keys = [p.key for p in plan()]
+        self.assertLess(keys.index("cavities"), keys.index("quality"))
+        self.assertLess(keys.index("quality"), keys.index("positives"))
+
+    def test_it_is_part_of_the_planning_group(self):
+        self.assertIn("quality", wf.PHASE_GROUPS["planning"])
+        self.assertIn("quality", wf.expand_phase_keys(["planning"]))
+
+    def test_it_produces_cavity_quality_csv_from_the_cavity_manifest(self):
+        phase = {p.key: p for p in plan()}["quality"]
+        self.assertEqual([os.path.basename(p) for p in phase.produces],
+                         ["cavity_quality.csv"])
+        self.assertEqual(os.path.basename(os.path.dirname(phase.produces[0])),
+                         "manifests")
+        self.assertEqual([os.path.basename(r) for r in phase.requires],
+                         ["cavity_manifest.csv"])
+
+    def test_it_runs_even_when_nothing_is_being_filtered(self):
+        """The numbers are worth having whether or not this run acts on them."""
+        for mode in wf.MODES:
+            with self.subTest(mode=mode):
+                self.assertIn("quality", [p.key for p in plan(mode=mode)])
+
+    def _flags(self, phase):
+        return {flag: phase.args[phase.args.index(flag) + 1]
+                for flag in self.QUALITY_FLAGS if flag in phase.args}
+
+    def test_the_thresholds_reach_both_planning_stages(self):
+        """One threshold, both classes.
+
+        Filtering the positives and not the negatives would put a positive class
+        full of low-confidence pockets against a high-confidence negative class --
+        a classifier could then separate them on pLDDT alone.
+        """
+        by_key = {p.key: p for p in plan(plddt_min="80", min_plddt_fraction="0.75")}
+        for key in ("positives", "negatives"):
+            with self.subTest(phase=key):
+                flags = self._flags(by_key[key])
+                self.assertEqual(sorted(flags), sorted(self.QUALITY_FLAGS))
+                self.assertEqual(float(flags["--plddt-min"]), 80.0)
+                self.assertEqual(float(flags["--min-plddt-fraction"]), 0.75)
+                self.assertEqual(os.path.basename(flags["--cavity-quality"]),
+                                 "cavity_quality.csv")
+
+    def test_the_file_the_stages_filter_on_is_the_one_phase_2b_wrote(self):
+        by_key = {p.key: p for p in plan(min_plddt_fraction="0.8")}
+        written = by_key["quality"].produces[0]
+        for key in ("positives", "negatives"):
+            with self.subTest(phase=key):
+                self.assertEqual(self._flags(by_key[key])["--cavity-quality"], written)
+                self.assertIn(written, by_key[key].requires)
+
+    def test_the_filtered_command_lines_are_accepted_by_the_real_parsers(self):
+        """The generic check only ever parses the unfiltered plan."""
+        import importlib
+
+        by_key = {p.key: p for p in plan(plddt_min="80", min_plddt_fraction="0.75")}
+        for key in ("quality", "positives", "negatives"):
+            phase = by_key[key]
+            module = importlib.import_module(phase.script[: -len(".py")])
+            builder = (getattr(module, "build_parser", None)
+                       or getattr(module, "build_arg_parser"))
+            with self.subTest(phase=key):
+                try:
+                    builder().parse_args(phase.args)
+                except SystemExit as exc:
+                    self.fail("%s does not accept %s (%s)"
+                              % (phase.script, phase.args, exc))
+
+    def test_without_a_fraction_neither_stage_is_given_a_quality_flag(self):
+        """No fraction, no filtering -- and no new arguments to today's commands."""
+        for overrides in ({}, {"plddt_min": "90"}):
+            by_key = {p.key: p for p in plan(**overrides)}
+            for key in ("positives", "negatives"):
+                with self.subTest(phase=key, overrides=overrides):
+                    self.assertEqual(self._flags(by_key[key]), {})
+                    self.assertNotIn(by_key["quality"].produces[0], by_key[key].requires)
+
+
 class TestPhaseGroups(unittest.TestCase):
     def test_only_structures_selects_exactly_the_structure_phases(self):
         self.assertEqual(wf.expand_phase_keys(["structures"]),

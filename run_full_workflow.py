@@ -35,6 +35,18 @@ Phase groups
 :data:`PHASE_GROUPS`. ``--only structures`` is the four structure-preparation
 phases; ``--skip structures`` is everything else.
 
+Pocket quality
+--------------
+
+Phase 2b (``score_cavity_quality.py``) always runs and always writes
+``manifests/cavity_quality.csv``: every cavity's per-residue AlphaFold pLDDT, about
+six CPU-minutes for all 38,709 archives. *Filtering* on it is opt-in and is one
+switch -- ``--min-plddt-fraction``. Without it phases 3 and 4 are handed no quality
+flags at all and plan exactly what they plan today; with it, both are given the
+same ``--cavity-quality`` / ``--plddt-min`` / ``--min-plddt-fraction``, because a
+threshold applied to one class and not the other is a confound rather than a
+filter.
+
 Where everything is written
 ---------------------------
 
@@ -117,7 +129,7 @@ MODES = ("positives-only", "balanced")
 #: Names --skip/--only accept in place of a single phase key.
 PHASE_GROUPS = {
     "structures": ("cavity-structures", "alphafold", "fix", "pdbqt"),
-    "planning": ("identity", "interactions", "cavities", "positives",
+    "planning": ("identity", "interactions", "cavities", "quality", "positives",
                  "negatives", "manifest"),
 }
 
@@ -234,6 +246,7 @@ def build_phases(args):
 
     interactions = j(manifests, "interactions_resolved.csv")
     cavity_manifest = j(manifests, "cavity_manifest.csv")
+    cavity_quality = j(manifests, "cavity_quality.csv")
     positives = j(manifests, "positives_planned.csv")
     pool = j(manifests, "negatives_pool.csv")
     drawn = j(manifests, "negatives_drawn.csv")
@@ -249,6 +262,20 @@ def build_phases(args):
     # batch_dock.py resolves each mapping as <run-dir>/manifests/<basename>, so the
     # structure phases must write there and nowhere else.
     threads = ["--threads", str(args.threads)] if args.threads else []
+
+    # Pocket-quality filtering is opt-in, and --min-plddt-fraction is the single
+    # switch: without it phases 3 and 4 are handed no quality flags at all and run
+    # exactly as they did before phase 2b existed. Phase 2b itself always runs --
+    # scoring all 38,709 cavities costs about six CPU-minutes and the file is
+    # worth having whether or not this run filters on it.
+    if args.min_plddt_fraction is None:
+        quality_flags = []
+        quality_requires = []
+    else:
+        quality_flags = ["--cavity-quality", cavity_quality,
+                         "--plddt-min", repr(float(args.plddt_min)),
+                         "--min-plddt-fraction", repr(float(args.min_plddt_fraction))]
+        quality_requires = [cavity_quality]
 
     phases = [
         Phase("identity", "Phase 0 - build the identity index",
@@ -266,18 +293,31 @@ def build_phases(args):
               "extract_cavities.py",
               ["--manifest-only", "--tarballs", args.tarballs or "", "--out", cavity_manifest],
               produces=[cavity_manifest]),
+        # Reads the pocket-lining residues out of each archive and records their
+        # AlphaFold pLDDT. Always run: it is the only place the confidence of a
+        # pocket is ever measured, and every later cutoff is recomputed from the
+        # per-residue column it writes rather than from the archives.
+        Phase("quality", "Phase 2b - score every cavity by pLDDT",
+              "score_cavity_quality.py",
+              ["--tarballs", args.tarballs or "", "--manifest", cavity_manifest,
+               "--out", cavity_quality,
+               "--rejects", j(manifests, "cavity_quality_rejected.csv")],
+              produces=[cavity_quality], requires=[cavity_manifest]),
         Phase("positives", "Phase 3 - plan the positive jobs",
               "plan_positives.py",
               ["--interactions", interactions, "--index", identity,
                "--cavities", cavity_manifest, "--drugs", args.drugs or "",
                "--out", positives, "--rejects", j(manifests, "positives_rejected.csv")]
-              + (["--ligands", args.ligands] if args.ligands else []),
-              produces=[positives], requires=[interactions, cavity_manifest]),
+              + (["--ligands", args.ligands] if args.ligands else [])
+              + quality_flags,
+              produces=[positives],
+              requires=[interactions, cavity_manifest] + quality_requires),
     ]
 
     sample_args = ["--index", identity, "--interactions", interactions,
                    "--positives", positives, "--out", drawn,
                    "--redock-queue", j(manifests, "negatives_redock_queue.csv")]
+    sample_args += quality_flags
     # Exactly one of --pool / --no-pool: the sampler refuses to guess whether
     # prior results exist, and the runner must not guess on its behalf either.
     if args.pool:
@@ -289,7 +329,7 @@ def build_phases(args):
             # The stage the old runner never called at all.
             Phase("negatives", "Phase 4 - balanced negative sampling",
                   "sample_negatives.py", sample_args,
-                  produces=[drawn], requires=[positives]))
+                  produces=[drawn], requires=[positives] + quality_requires))
 
     phases.append(
         Phase("manifest", "Phase 5 - assemble the run manifest and job queue",
@@ -496,6 +536,21 @@ def build_parser():
                         help=("worker threads for the structure phases (extraction, "
                               "hydrogen addition, PDBQT conversion). Unset leaves each "
                               "script on its own default."))
+    parser.add_argument("--plddt-min", type=float, default=70.0,
+                        help=("pLDDT a pocket residue must reach to count as "
+                              "confident (default: %(default)s, AlphaFold's "
+                              "'confident' band). Forwarded to phases 3 and 4 only "
+                              "together with --min-plddt-fraction; on its own it "
+                              "changes nothing."))
+    parser.add_argument("--min-plddt-fraction", type=float, default=None,
+                        help=("fraction of a pocket's residues that must reach "
+                              "--plddt-min for that pocket to be planned. NO "
+                              "DEFAULT, and supplying it is what turns pocket-"
+                              "quality filtering on: without it phases 3 and 4 are "
+                              "handed no quality flags at all and plan exactly what "
+                              "they plan today. Phase 2b scores every cavity either "
+                              "way, so the numbers are on disk whether or not this "
+                              "run filters on them."))
     parser.add_argument("--pool", default=None,
                         help=("optional negatives_pool.csv: already-docked "
                               "non-interaction jobs the sampler may draw from before "

@@ -28,6 +28,7 @@ import hashlib
 import json
 import logging
 import os
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -215,6 +216,101 @@ POOL_COLUMNS = [
 
 def make_pool(rows: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(list(rows), columns=POOL_COLUMNS)
+
+
+# --------------------------------------------------------------------------
+# cavity_quality fixtures
+# --------------------------------------------------------------------------
+
+#: A pocket every residue of which AlphaFold modelled with high confidence.
+CONFIDENT_RESIDUES: Tuple[float, ...] = (95.0, 94.5, 93.0, 91.25, 90.0)
+#: The same pocket size, but only one residue in the confident band: at
+#: ``--plddt-min 70`` its ``frac_ge_70`` is 0.20, so any ``--min-plddt-fraction``
+#: above that rejects it.
+DISORDERED_RESIDUES: Tuple[float, ...] = (95.0, 40.0, 39.5, 38.0, 30.25)
+
+QUALITY_COLUMNS = [
+    "accession",
+    "fragment_id",
+    "cavity_index",
+    "n_residues",
+    "n_atoms",
+    "mean_plddt",
+    "median_plddt",
+    "min_plddt",
+    "max_plddt",
+    "frac_ge_50",
+    "frac_ge_70",
+    "frac_ge_90",
+    "residue_plddt",
+]
+
+
+def quality_row(
+    accession: str,
+    fragment: str,
+    cavity: int,
+    residues: Sequence[float],
+) -> Dict[str, Any]:
+    """One ``cavity_quality`` row, derived from its per-residue values.
+
+    Every number comes from ``residues``, exactly as ``score_cavity_quality.py``
+    derives them, so the schema's ``residue_list_matches_count`` check and
+    ``quality.fraction_at`` agree with the frac_ge_* columns.
+    """
+    values = [float("{0:.2f}".format(float(v))) for v in residues]
+
+    def frac(threshold: float) -> float:
+        return sum(1 for v in values if v >= threshold) / float(len(values))
+
+    return {
+        "accession": accession,
+        "fragment_id": fragment,
+        "cavity_index": int(cavity),
+        "n_residues": len(values),
+        "n_atoms": len(values) * 7,
+        "mean_plddt": sum(values) / float(len(values)),
+        "median_plddt": statistics.median(values),
+        "min_plddt": min(values),
+        "max_plddt": max(values),
+        "frac_ge_50": frac(50.0),
+        "frac_ge_70": frac(70.0),
+        "frac_ge_90": frac(90.0),
+        "residue_plddt": ";".join("{0:.2f}".format(v) for v in values),
+    }
+
+
+def make_quality(
+    pockets: Mapping[str, Sequence[Any]],
+    failing: Iterable[Tuple[str, str, int]] = (),
+    omit: Iterable[Tuple[str, str, int]] = (),
+) -> pd.DataFrame:
+    """A ``cavity_quality`` frame over ``pockets`` (the ``cavities`` mapping).
+
+    ``failing`` names ``(accession, fragment_id, cavity_index)`` triples that get
+    a disordered pocket; ``omit`` names triples left out of the file entirely,
+    which is the ``--allow-missing-quality`` case.
+    """
+    failing_keys = {(str(a), str(f), int(c)) for a, f, c in failing}
+    omitted = {(str(a), str(f), int(c)) for a, f, c in omit}
+    rows: List[Dict[str, Any]] = []
+    for accession, cavities in sorted(pockets.items()):
+        for pocket in cavities:
+            fragment, cavity = (
+                pocket if isinstance(pocket, tuple) else ("F1", int(pocket))
+            )
+            key = (str(accession), str(fragment), int(cavity))
+            if key in omitted:
+                continue
+            rows.append(
+                quality_row(
+                    accession,
+                    fragment,
+                    int(cavity),
+                    DISORDERED_RESIDUES if key in failing_keys else CONFIDENT_RESIDUES,
+                )
+            )
+    return pd.DataFrame(rows, columns=QUALITY_COLUMNS)
 
 
 class Fixture:
@@ -770,7 +866,17 @@ class TestBalance(SamplerTestCase):
         self.assertEqual(
             list(table.columns),
             ["axis", "key", "gene", "unit", "quota", "drawn", "from_pool",
-             "from_new", "deficit"],
+             "from_new", "deficit", "quality_dropped", "deficit_reason"],
+        )
+        self.assertEqual(
+            {0},
+            set(table["quality_dropped"]),
+            "no pocket-quality filter ran, so nothing was dropped by one",
+        )
+        self.assertEqual(
+            {"", "no_candidate"},
+            set(table["deficit_reason"]),
+            "a shortfall with no quality filter is a candidate shortfall",
         )
         self.assertEqual({"job"}, set(table["unit"]), "the file names its unit")
         worst = table[table["axis"] == "drug"].iloc[0]
@@ -1593,6 +1699,634 @@ class TestHelpers(unittest.TestCase):
             sn.build_avoid_list(
                 pd.DataFrame({"drugbank_id": ["DB1"], "gene": ["AVPR2"]})
             )
+
+
+# --------------------------------------------------------------------------
+# the optional pLDDT filter
+# --------------------------------------------------------------------------
+
+
+class TestPocketQualityFilter(SamplerTestCase):
+    """``--cavity-quality`` / ``--min-plddt-fraction`` on the candidate pool.
+
+    The filter runs *before* the quotas are computed. Every test here is really
+    one question: does the sampler balance the design that will actually be
+    docked, or the one it was handed?
+    """
+
+    #: DB00001 binds P30518 (3 cavities); DB00002 binds P35348 (1 cavity).
+    CAVITIES: Dict[str, List[Any]] = {"P30518": [1, 2, 3], "P35348": [1]}
+    #: Two of P30518's three cavities are modelled badly.
+    FAILING = (("P30518", "F1", 2), ("P30518", "F1", 3))
+
+    def fixture(
+        self,
+        pool_rows: Sequence[Mapping[str, Any]] = (),
+        cavities: Optional[Mapping[str, Sequence[Any]]] = None,
+    ) -> Fixture:
+        return build_fixture(
+            os.path.join(self.tmp, "in"),
+            edges=[("DB00001", "P30518"), ("DB00002", "P35348")],
+            positive_pairs=[("DB00001", "P30518"), ("DB00002", "P35348")],
+            cavities=dict(cavities or self.CAVITIES),
+            pool_rows=pool_rows,
+        )
+
+    def write_quality(self, frame: pd.DataFrame, name: str = "cavity_quality.csv") -> str:
+        path = os.path.join(self.tmp, name)
+        write_checked(frame, path, "cavity_quality")
+        return path
+
+    def quality(self, **kwargs) -> pd.DataFrame:
+        return make_quality(self.CAVITIES, **kwargs)
+
+    # -- the ordering that this whole feature turns on --------------------
+
+    def test_quotas_are_computed_from_the_filtered_pool(self) -> None:
+        """Filter first, then count. The two orders give different answers.
+
+        DB00001's three positives sit on P30518's three cavities, two of which
+        are badly modelled. Counting first says "DB00001 needs 3 negatives" and
+        the draw then falls two short, because DB00001's only non-interacting
+        target has a quota of 1. Filtering first says "DB00001 needs 1", which
+        is satisfiable -- and it is the honest number, because the two dropped
+        positives will not be docked either.
+        """
+        fixture = self.fixture()
+        raw = read_checked(fixture.positives_path, "positives_planned")
+        raw_drug_quota, raw_target_quota = sn.compute_quotas(raw, sn.UNIT_JOB)
+        self.assertEqual(3, raw_drug_quota["DB00001"], "the unfiltered demand")
+        self.assertEqual(3, raw_target_quota["P30518"])
+
+        result = fixture.sample(
+            cavity_quality=self.quality(failing=self.FAILING),
+            min_plddt_fraction=0.8,
+            seed=3,
+        )
+        ledger = result.deficits.set_index(["axis", "key"])
+        self.assertEqual(
+            1,
+            int(ledger.loc[("drug", "DB00001"), "quota"]),
+            "the quota must count the positives that survive the filter",
+        )
+        self.assertEqual(1, int(ledger.loc[("target", "P30518"), "quota"]))
+        self.assertEqual(2, int(ledger.loc[("drug", "DB00001"), "quality_dropped"]))
+        self.assertEqual(2, int(ledger.loc[("target", "P30518"), "quality_dropped"]))
+        self.assertTrue(
+            result.balance_ok,
+            "the filtered design is balanceable; the unfiltered one is not",
+        )
+        self.assertEqual(2, len(result.drawn))
+
+    def test_counting_before_filtering_would_have_left_a_deficit(self) -> None:
+        """The other order, pinned, so the difference cannot be argued away."""
+        fixture = self.fixture()
+        unfiltered = fixture.sample(seed=3)
+        self.assertFalse(unfiltered.balance_ok)
+        ledger = unfiltered.deficits.set_index(["axis", "key"])
+        self.assertEqual(2, int(ledger.loc[("drug", "DB00001"), "deficit"]))
+
+    def test_no_negative_is_ever_drawn_into_a_rejected_pocket(self) -> None:
+        result = self.fixture().sample(
+            cavity_quality=self.quality(failing=self.FAILING),
+            min_plddt_fraction=0.8,
+            seed=3,
+        )
+        rejected = {(a, f, int(c)) for a, f, c in self.FAILING}
+        drawn = {
+            (a, f, int(c))
+            for a, f, c in zip(
+                result.drawn["accession"],
+                result.drawn["fragment_id"],
+                result.drawn["cavity_index"],
+            )
+        }
+        self.assertFalse(drawn & rejected, "a rejected pocket reached the draw")
+
+    def test_balance_still_holds_after_filtering(self) -> None:
+        """Per-entity equality, recomputed from the surviving positives."""
+        fixture = build_fixture(
+            os.path.join(self.tmp, "in"),
+            edges=[
+                ("DB00001", "P30518"),
+                ("DB00002", "P35348"),
+                ("DB00003", "P14416"),
+            ],
+            positive_pairs=[
+                ("DB00001", "P30518"),
+                ("DB00002", "P35348"),
+                ("DB00003", "P14416"),
+            ],
+            cavities={"P30518": [1, 2], "P35348": [1, 2], "P14416": [1, 2]},
+        )
+        quality_frame = make_quality(
+            {"P30518": [1, 2], "P35348": [1, 2], "P14416": [1, 2]},
+            failing=[("P30518", "F1", 2), ("P14416", "F1", 2)],
+        )
+        result = fixture.sample(
+            cavity_quality=quality_frame, min_plddt_fraction=0.8, seed=11
+        )
+        positives = read_checked(fixture.positives_path, "positives_planned")
+        surviving = positives[
+            ~positives.apply(
+                lambda row: (row["accession"], row["fragment_id"], int(row["cavity_index"]))
+                in {("P30518", "F1", 2), ("P14416", "F1", 2)},
+                axis=1,
+            )
+        ]
+        self.assertEqual(4, len(surviving))
+        self.assertEqual(len(surviving), len(result.drawn))
+        for column in ("drugbank_id", "accession"):
+            positive_counts = surviving.groupby(column).size()
+            negative_counts = result.drawn.groupby(column).size()
+            self.assertEqual(sorted(positive_counts.index), sorted(negative_counts.index))
+            for key in positive_counts.index:
+                self.assertEqual(
+                    int(positive_counts[key]),
+                    int(negative_counts[key]),
+                    "{0}={1} is unbalanced after filtering".format(column, key),
+                )
+        self.assertTrue(result.balance_ok)
+
+    # -- entities the filter removes entirely -----------------------------
+
+    def test_an_entity_that_loses_every_pocket_is_a_quality_deficit(self) -> None:
+        """P14416's only cavity fails, so it and its drug leave the design.
+
+        The ledger still names both, with the demand they started from, because
+        an entity that silently disappears is exactly what this file exists to
+        prevent -- "we asked for 5 and got 3" has to be readable off the ledger.
+        """
+        fixture = build_fixture(
+            os.path.join(self.tmp, "in"),
+            edges=[
+                ("DB00001", "P30518"),
+                ("DB00002", "P35348"),
+                ("DB00003", "P14416"),
+            ],
+            positive_pairs=[
+                ("DB00001", "P30518"),
+                ("DB00002", "P35348"),
+                ("DB00003", "P14416"),
+            ],
+            cavities={"P30518": [1], "P35348": [1], "P14416": [1]},
+        )
+        result = fixture.sample(
+            cavity_quality=make_quality(
+                {"P30518": [1], "P35348": [1], "P14416": [1]},
+                failing=[("P14416", "F1", 1)],
+            ),
+            min_plddt_fraction=0.8,
+            seed=4,
+        )
+        ledger = result.deficits.set_index(["axis", "key"])
+        for axis, key in (("target", "P14416"), ("drug", "DB00003")):
+            row = ledger.loc[(axis, key)]
+            self.assertEqual(0, int(row["quota"]), "{0} left the design".format(key))
+            self.assertEqual(0, int(row["drawn"]))
+            self.assertEqual(1, int(row["quality_dropped"]))
+            self.assertEqual(sn.DEFICIT_REASON_QUALITY, str(row["deficit_reason"]))
+        self.assertEqual(
+            ["P14416"], result.report["quality"]["undrawable_targets"]
+        )
+        self.assertEqual(["DB00003"], result.report["quality"]["undrawable_drugs"])
+        self.assertEqual(
+            {"drug": 1, "target": 1}, result.report["quality"]["units_dropped"]
+        )
+        self.assertTrue(
+            result.balance_ok,
+            "what remains is balanced; the loss is reported, not hidden in the "
+            "balance flag",
+        )
+        self.assertEqual(
+            0,
+            int((result.drawn["accession"] == "P14416").sum()),
+            "a target with no usable pocket receives no negatives",
+        )
+
+    def test_the_ledger_reconciles_the_demand_the_plan_started_from(self) -> None:
+        """``quota + quality_dropped`` is what was asked for; ``drawn`` is what came.
+
+        This is the arithmetic that turns "we asked for 4 and got 2" from an
+        observation into an explanation.
+        """
+        fixture = self.fixture()
+        planned = sn.compute_quotas(
+            read_checked(fixture.positives_path, "positives_planned"), sn.UNIT_JOB
+        )
+        result = fixture.sample(
+            cavity_quality=self.quality(failing=self.FAILING),
+            min_plddt_fraction=0.8,
+            seed=3,
+        )
+        for axis, quota in (("drug", planned[0]), ("target", planned[1])):
+            part = result.deficits[result.deficits["axis"] == axis]
+            self.assertEqual(
+                sum(quota.values()),
+                int(part["quota"].sum()) + int(part["quality_dropped"].sum()),
+                "{0} axis does not reconcile with the plan it started from".format(axis),
+            )
+            self.assertEqual(2, int(part["drawn"].sum()))
+            self.assertEqual(2, int(part["quality_dropped"].sum()))
+
+    def test_pair_mode_filters_the_pool_before_its_quotas_too(self) -> None:
+        fixture = build_fixture(
+            os.path.join(self.tmp, "in"),
+            edges=[("DB00001", "P30518"), ("DB00002", "P35348"), ("DB00003", "P14416")],
+            positive_pairs=[
+                ("DB00001", "P30518"),
+                ("DB00002", "P35348"),
+                ("DB00003", "P14416"),
+            ],
+            cavities={"P30518": [1, 2], "P35348": [1, 2], "P14416": [1, 2]},
+        )
+        quality_frame = make_quality(
+            {"P30518": [1, 2], "P35348": [1, 2], "P14416": [1, 2]},
+            # P14416 loses both pockets; P30518 loses one of two.
+            failing=[("P14416", "F1", 1), ("P14416", "F1", 2), ("P30518", "F1", 2)],
+        )
+        result = fixture.sample(
+            cavity_quality=quality_frame,
+            min_plddt_fraction=0.8,
+            balance_unit=sn.UNIT_PAIR,
+            seed=6,
+        )
+        ledger = result.deficits.set_index(["axis", "key"])
+        self.assertEqual(
+            1,
+            int(ledger.loc[("target", "P30518"), "quota"]),
+            "losing one of two cavities costs no pair",
+        )
+        self.assertEqual(0, int(ledger.loc[("target", "P30518"), "quality_dropped"]))
+        self.assertEqual(0, int(ledger.loc[("target", "P14416"), "quota"]))
+        self.assertEqual(1, int(ledger.loc[("target", "P14416"), "quality_dropped"]))
+        self.assertEqual(
+            1,
+            int((result.drawn["accession"] == "P30518").sum()),
+            "a drawn pair mirrors the surviving positive cavity depth, not the "
+            "planned one",
+        )
+        self.assertTrue(result.balance_ok)
+
+    def test_a_shortfall_with_no_filter_is_not_blamed_on_quality(self) -> None:
+        result = self.fixture().sample(seed=3)
+        ledger = result.deficits.set_index(["axis", "key"])
+        self.assertEqual(
+            sn.DEFICIT_REASON_NO_CANDIDATE,
+            str(ledger.loc[("drug", "DB00001"), "deficit_reason"]),
+        )
+        self.assertEqual(0, int(result.deficits["quality_dropped"].sum()))
+
+    def test_every_positive_failing_is_an_error_not_an_empty_manifest(self) -> None:
+        fixture = self.fixture()
+        with self.assertRaises(InvariantViolation) as caught:
+            fixture.sample(
+                cavity_quality=self.quality(
+                    failing=[
+                        ("P30518", "F1", 1),
+                        ("P30518", "F1", 2),
+                        ("P30518", "F1", 3),
+                        ("P35348", "F1", 1),
+                    ]
+                ),
+                min_plddt_fraction=0.8,
+            )
+        self.assertIn("every one of the 4 planned positive row(s)", str(caught.exception))
+
+    # -- the pool side ----------------------------------------------------
+
+    def test_a_pool_row_on_a_bad_pocket_is_recorded_not_dropped(self) -> None:
+        index = write_index(os.path.join(self.tmp, "identity_index.parquet"))
+        fixture = self.fixture(
+            pool_rows=[pool_row("DB00002", "P30518", index, cavity=2)]
+        )
+        result = fixture.sample(
+            cavity_quality=self.quality(failing=self.FAILING),
+            min_plddt_fraction=0.8,
+            seed=3,
+        )
+        self.assertEqual(1, len(result.eligibility), "the ledger keeps every pool row")
+        row = result.eligibility.iloc[0]
+        self.assertEqual(sn.REASON_POCKET_QUALITY, str(row["eligibility"]))
+        self.assertFalse(bool(row["eligible"]))
+        self.assertEqual(
+            "frac_ge_70=0.20 < 0.80 (n_residues=5)", str(row["eligibility_detail"])
+        )
+        self.assertEqual(0, result.report["pool"]["n_eligible"])
+        self.assertEqual(
+            1, result.report["pool"]["reasons"][sn.REASON_POCKET_QUALITY]
+        )
+        self.assertTrue(
+            (result.drawn["source"] == "new").all(),
+            "a pool job on a rejected pocket must not be reused",
+        )
+
+    def test_structural_ineligibility_outranks_the_quality_reason(self) -> None:
+        """A row that was ineligible anyway was not lost *to the filter*.
+
+        ``(DB00001, P30518)`` is a known interaction, so the pool row is
+        contamination whether or not its pocket is well modelled. Counting it as
+        a quality rejection would overstate what the threshold cost.
+        """
+        index = write_index(os.path.join(self.tmp, "identity_index.parquet"))
+        fixture = self.fixture(
+            pool_rows=[pool_row("DB00001", "P30518", index, cavity=2)]
+        )
+        result = fixture.sample(
+            cavity_quality=self.quality(failing=self.FAILING),
+            min_plddt_fraction=0.8,
+            seed=3,
+        )
+        self.assertEqual(
+            sn.REASON_KNOWN_INTERACTION,
+            str(result.eligibility["eligibility"].iloc[0]),
+        )
+        self.assertEqual(
+            "", str(result.eligibility["eligibility_detail"].iloc[0])
+        )
+        self.assertEqual(
+            0, result.report["pool"]["reasons"][sn.REASON_POCKET_QUALITY]
+        )
+
+    def test_a_rejected_pocket_is_not_offered_as_a_fresh_job_either(self) -> None:
+        """The pocket *universe* shrinks too, not only the reusable rows.
+
+        P30518 cavity 1 is badly modelled and cavity 2 is not. The pool holds a
+        job on cavity 1; the sampler must neither reuse it nor invent a fresh
+        job there -- it has to plan the draw on cavity 2.
+        """
+        index = write_index(os.path.join(self.tmp, "identity_index.parquet"))
+        fixture = self.fixture(
+            pool_rows=[pool_row("DB00002", "P30518", index, cavity=1)],
+            cavities={"P30518": [1, 2], "P35348": [1]},
+        )
+        result = fixture.sample(
+            cavity_quality=make_quality(
+                {"P30518": [1, 2], "P35348": [1]},
+                failing=[("P30518", "F1", 1)],
+            ),
+            min_plddt_fraction=0.8,
+            prefer_pool=True,
+            seed=3,
+        )
+        drawn = result.drawn[result.drawn["accession"] == "P30518"]
+        self.assertEqual(1, len(drawn))
+        self.assertEqual(2, int(drawn["cavity_index"].iloc[0]))
+        self.assertEqual("new", str(drawn["source"].iloc[0]))
+
+    def test_the_fragment_id_is_normalised_on_both_sides_of_the_join(self) -> None:
+        """``'1'`` and ``'F1'`` are the same fragment. They were not, once.
+
+        The 2025 pipeline wrote ``'F1'`` on positives and bare ``'1'`` on
+        negatives; a quality join that compared the raw strings would call every
+        pocket unscored and stop the run for no reason.
+        """
+        quality_frame = self.quality(failing=self.FAILING)
+        quality_frame["fragment_id"] = [
+            str(value)[1:] for value in quality_frame["fragment_id"]
+        ]
+        self.assertEqual({"1"}, set(quality_frame["fragment_id"]))
+        result = self.fixture().sample(
+            cavity_quality=quality_frame, min_plddt_fraction=0.8, seed=3
+        )
+        self.assertEqual(0, result.report["quality"]["n_rows_missing_quality"])
+        self.assertEqual(2, result.report["quality"]["positives"]["n_dropped"])
+
+    def test_a_quality_table_that_names_a_pocket_twice_is_refused(self) -> None:
+        quality_frame = self.quality()
+        doubled = pd.concat(
+            [quality_frame, quality_frame.head(1).assign(fragment_id="1")],
+            ignore_index=True,
+        )
+        with self.assertRaises(InvariantViolation) as caught:
+            self.fixture().sample(cavity_quality=doubled, min_plddt_fraction=0.8)
+        self.assertIn("two rows for pocket", str(caught.exception))
+
+    # -- coverage policy --------------------------------------------------
+
+    def test_an_unscored_pocket_is_an_error_that_writes_nothing(self) -> None:
+        path = self.write_quality(self.quality(omit=[("P35348", "F1", 1)]))
+        out = self.out_dir()
+        self.assertEqual(
+            2,
+            sn.main(
+                self.fixture().argv(
+                    out,
+                    "--cavity-quality", path,
+                    "--min-plddt-fraction", "0.8",
+                )
+            ),
+        )
+        self.assertFalse(
+            os.path.exists(os.path.join(out, "negatives_drawn.csv")),
+            "a stage that refuses a prerequisite creates nothing on the way out",
+        )
+        self.assertFalse(
+            os.path.exists(os.path.join(out, "negatives_drawn.quality_rejects.csv"))
+        )
+
+    def test_allow_missing_quality_treats_the_pocket_as_failing(self) -> None:
+        result = self.fixture().sample(
+            cavity_quality=self.quality(
+                omit=[("P30518", "F1", 2), ("P30518", "F1", 3)]
+            ),
+            min_plddt_fraction=0.8,
+            allow_missing_quality=True,
+            seed=3,
+        )
+        self.assertEqual(2, result.report["quality"]["n_rows_missing_quality"])
+        ledger = result.deficits.set_index(["axis", "key"])
+        self.assertEqual(1, int(ledger.loc[("drug", "DB00001"), "quota"]))
+        self.assertEqual(2, int(ledger.loc[("drug", "DB00001"), "quality_dropped"]))
+        self.assertTrue(result.balance_ok)
+        rejects = result.quality_rejects
+        unscored = rejects[rejects["detail"].str.startswith("not scored")]
+        self.assertEqual(2, len(unscored))
+
+    def test_the_same_pocket_scored_and_missing_are_not_the_same_run(self) -> None:
+        """Without the escape hatch the run stops; with it, it continues."""
+        fixture = self.fixture()
+        with self.assertRaises(sn.MissingQualityError):
+            fixture.sample(
+                cavity_quality=self.quality(omit=[("P35348", "F1", 1)]),
+                min_plddt_fraction=0.8,
+            )
+        result = fixture.sample(
+            cavity_quality=self.quality(omit=[("P35348", "F1", 1)]),
+            min_plddt_fraction=0.8,
+            allow_missing_quality=True,
+            seed=3,
+        )
+        self.assertNotIn("P35348", set(result.drawn["accession"]))
+
+    # -- opt-in: the flags are inert until the fraction is given ----------
+
+    def test_without_min_plddt_fraction_the_draw_is_byte_identical(self) -> None:
+        fixture = ring_fixture(os.path.join(self.tmp, "in"))
+        path = self.write_quality(
+            make_quality(
+                {
+                    "P30518": [1],
+                    "P35348": [1],
+                    "P14416": [1],
+                    "P08913": [1],
+                    "P28223": [1],
+                },
+                failing=[("P30518", "F1", 1)],
+            )
+        )
+        plain, with_table = self.out_dir("plain"), self.out_dir("table")
+        self.assertEqual(
+            sn.EXIT_OK, sn.main(fixture.argv(plain, "--prefer-pool", "--seed", "1234"))
+        )
+        self.assertEqual(
+            sn.EXIT_OK,
+            sn.main(
+                fixture.argv(
+                    with_table,
+                    "--prefer-pool",
+                    "--seed", "1234",
+                    "--cavity-quality", path,
+                    "--plddt-min", "90",
+                )
+            ),
+        )
+        self.assertEqual(
+            sha256(os.path.join(plain, "negatives_drawn.csv")),
+            sha256(os.path.join(with_table, "negatives_drawn.csv")),
+            "--cavity-quality alone must not change a single drawn row",
+        )
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(with_table, "negatives_drawn.quality_rejects.csv")
+            ),
+            "an absent rejects file means 'no filtering was asked for'",
+        )
+        with open(
+            os.path.join(with_table, "negatives_drawn.report.json"), encoding="utf-8"
+        ) as handle:
+            report = json.load(handle)[0]
+        self.assertFalse(report["quality"]["enabled"])
+
+    def test_min_plddt_fraction_without_a_table_is_a_usage_error(self) -> None:
+        out = self.out_dir()
+        self.assertEqual(
+            2, sn.main(self.fixture().argv(out, "--min-plddt-fraction", "0.8"))
+        )
+        self.assertFalse(os.path.exists(os.path.join(out, "negatives_drawn.csv")))
+
+    def test_a_percentage_is_refused_rather_than_passing_nothing(self) -> None:
+        path = self.write_quality(self.quality())
+        self.assertEqual(
+            2,
+            sn.main(
+                self.fixture().argv(
+                    self.out_dir(),
+                    "--cavity-quality", path,
+                    "--min-plddt-fraction", "80",
+                )
+            ),
+        )
+
+    # -- the artifacts ----------------------------------------------------
+
+    def test_the_rejects_ledger_names_both_manifests_with_numbers(self) -> None:
+        index = write_index(os.path.join(self.tmp, "identity_index.parquet"))
+        fixture = self.fixture(
+            pool_rows=[pool_row("DB00002", "P30518", index, cavity=2)]
+        )
+        path = self.write_quality(self.quality(failing=self.FAILING))
+        out = self.out_dir()
+        self.assertEqual(
+            sn.EXIT_OK,
+            sn.main(
+                fixture.argv(
+                    out,
+                    "--cavity-quality", path,
+                    "--plddt-min", "70",
+                    "--min-plddt-fraction", "0.8",
+                    "--seed", "3",
+                )
+            ),
+        )
+        table = read_plain(os.path.join(out, "negatives_drawn.quality_rejects.csv"))
+        self.assertEqual(list(table.columns), list(sn.QUALITY_REJECT_COLUMNS))
+        self.assertEqual({"positives", "pool"}, set(table["frame"]))
+        self.assertEqual(
+            {sn.REASON_POCKET_QUALITY}, set(table["reason"]), "one fixed reason string"
+        )
+        self.assertEqual(
+            ["frac_ge_70=0.20 < 0.80 (n_residues=5)"] * 3,
+            list(table["detail"]),
+            "the detail carries the numbers that decided it",
+        )
+        self.assertEqual(
+            2, int((table["frame"] == "positives").sum()), "both dropped positives"
+        )
+
+    def test_the_report_records_the_threshold_and_the_before_after(self) -> None:
+        index = write_index(os.path.join(self.tmp, "identity_index.parquet"))
+        fixture = self.fixture(
+            pool_rows=[pool_row("DB00002", "P30518", index, cavity=2)]
+        )
+        result = fixture.sample(
+            cavity_quality=self.quality(failing=self.FAILING),
+            plddt_min=70.0,
+            min_plddt_fraction=0.8,
+            seed=3,
+        )
+        quality_report = result.report["quality"]
+        self.assertTrue(quality_report["enabled"])
+        self.assertEqual(70.0, quality_report["plddt_min"])
+        self.assertEqual(0.8, quality_report["min_fraction"])
+        self.assertFalse(quality_report["allow_missing"])
+        self.assertEqual(4, quality_report["n_scored_pockets"])
+        self.assertEqual(2, quality_report["n_scored_pockets_passing"])
+        self.assertEqual(
+            {"n_rows_before": 4, "n_rows_after": 2, "n_dropped": 2},
+            quality_report["positives"],
+        )
+        self.assertEqual(
+            {"n_rows_before": 1, "n_rows_passing": 0, "n_dropped": 1},
+            quality_report["pool"],
+        )
+
+    def test_the_summary_states_what_the_filter_cost(self) -> None:
+        fixture = build_fixture(
+            os.path.join(self.tmp, "in"),
+            edges=[("DB00001", "P30518"), ("DB00002", "P35348"), ("DB00003", "P14416")],
+            positive_pairs=[
+                ("DB00001", "P30518"),
+                ("DB00002", "P35348"),
+                ("DB00003", "P14416"),
+            ],
+            cavities={"P30518": [1], "P35348": [1], "P14416": [1]},
+        )
+        path = self.write_quality(
+            make_quality(
+                {"P30518": [1], "P35348": [1], "P14416": [1]},
+                failing=[("P14416", "F1", 1)],
+            )
+        )
+        with self.assertLogs("sample_negatives", level="INFO") as captured:
+            self.assertEqual(
+                sn.EXIT_OK,
+                sn.main(
+                    fixture.argv(
+                        self.out_dir(),
+                        "--cavity-quality", path,
+                        "--min-plddt-fraction", "0.8",
+                        "--log-level", "INFO",
+                    )
+                ),
+            )
+        text = "\n".join(captured.output)
+        self.assertIn("pocket quality", text)
+        self.assertIn("2 of 3 scored pocket(s) pass", text)
+        self.assertIn("3 -> 2 row(s) (1 dropped)", text)
+        self.assertIn("lost EVERY pocket and left the design", text)
+        self.assertIn("P14416", text)
+        self.assertIn("DB00003", text)
 
 
 if __name__ == "__main__":  # pragma: no cover

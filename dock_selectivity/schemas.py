@@ -21,6 +21,7 @@ paid for it:
 The schemas below cover the manifests of ``REBUILD_PLAN.md`` §2::
 
     manifests/interactions_resolved.csv   corrected DTI edge list
+    manifests/cavity_quality.csv          per-cavity AlphaFold pLDDT confidence
     manifests/positives_planned.csv       positives the design wants
     manifests/negatives_pool.csv          reuseable non-interaction jobs
     manifests/negatives_drawn.csv         what the balanced sampler selected
@@ -275,6 +276,33 @@ def _reused_rows_name_their_source(df: pd.DataFrame) -> Any:
     return (df["provenance"] == "reused_from") == df["source_job"].notna()
 
 
+def _n_residue_values(value: Any) -> int:
+    """How many ``;``-separated pLDDT values ``residue_plddt`` carries."""
+    if value is None or value != value:  # None / NaN
+        return 0
+    return len([part for part in str(value).split(";") if part.strip()])
+
+
+def _quality_rows_have_residues(df: pd.DataFrame) -> Any:
+    """A scored pocket has at least one residue.
+
+    A zero-residue row would read downstream as *a terrible pocket* rather than
+    *no data*, and would silently fail every cutoff. Unscoreable cavities belong
+    in ``score_cavity_quality.py``'s reject ledger, never in this file.
+    """
+    return df["n_residues"] >= 1
+
+
+def _quality_residue_list_matches_count(df: pd.DataFrame) -> Any:
+    """``residue_plddt`` holds exactly ``n_residues`` values.
+
+    ``residue_plddt`` is the authority every later cutoff is recomputed from
+    (:func:`dock_selectivity.quality.fraction_at`), so a truncated list would
+    silently change the denominator of a filter.
+    """
+    return df["residue_plddt"].map(_n_residue_values) == df["n_residues"]
+
+
 # --------------------------------------------------------------------------
 # the schemas
 # --------------------------------------------------------------------------
@@ -290,6 +318,94 @@ _SCHEMA_LIST: Tuple[Schema, ...] = (
         ),
         columns=(DRUGBANK_ID, ENTREZ_ID, ACCESSION, GENE, SELECTED_BY),
         primary_key=("drugbank_id", "accession"),
+    ),
+    Schema(
+        name="cavity_quality",
+        description=(
+            "Per-cavity AlphaFold confidence, scored from the pLDDT the "
+            "CavitySpace pocket PDB carries in its B-factor column. One row per "
+            "(accession, fragment_id, cavity_index), written by "
+            "score_cavity_quality.py and consumed by plan_positives.py / "
+            "sample_negatives.py through dock_selectivity.quality. "
+            "'residue_plddt' is the contract: it stores every residue's value so "
+            "any cutoff can be evaluated later without re-reading the archives. "
+            "The frac_ge_* columns are precomputed convenience, and every one of "
+            "them is reproducible from residue_plddt alone."
+        ),
+        columns=(
+            ACCESSION,
+            FRAGMENT_ID,
+            CAVITY_INDEX,
+            Column(
+                "n_residues",
+                "int64",
+                description=(
+                    "Distinct residues lining the pocket, keyed (chain, "
+                    "resSeq+iCode). Never 0 -- see the has_residues row check."
+                ),
+            ),
+            Column(
+                "n_atoms",
+                "int64",
+                description="ATOM records the pocket PDB holds. HETATM is not counted.",
+            ),
+            Column(
+                "mean_plddt",
+                "float64",
+                description="Mean over the per-residue pLDDT values.",
+            ),
+            Column(
+                "median_plddt",
+                "float64",
+                description="Median over the per-residue pLDDT values.",
+            ),
+            Column(
+                "min_plddt", "float64", description="Lowest per-residue pLDDT."
+            ),
+            Column(
+                "max_plddt", "float64", description="Highest per-residue pLDDT."
+            ),
+            Column(
+                "frac_ge_50",
+                "float64",
+                description="Fraction of residues with pLDDT >= 50 (AlphaFold 'low').",
+            ),
+            Column(
+                "frac_ge_70",
+                "float64",
+                description=(
+                    "Fraction of residues with pLDDT >= 70 (AlphaFold "
+                    "'confident'). The default cutoff of the pocket filter."
+                ),
+            ),
+            Column(
+                "frac_ge_90",
+                "float64",
+                description="Fraction of residues with pLDDT >= 90 (AlphaFold 'very high').",
+            ),
+            Column(
+                "residue_plddt",
+                "string",
+                description=(
+                    "Every residue's pLDDT, 2dp, joined with ';' in pocket-PDB "
+                    "order. The reason an arbitrary cutoff can be swept without "
+                    "re-reading 7.0 GB of tarballs."
+                ),
+            ),
+        ),
+        primary_key=("accession", "fragment_id", "cavity_index"),
+        checks=(
+            RowCheck(
+                "has_residues",
+                "n_residues >= 1: an unscoreable cavity is a reject, not a zero row",
+                _quality_rows_have_residues,
+            ),
+            RowCheck(
+                "residue_list_matches_count",
+                "residue_plddt holds exactly n_residues ';'-separated values",
+                _quality_residue_list_matches_count,
+            ),
+        ),
     ),
     Schema(
         name="positives_planned",
@@ -942,6 +1058,12 @@ def read_checked(
             dtype=read_dtypes,
             keep_default_na=False,
             na_values=[""],
+            # pandas' default CSV float parser is fast, not correctly rounded:
+            # a float64 written at full repr comes back one ULP out, so
+            # 29/30 != read(write(29/30)). Harmless for a score; fatal for
+            # cavity_quality.csv, where fraction_at() recomputes frac_ge_70
+            # from residue_plddt and must reproduce the stored column exactly.
+            float_precision="round_trip",
         )
     elif suffix == ".parquet":
         df = pd.read_parquet(path)

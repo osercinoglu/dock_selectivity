@@ -192,6 +192,14 @@ archival step for after the analysis table is built.
 
 Budget roughly 45 MB per job with complexes, ~1 MB without.
 
+Phase 2b (`score_cavity_quality.py`) reads all 38,709 cavity archives once: about
+six CPU-minutes, and the CSV it writes is about 20 MB (measured at ~0.5 KB per
+pocket, most of it the per-residue column). Leave `--threads` at 1 — threads were
+measured and make it *slower* on local disk (0.7 ms/archive at 1 thread against
+2.3 ms at 16), because each archive is small and the tar-header parsing is pure
+Python. Raise it only for a filesystem where an open blocks, and only after
+measuring there.
+
 ## Pilot
 
 A two-drug, two-target run exercises the whole chain including the external

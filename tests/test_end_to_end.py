@@ -471,6 +471,34 @@ def run_chain(paths, code_revision="e2e-test"):
         "positives_planned",
     )
 
+    # -- cavity_quality ----------------------------------------------------
+    # NOTE: same situation as positives_planned above. Phase 2b reads cavity
+    # ARCHIVES, and this chain has none -- it declares its pockets rather than
+    # unpacking them -- so the artifact is synthesised the way the phase would
+    # write it. `audit run` validates its schema like every other inter-stage
+    # manifest, and every pocket here is confidently scored so that a run
+    # declaring no filter is not judged against a threshold nobody chose.
+    quality_values = [96.0, 94.0, 91.5, 89.0]
+    write_checked(
+        pd.DataFrame(
+            [
+                dict(accession=accession, fragment_id=fragment_id,
+                     cavity_index=cavity_index, n_residues=len(quality_values),
+                     n_atoms=len(quality_values) * 8,
+                     mean_plddt=92.63, median_plddt=92.75,
+                     min_plddt=min(quality_values), max_plddt=max(quality_values),
+                     frac_ge_50=1.0, frac_ge_70=1.0, frac_ge_90=0.75,
+                     residue_plddt=";".join("%.2f" % v for v in quality_values))
+                for accession, fragment_id, cavity_index in sorted(
+                    {(row["accession"], row["fragment_id"], row["cavity_index"])
+                     for row in positive_rows}
+                )
+            ]
+        ),
+        os.path.join(paths["manifests"], "cavity_quality.csv"),
+        "cavity_quality",
+    )
+
     # -- Phase 2: classify every old job under correct identity ------------
     stage(
         "classify_existing",

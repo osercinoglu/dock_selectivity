@@ -42,9 +42,12 @@ from dock_selectivity.schemas import (
     write_checked,
 )
 
-# REBUILD_PLAN.md §2 names these seven manifests.
+# REBUILD_PLAN.md §2 names seven manifests; ``cavity_quality`` is the eighth,
+# added with phase 2b (score_cavity_quality.py) so pockets can be filtered on
+# AlphaFold confidence.
 #: schema_names() returns these sorted, so this list is sorted too.
 EXPECTED_SCHEMAS = [
+    "cavity_quality",
     "interactions_resolved",
     "job_classification",
     "negatives_drawn",
@@ -121,7 +124,7 @@ def reuse_rows():
 
 
 class TestSchemaCatalogue(unittest.TestCase):
-    def test_the_seven_rebuild_plan_manifests_are_declared(self):
+    def test_every_inter_stage_manifest_is_declared(self):
         self.assertEqual(schema_names(), EXPECTED_SCHEMAS)
 
     def test_unknown_schema_name_raises_and_lists_the_known_ones(self):

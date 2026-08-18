@@ -78,6 +78,7 @@ from dock_selectivity.jobid import (  # noqa: E402
     format_job_dir,
     read_job_identity_record,
 )
+from dock_selectivity.quality import fraction_at, load_cavity_quality  # noqa: E402
 from dock_selectivity.runtime import (  # noqa: E402
     add_runtime_arguments,
     resolve_out_dir,
@@ -94,7 +95,9 @@ __all__ = [
     "EXCLUDED_BASENAME_PATTERNS",
     "audit_identity",
     "audit_curated",
+    "audit_pocket_quality",
     "audit_run",
+    "planned_quality_thresholds",
     "format_table",
     "exit_code",
     "main",
@@ -133,7 +136,23 @@ MANIFESTS: Tuple[Tuple[str, str], ...] = (
     ("job_classification.csv", "job_classification"),
     ("redock_queue.csv", "redock_queue"),
     ("run_manifest.csv", "run_manifest"),
+    # Phase 2b's artifact. Validated here even on an unfiltered run: the
+    # cross-stage check only reads it when the run declares a filter, so
+    # without this entry a malformed quality file goes unnoticed until the
+    # first run that actually filters on it.
+    ("cavity_quality.csv", "cavity_quality"),
 )
+
+#: Phase 2b's artifact, and the file that records which thresholds phase 4 was
+#: actually run with. The auditor reads the run's own evidence rather than being
+#: told the numbers a second time: a threshold retyped at audit time proves only
+#: that someone can retype it.
+CAVITY_QUALITY_CSV = os.path.join("manifests", "cavity_quality.csv")
+QUALITY_REPORT_JSON = os.path.join("manifests", "negatives_drawn.report.json")
+
+#: pLDDT floor assumed when an audit supplies ``--min-plddt-fraction`` alone.
+#: Same value as every stage's ``--plddt-min`` default, AlphaFold's "confident" band.
+DEFAULT_PLDDT_MIN = 70.0
 
 _MAX_EXAMPLES = 5
 
@@ -1039,11 +1058,195 @@ def _read_manifest(run_dir: str, filename: str, schema: str):
         return None, path, str(exc)
 
 
-def _keys(df, columns: Sequence[str]):
-    return set(
+def _key_tuples(df, columns: Sequence[str]) -> List[Tuple[str, ...]]:
+    """One key tuple per row, in row order -- so a row can be traced back."""
+    return list(
         zip(*[df[c].astype(str) if c != "cavity_index" else df[c].astype("int64").astype(str)
               for c in columns])
     )
+
+
+def _keys(df, columns: Sequence[str]):
+    return set(_key_tuples(df, columns))
+
+
+#: How a pocket is named in this section's messages.
+POCKET_KEY: Tuple[str, str, str] = ("accession", "fragment_id", "cavity_index")
+
+
+def _pocket(key: Sequence[str]) -> str:
+    return "{0}/{1}/cav{2}".format(*key)
+
+
+def planned_quality_thresholds(
+    run_dir: str,
+    plddt_min: Optional[float] = None,
+    min_fraction: Optional[float] = None,
+) -> Tuple[Optional[float], Optional[float], str]:
+    """The pocket-quality thresholds this run was planned with, and where from.
+
+    ``--min-plddt-fraction`` at audit time wins.  Otherwise the numbers come out
+    of ``negatives_drawn.report.json``, which is where ``sample_negatives.py``
+    records what it actually filtered on -- so the auditor compares the docked
+    set against the run's own declaration rather than against a number supplied
+    afresh.  Returns ``(None, None, why)`` when no threshold was ever recorded,
+    which is not a failure: it is a run that was planned without filtering.
+    """
+    if min_fraction is not None:
+        return (
+            float(DEFAULT_PLDDT_MIN if plddt_min is None else plddt_min),
+            float(min_fraction),
+            "--plddt-min/--min-plddt-fraction",
+        )
+    path = os.path.join(run_dir, QUALITY_REPORT_JSON)
+    if not os.path.exists(path):
+        return None, None, "{0} is not there".format(path)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError) as exc:
+        return None, None, "{0} could not be read: {1}".format(path, exc)
+    # write_invariant_report() always writes a LIST of report dicts, even for one.
+    records = payload if isinstance(payload, list) else [payload]
+    for record in records:
+        block = (record or {}).get("quality") if isinstance(record, dict) else None
+        if isinstance(block, dict) and block.get("enabled"):
+            try:
+                return float(block["plddt_min"]), float(block["min_fraction"]), path
+            except (KeyError, TypeError, ValueError) as exc:
+                return None, None, "{0} has an unreadable quality block: {1}".format(
+                    path, exc
+                )
+    return None, None, "{0} records no pocket-quality filter".format(path)
+
+
+def audit_pocket_quality(
+    run_dir: str,
+    run_manifest,
+    plddt_min: Optional[float] = None,
+    min_fraction: Optional[float] = None,
+) -> List[CheckResult]:
+    """What the pocket-quality filter removed is what the docking left out.
+
+    ``plan_positives.py`` and ``sample_negatives.py`` drop pockets that miss the
+    threshold; ``run_manifest.csv`` says what was actually docked.  Nothing else
+    compares the two, so a threshold changed between phases -- or a manifest
+    rebuilt without the flags -- would first show up as an unexplained pLDDT skew
+    in the analysis, which is where this repository's last defect was found.
+
+    The run's own declaration decides what is being checked, and it is read from
+    the run rather than retyped: ``negatives_drawn.report.json`` records the
+    thresholds phase 4 filtered on.
+
+    * no filter declared -- the ordinary case, since filtering is opt-in -- and the
+      check passes on that declaration.  There is no threshold for a docked pocket
+      to violate, and inventing one at audit time would fail runs nobody asked to
+      filter.
+    * a filter declared, and every docked pocket must both *have* a
+      ``cavity_quality.csv`` row (docking a pocket whose confidence was never
+      measured means the filter never saw it) and clear the threshold.
+    """
+    name = "xstage.docked_pockets_match_the_quality_filter"
+    path = os.path.join(run_dir, CAVITY_QUALITY_CSV)
+    cutoff, fraction, provenance = planned_quality_thresholds(
+        run_dir, plddt_min, min_fraction
+    )
+    scored = "; {0} pocket(s) scored in {1}".format(
+        _count_csv_rows(path), path) if os.path.exists(path) else ""
+
+    if fraction is None:
+        return [
+            _result(
+                name,
+                PASS,
+                "this run declares no pocket-quality filter ({0}), so no pocket was "
+                "excluded for its pLDDT and none of the docked set contradicts "
+                "it{1}".format(provenance, scored),
+                filtered=False,
+                provenance=provenance,
+            )
+        ]
+
+    declared = "frac_ge_{0:.0f} >= {1:.2f} (from {2})".format(cutoff, fraction, provenance)
+    if run_manifest is None:
+        return [
+            _result(
+                name,
+                SKIP,
+                "this run was planned with {0}, but run_manifest.csv is not "
+                "readable, so what was docked cannot be compared with it".format(
+                    declared
+                ),
+                provenance=provenance,
+            )
+        ]
+    if not os.path.exists(path):
+        return [
+            _result(
+                name,
+                FAIL,
+                "this run was planned with {0}, but {1} is not there. The filter "
+                "that shaped the dataset cannot be reconciled with what was "
+                "docked; re-run phase 2b (score_cavity_quality.py).".format(
+                    declared, path
+                ),
+                provenance=provenance,
+            )
+        ]
+    try:
+        quality = load_cavity_quality(path)
+    except (SchemaViolation, InvariantViolation, OSError) as exc:
+        return [_result(name, FAIL, "{0}: {1}".format(path, exc), path=path)]
+
+    wanted = _keys(run_manifest, POCKET_KEY)
+    unscored = sorted(wanted - _keys(quality, POCKET_KEY))
+    docked = quality.loc[[key in wanted for key in _key_tuples(quality, POCKET_KEY)]]
+    offenders = [
+        "{0} frac_ge_{1:.0f}={2:.2f} < {3:.2f} (n_residues={4})".format(
+            _pocket(key), cutoff, value, fraction, int(row.n_residues)
+        )
+        for key, row, value in zip(
+            _key_tuples(docked, POCKET_KEY),
+            docked.itertuples(index=False),
+            fraction_at(docked, cutoff),
+        )
+        if value < fraction
+    ]
+    problems = []
+    if unscored:
+        problems.append(
+            "{0} docked pocket(s) have no row in {1} at all ({2}) -- they were "
+            "docked with their model confidence never measured, so the filter "
+            "never saw them".format(
+                len(unscored), path, _examples([_pocket(k) for k in unscored])
+            )
+        )
+    if offenders:
+        problems.append(
+            "{0} docked pocket(s) do not clear the threshold ({1})".format(
+                len(offenders), _examples(offenders)
+            )
+        )
+    return [
+        _verdict(
+            name,
+            not problems,
+            "all {0} docked pocket(s) are scored and clear {1}".format(
+                len(wanted), declared
+            ),
+            "this run was planned with {0}, but what was docked disagrees: {1}.".format(
+                declared, "; ".join(problems)
+            ),
+            plddt_min=cutoff,
+            min_fraction=fraction,
+            provenance=provenance,
+            filtered=True,
+            n_docked=len(wanted),
+            n_unscored=len(unscored),
+            n_failing=len(offenders),
+            path=path,
+        )
+    ]
 
 
 def audit_run(
@@ -1052,6 +1255,8 @@ def audit_run(
     skip_determinism: bool = False,
     check_excluded: bool = True,
     expect: str = "subset",
+    plddt_min: Optional[float] = None,
+    min_plddt_fraction: Optional[float] = None,
 ) -> List[CheckResult]:
     """Cross-stage consistency for a whole ``$NEW`` run directory."""
     results: List[CheckResult] = []
@@ -1290,6 +1495,16 @@ def audit_run(
             )
         )
 
+    # -- pocket quality: what was filtered is what was docked ---------------
+    results.extend(
+        audit_pocket_quality(
+            run_dir,
+            frames.get("run_manifest"),
+            plddt_min=plddt_min,
+            min_fraction=min_plddt_fraction,
+        )
+    )
+
     # -- the curated tree --------------------------------------------------
     curated_dir = os.path.join(run_dir, "docking_results")
     manifest_path = os.path.join(run_dir, "manifests", "run_manifest.csv")
@@ -1484,6 +1699,18 @@ def _build_parser() -> argparse.ArgumentParser:
                      help=("'subset': the directory may hold fewer jobs than the "
                            "manifest; 'exact': it must hold exactly those "
                            "(default: %(default)s)"))
+    run.add_argument("--plddt-min", type=float, default=None,
+                     help=("pLDDT a pocket residue must reach to count as confident, "
+                           "when auditing against a threshold given here rather than "
+                           "the one the run recorded. Ignored without "
+                           "--min-plddt-fraction; defaults to %s with it."
+                           % DEFAULT_PLDDT_MIN))
+    run.add_argument("--min-plddt-fraction", type=float, default=None,
+                     help=("fraction of a pocket's residues that must reach "
+                           "--plddt-min. Unset, the threshold is read from the run's "
+                           "own negatives_drawn.report.json; a run that declares no "
+                           "pocket-quality filter passes on that declaration rather "
+                           "than being judged against a threshold nobody chose."))
 
     for subparser in (identity, curated, run):
         _add_common(subparser, suppress=True)
@@ -1560,6 +1787,8 @@ def _run_command(args: Any) -> List["CheckResult"]:
             skip_determinism=args.skip_determinism,
             check_excluded=not args.no_check_excluded,
             expect=args.expect,
+            plddt_min=args.plddt_min,
+            min_plddt_fraction=args.min_plddt_fraction,
         )
     return results
 

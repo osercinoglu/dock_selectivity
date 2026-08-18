@@ -217,8 +217,33 @@ class RunDirFixture(unittest.TestCase):
     def path(self, filename):
         return os.path.join(self.manifests, filename)
 
+    def quality_rows(self):
+        """One scored pocket per pocket the other manifests name.
+
+        ``audit.MANIFESTS`` validates cavity_quality.csv like every other
+        inter-stage artifact, so the fixture has to carry one -- and it has to
+        cover every pocket, because the cross-stage check fails a pocket that was
+        docked without its confidence ever being measured.
+        """
+        pockets = set()
+        for rows in (self.positive_rows(), self.drawn_rows(), self.redock_rows()):
+            for row in rows:
+                pockets.add((row["accession"], row["fragment_id"], int(row["cavity_index"])))
+        values = [95.0, 92.5, 88.0, 91.25]
+        joined = ";".join("%.2f" % v for v in values)
+        return [
+            dict(accession=accession, fragment_id=fragment_id, cavity_index=cavity_index,
+                 n_residues=len(values), n_atoms=len(values) * 8,
+                 mean_plddt=91.69, median_plddt=91.88, min_plddt=88.0, max_plddt=95.0,
+                 frac_ge_50=1.0, frac_ge_70=1.0, frac_ge_90=0.75,
+                 residue_plddt=joined)
+            for accession, fragment_id, cavity_index in sorted(pockets)
+        ]
+
     def write_manifests(self):
         write_checked(pd.DataFrame(self.reuse_rows()), self.path("job_classification.csv"), "job_classification")
+        write_checked(pd.DataFrame(self.quality_rows()), self.path("cavity_quality.csv"),
+                      "cavity_quality")
         write_checked(pd.DataFrame(self.positive_rows()), self.path("positives_planned.csv"),
                       "positives_planned")
         write_checked(pd.DataFrame(self.drawn_rows()), self.path("negatives_drawn.csv"),
