@@ -1,64 +1,64 @@
 # dock_selectivity
 
-Consensus docking of DrugBank small molecules into AlphaFold/CavitySpace pockets.
-Four engines (smina, gnina, GOLD, LeDock) dock each ligand–pocket pair, and
-cross-tool pose agreement (RMSD) is tested as a discriminator of drug–target
-interactions against balanced negatives.
+A consensus docking pipeline. It docks small molecules into protein cavities with
+up to four engines — smina, gnina, GOLD, LeDock — and measures how far apart the
+engines place each ligand. Cross-tool pose agreement (RMSD) is the output
+quantity, computed for a set of drug–target pairs and for a balanced set of
+non-interacting pairs.
 
-Environment and external programs: **`SETUP.md`**.
+Inputs are DrugBank ligands, a drug–target edge list, and AlphaFold/CavitySpace
+pockets. The output is one parquet table with a row per cross-tool pose pair,
+labelled positive or negative.
+
+Requirements, external programs and reference data: **`SETUP.md`**.
+Architecture and the rules new code must not break: **`CLAUDE.md`**.
 
 ## Quick start
 
 ```bash
+conda activate teachopencadd
+
 DATA=/media/onur/Elements/cavity_space_consensus_docking
+RUN=$DATA/runs/2026_10_11
 
 python3 run_full_workflow.py \
     --inputs-dir $DATA/inputs \
-    --run-dir    $DATA/runs/2026_08_13 \
+    --run-dir    $RUN \
     --mode       balanced \
-    --dry-run                       # prints the plan; drop to execute
+    --dry-run                       # prints every phase's command line; drop to execute
 ```
 
-Inputs are shared and versioned; outputs are per-run:
+A full run takes days, almost all of it docking. Plan first and look at the queue
+before committing to it:
 
-```
-$DATA/inputs/     1_drug_to_protein.tsv, small_molecule_drug_links.csv,
-                  ligands/, uniprot/
-$DATA/runs/<date>/  identity/ manifests/ structures/ docking_results/
-                    steps/ logs/          ← logs, one folder per phase
+```bash
+python3 run_full_workflow.py --inputs-dir $DATA/inputs --run-dir $RUN --only planning
+wc -l $RUN/manifests/redock_queue.csv      # jobs; budget ~57 MB each while docking
 ```
 
 Every stage skips work already complete on disk, so a run can be interrupted and
-resumed, and a partially populated output directory is docked to completion
-rather than redone.
+resumed, and a partly finished directory is taken to completion rather than redone.
 
-## Where the logs are
+## Directory layout
 
-Nothing writes a log file loose into the directory you started it from:
+Inputs are shared between runs; outputs belong to one run.
 
 ```
-$RUN/logs/workflow.log                    the runner: plan, phase, exit code, elapsed
-$RUN/steps/<phase>/<script>.log           that phase's own log
-$RUN/steps/<phase>/<phase>.console.log    everything that phase printed
+$DATA/inputs/            1_drug_to_protein.tsv, small_molecule_drug_links.csv,
+                         ligands/, uniprot/
+$DATA/runs/<date>/
+    identity/            the accession index everything keys on
+    manifests/           one CSV per planning stage; the chain between phases
+    structures/          receptors: cavities, alphafold, fixed, pdbqt
+    docking_results/     one directory per job
+    steps/<phase>/       that phase's log and captured output
+    logs/workflow.log    the runner's own log
 ```
 
-Run a script standalone with no `--run-dir` and it makes `./<step-name>/` and logs
-there. The four structure scripts name that log after the *phase* rather than the
-script, because the runner sets it with `--log-file`.
+## The pipeline
 
-The runner captures each phase's stdout and stderr into that console log instead
-of twelve scripts interleaving progress bars in one terminal — but a failed phase
-still quotes the tail of its output into `workflow.log` and onto your screen.
-
-Every script takes `--out-dir` (its own folder), `--log-file`, `--log-level` and
-`--quiet`. The four structure scripts are the exception: they owned `--out-dir`
-first and it means *where the structures land*, so their log is set with
-`--log-file` — which is what `run_full_workflow.py` passes them.
-
-## The pipeline, phase by phase
-
-`run_full_workflow.py` runs these in order. Each is a normal script you can run
-alone — useful when a phase needs different arguments, or when re-running one.
+`run_full_workflow.py` runs these in order. Each is a normal script that also runs
+standalone.
 
 | # | Script | Reads | Writes |
 |---|---|---|---|
@@ -76,135 +76,31 @@ alone — useful when a phase needs different arguments, or when re-running one.
 | 7 | `batch_dock.py --queue` | queue, structures, ligands | `docking_results/<job>/` |
 | 8 | `parse_prepare.py` | docking results, manifest | `combined_filtered_annotated_docking_results.parquet` |
 
-**0 — identity.** Builds the accession ↔ Entrez ↔ symbol index everything else
-keys on. Run once; downstream stages pin its SHA256.
+Phases 2 and 6a both run `extract_cavities.py`: the first derives pocket identity
+from tarball filenames without unpacking anything (0.4 s for 38,709 archives), the
+second unpacks only the pockets the queue names. Negatives are drawn so that each
+drug and each target appears equally often in both classes.
 
-**1 — interactions.** Resolves each drug–target edge to a UniProt accession *via
-the Entrez gene id*. Unresolvable edges go to a rejects file with a reason.
+## Running part of it
 
-**2 — cavity manifest.** Derives every cavity's identity from the tarball
-filenames without unpacking anything (0.4 s for 38,709 archives).
-
-**2b — pocket quality.** A CavitySpace cavity file is the pocket-lining residues
-of an AlphaFold model, and those residues keep the model's pLDDT in the B-factor
-column. This phase reads it: one row per pocket with `n_residues`, the pLDDT
-distribution, and `residue_plddt` — every residue's value, so any later cutoff is
-a string split rather than a second pass over 7 GB of archives. Mean pocket pLDDT
-runs from 34 to 99, so a run that never looks docks into confident pockets and
-into disordered guesses with equal weight. About 6 CPU-minutes for all 38,709
-archives; a cavity that cannot be scored is recorded in
-`cavity_quality_rejected.csv` with a reason, never written as a zero row.
-
-**3 — positives.** Expands each resolved pair across every cavity of its target.
-Drops pairs with no ligand SDF, no cavity, or a non-small-molecule drug — each
-recorded with its reason.
-
-**4 — negatives.** Balanced sampling: each drug and each target appears equally
-in both classes. `--prefer-pool` reuses already-docked non-interactions.
-
-**5 — manifest.** Merges both into the authority on what should exist, plus the
-queue of what must actually be docked.
-
-**6 — structures.** Extracts cavities and AlphaFold models, adds hydrogens,
-converts to PDBQT. Each takes `--required` and materialises only what the queue
-asks for — the four steps run in order because each consumes the previous one's
-mapping. `batch_dock.py` picks receptors in the order fixed > alphafold > cavity,
-substituting PDBQT where one exists.
-
-**7 — docking.** Five stages in order: smina → gnina → GOLD → LeDock → consensus
-RMSD. `consensus_docker.py` is invoked once per tool per job; the RMSD stage
-compares every pose of every tool pair into `final_results.csv`.
-
-**8 — analysis.** Walks the job directories into one parquet, joining sample
-types, IC50s, cavity clusters and DTA predictions. Discovery is checked against
-`run_manifest.csv`: finding fewer jobs than the manifest declares stops the parse
-instead of quietly producing a smaller table.
-
-## Filtering pockets on model confidence
-
-Scoring always happens; **filtering is opt-in.** A pocket *passes* when
-
-```
-frac_ge(--plddt-min) >= --min-plddt-fraction
-```
-
-where `frac_ge(t)` is the fraction of the pocket's residues whose pLDDT is at
-least `t`. `--plddt-min` defaults to 70 (AlphaFold's "confident" band);
-`--min-plddt-fraction` has **no default**, and supplying it is what turns the
-filter on:
+`--only` and `--skip` take a phase key from the table, or a group name: `planning`
+(0–5, including 2b) or `structures` (6).
 
 ```bash
-python3 run_full_workflow.py --run-dir $RUN --plddt-min 70 --min-plddt-fraction 0.80
-```
-
-Without `--min-plddt-fraction`, phases 3 and 4 are handed no quality arguments at
-all and plan exactly what they would have planned before this phase existed. With
-it, `plan_positives.py` and `sample_negatives.py` both get the same thresholds —
-one class filtered and the other not is a confound, not a filter, because a
-classifier could then separate the classes on pLDDT alone. Each stage records
-every pocket it drops with reason `pocket_quality` and the numbers behind it
-(`frac_ge_70=0.42 < 0.80 (n_residues=61)`), and a pocket the manifest names but
-`cavity_quality.csv` does not carry stops the stage rather than silently passing
-or silently vanishing (`--allow-missing-quality` downgrades that to a warning and
-treats those pockets as failing).
-
-`audit.py run` closes the loop: it checks that every pocket in `run_manifest.csv`
-is scored and clears the thresholds recorded in `negatives_drawn.report.json`, so
-a disagreement between what was filtered and what was docked surfaces there rather
-than in the analysis.
-
-## Being told when it breaks
-
-A three-day run that dies at hour 40 should not wait for you to notice. Set two
-environment variables — never a flag, never a file in this repo — and pass
-`--notify`:
-
-```bash
-export PUSHOVER_TOKEN=<application token>     # pushover.net → Create an Application
-export PUSHOVER_USER_KEY=<your user key>      # shown on your pushover.net dashboard
-export PUSHOVER_DEVICE=<device name>          # optional; all devices otherwise
-
-python3 run_full_workflow.py --run-dir $RUN --notify
-```
-
-You get one message when the run starts, one naming the phase and its exit code
-if anything fails, and one at the end with the total time and a per-phase
-summary. `--notify` with the variables unset exits 2 **before** the first phase,
-so a broken notification setup is discovered in seconds rather than at hour 40;
-`--dry-run --notify` is a way to check them without running anything.
-
-`--notify-steps` additionally passes `--notify` down to every phase script, which
-then reports on itself (failures only). Off by default — otherwise a 12-phase run
-notifies twelve more times. Any individual script takes `--notify`,
-`--notify-on start|success|failure|all` and `--notify-title` the same way. A
-notification that cannot be delivered is logged as a warning and never stops the
-run. See `SETUP.md` for the Pushover account setup.
-
-## Running part of the pipeline
-
-`--only` and `--skip` take a phase key from the table, or a group name —
-`planning` (phases 0–5, including 2b) and `structures` (phase 6):
-
-```bash
-python3 run_full_workflow.py --run-dir $RUN --only planning     # plan, don't dock
+python3 run_full_workflow.py --run-dir $RUN --only planning
 python3 run_full_workflow.py --run-dir $RUN --only structures --threads 16
 python3 run_full_workflow.py --run-dir $RUN --skip parse
 ```
 
-Each script also runs standalone and documents its own arguments:
+Every script documents its own arguments; there is no config file and nothing to
+edit before a run.
 
 ```bash
 python3 <script>.py --help
+python3 batch_dock.py --print-config --num-threads 24    # resolved settings, no run
 ```
 
-`batch_dock.py` additionally has `--print-config`, which prints all 50 resolved
-settings and marks the ones your command line changed:
-
-```bash
-python3 batch_dock.py --print-config --num-threads 24 --smina-exhaustiveness 8
-```
-
-Common docking invocation:
+A typical standalone docking call:
 
 ```bash
 python3 batch_dock.py \
@@ -215,22 +111,78 @@ python3 batch_dock.py \
     --num-threads 24 --smina-exhaustiveness 32
 ```
 
-Useful flags: `--test-mode --max-jobs N` (smoke test), `--no-force-rmsd` (skip
-recomputation when poses were cleaned away), `--complex-pdb keep|delete|compress`.
+Useful flags: `--test-mode --max-jobs N` to smoke-test, `--complex-pdb
+keep|delete|compress` (keep during a run — RMSD is computed from those files;
+they are ~89% of the output size, so delete or compress once the parquet is built).
+
+## Pocket quality
+
+Phase 2b always runs and records every pocket's pLDDT. **Filtering on it is
+opt-in.** A pocket passes when
+
+```
+frac_ge(--plddt-min) >= --min-plddt-fraction
+```
+
+where `frac_ge(t)` is the fraction of the pocket's residues with pLDDT ≥ t.
+`--plddt-min` defaults to 70; `--min-plddt-fraction` has no default, and giving it
+is what switches the filter on:
+
+```bash
+python3 run_full_workflow.py --run-dir $RUN --plddt-min 70 --min-plddt-fraction 0.70
+```
+
+The same thresholds reach positives and negatives — filtering one class and not
+the other would let a classifier separate them on pocket confidence alone. Every
+dropped pocket is recorded with the numbers behind it.
+`POCKET_QUALITY_SWEEP.md` tabulates how many drug–target pairs survive at 25
+threshold combinations.
+
+## Notifications
+
+Export two variables and pass `--notify`:
+
+```bash
+export PUSHOVER_TOKEN=<application token>
+export PUSHOVER_USER_KEY=<user key>
+
+python3 run_full_workflow.py --run-dir $RUN --notify
+```
+
+You get a message at the start, one naming the phase and exit code if anything
+fails, and one at the end with timings. `--notify` with the variables unset exits
+immediately rather than at hour 40, and `--dry-run --notify` checks the setup
+without running anything. `--notify-steps` forwards `--notify` to each phase.
+Account setup is in `SETUP.md`.
 
 ## gnina on a remote GPU
 
-gnina needs a GPU. `gnina_remote.py` stands in for the binary and runs it
-elsewhere over SSH — `consensus_docker.py` cannot tell the difference:
+gnina needs a GPU. `gnina_remote.py` stands in for the binary and runs it over
+SSH; `consensus_docker.py` cannot tell the difference.
 
 ```bash
 export GNINA_PATH=$PWD/gnina_remote.py
 export GNINA_REMOTE_HOST=user@gpu-host GNINA_REMOTE_PORT=50000
 ```
 
-With `GNINA_ASYNC=1`, gnina jobs are queued to the GPU while smina/GOLD/LeDock
-keep local cores busy; `gnina_collect.py` files results as they land and a
-barrier before the RMSD stage waits for them. Details in `SETUP.md`.
+With `GNINA_ASYNC=1`, gnina jobs queue to the GPU while the other engines use
+local cores, and `gnina_collect.py` files results as they land. Details in
+`SETUP.md`.
+
+## Logs
+
+```
+$RUN/logs/workflow.log                    the runner: plan, phase, exit code, elapsed
+$RUN/steps/<phase>/<script>.log           that phase's own log
+$RUN/steps/<phase>/<phase>.console.log    everything that phase printed
+```
+
+Nothing writes a log loose into the directory you started it from; a script run
+with no `--run-dir` makes `./<step-name>/`. Every script takes `--out-dir`,
+`--log-file`, `--log-level` and `--quiet`. For the four structure scripts
+`--out-dir` is where the structures land, so their log is set with `--log-file`.
+
+A failed phase still prints the tail of its output to the terminal.
 
 ## Checking a run
 
@@ -240,30 +192,30 @@ python3 audit.py curated  --dir $RUN/docking_results --manifest $RUN/manifests/r
 python3 audit.py run      --run-dir $RUN
 ```
 
-Run these between phases; each exits non-zero on a failed invariant.
+Each exits non-zero on a failed invariant. Run them between phases.
 
-## Identity
+## Identity and naming
 
-Proteins are keyed on **UniProt accession**, resolved from the **Entrez gene id**
-in `1_drug_to_protein.tsv`. Gene symbols are display labels derived from the
-accession, never resolution inputs. Compounds are keyed on DrugBank ID; pockets on
+Proteins are keyed on **UniProt accession**, resolved from the **Entrez gene id**.
+Gene symbols are display labels derived from the accession, never resolution
+inputs. Compounds are keyed on DrugBank ID, pockets on
 `(accession, fragment, cavity)`.
 
-Job directories are named `DB00035__P30518__AVPR2__F1__cav2`; the authority is
-`job_identity.json` inside each one.
+Job directories are named `DB00035__P30518__AVPR2__F1__cav2`, and each one holds a
+`job_identity.json` that is the authority on what was docked.
 
 ## Conventions
 
-- A missing prerequisite is an error, never a fallback — no stage widens its input
+- A missing prerequisite is an error, never a fallback. No stage widens its input
   set when something is absent.
-- Stages validate inputs and outputs against `dock_selectivity.schemas` and record
-  rejected rows with a reason rather than dropping them.
+- Stages validate against `dock_selectivity.schemas` and record rejected rows with
+  a reason instead of dropping them.
 - Joins go through `checked_merge()`, which fails if a merge changes the row count.
-- `run_manifest.csv` is the authority on which jobs should exist; discovery is
-  checked against it.
 
 ## Tests
 
 ```bash
 python3 -m unittest discover -s tests -t .
 ```
+
+Standard library only, no network, no GPU.
