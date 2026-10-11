@@ -85,7 +85,7 @@ disk_free_kb=212345678
 uptime=98765.43
 """
 
-HOST = "onur@headscale.bio-cloud.site"
+HOST = "user@gpu-host"
 PORT = 50000
 SHIM = "/home/onur/repos/dock_selectivity/gnina_remote.py"
 STAMP = "2026-08-13T09:00:00.000000Z"

@@ -78,7 +78,7 @@ PARAMS = {
     "consensus_docker_script": "/abs/consensus_docker.py",
     "gnina_path": "/abs/gnina_remote.py",
     "image": "gnina/gnina:v1.3.3",
-    "host": "onur@headscale.bio-cloud.site",
+    "host": "user@gpu-host",
     "port": 50000,
     "key": None,
     "native": None,
