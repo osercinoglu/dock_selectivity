@@ -895,6 +895,281 @@ def _run_collect(cfg, ticket):
 #: which is precisely the failure the check exists to catch.
 CAPABILITIES = ("sync", "submit", "collect")
 
+#: Where the GPU is. ``ssh`` is one host reachable over SSH; ``colab`` is a
+#: Google Colab runtime driven by the ``colab`` CLI, for when that host is busy.
+BACKEND_SSH = "ssh"
+BACKEND_COLAB = "colab"
+BACKENDS = (BACKEND_SSH, BACKEND_COLAB)
+
+
+def resolve_backend():
+    """Which GPU backend this invocation targets, from ``GNINA_REMOTE_BACKEND``."""
+    return (os.environ.get("GNINA_REMOTE_BACKEND") or BACKEND_SSH).strip().lower()
+
+
+def _run_colab(known, passthrough, log, ticket, mode):
+    """Dock on a Colab GPU runtime. Same three modes, same resume, same exit codes.
+
+    Mirrors the SSH backend deliberately: the job directory is content-addressed
+    on the same :func:`job_key`, the run is detached on the runtime with its exit
+    code in a marker file, and a finished job is collected rather than re-docked.
+    What differs is only the transport (the ``colab`` CLI instead of ssh/scp) and
+    how gnina gets there (the release binary, because Colab has no Docker).
+    """
+    from dock_selectivity import colab_backend as cb
+
+    session = cb.ColabSession(log=log)
+    # Keyed on the REQUESTED arguments, never the ones fitted to this runtime.
+    # The only thing fitting changes is the thread count, which changes speed and
+    # not the result -- so a job docked on a 2-vCPU runtime must resume as the
+    # same job on a 4-vCPU one. Keying on the fitted arguments would fork the
+    # content address by accident of which machine answered.
+    key = job_key(known.receptor, known.ligand, passthrough)
+    job_dir = posixpath.join(session.remote_root, "gnina_%s" % key)
+    keep = os.environ.get("GNINA_COLAB_KEEP") == "1"
+    stop_when_done = os.environ.get("GNINA_COLAB_STOP") == "1"
+    poll_interval = float(os.environ.get("GNINA_REMOTE_POLL", POLL_INTERVAL)
+                          or POLL_INTERVAL)
+    run_timeout = float(os.environ.get("GNINA_REMOTE_TIMEOUT", DEFAULT_RUN_TIMEOUT)
+                        or DEFAULT_RUN_TIMEOUT)
+    ticket.set(backend=BACKEND_COLAB, session=session.session, gpu=session.gpu,
+               job_dir=job_dir, job_key=key)
+
+    def probe():
+        return cb.last_json(session.exec_python(
+            cb.probe_source(job_dir), "probe", timeout=300)) or {}
+
+    def collect():
+        session.download(posixpath.join(job_dir, "out.sdf"), known.out)
+        # gnina can exit 0 having written nothing -- an empty out.sdf is how a
+        # job with no poses looks, and consensus_docker's split_mol would then
+        # produce an empty results.csv that reads downstream as "this pair does
+        # not bind" rather than "this job did not run".
+        if not os.path.exists(known.out) or os.path.getsize(known.out) == 0:
+            raise cb.ColabError(
+                "gnina exited 0 on the colab runtime but %s is empty. An empty "
+                "pose file is not a negative result; the job is being reported "
+                "as failed rather than passed on as zero poses." % known.out)
+        if known.log:
+            try:
+                session.download(posixpath.join(job_dir, "out.log"), known.log)
+            except cb.ColabError as exc:
+                # The poses are the result; a missing run log is not worth
+                # failing a job that produced them.
+                log("could not fetch the gnina log (%s); poses were collected" % exc)
+
+    try:
+        if mode == MODE_COLLECT:
+            if not session.exists():
+                log("colab session %r is gone, so its job directory went with it; "
+                    "this job has to be docked again" % session.session)
+                ticket.finish("gone")
+                return EXIT_NOT_READY
+            state = probe()
+            code = state.get("exit_code")
+            if code is None:
+                log("the colab job has not finished yet; nothing to collect")
+                ticket.finish("not_ready")
+                return EXIT_NOT_READY
+            if code != "0":
+                raise cb.ColabError(
+                    "gnina exited %s on the colab runtime:\n%s"
+                    % (code, (state.get("stderr_tail") or "").strip()[-800:]))
+            collect()
+            log("colab:%s -> %d bytes collected from %s"
+                % (session.session, os.path.getsize(known.out), job_dir))
+            ticket.finish("collected", exit_code=0)
+            return EXIT_OK
+
+        created = session.ensure()
+        ready = session.ensure_gnina()
+        cores = int(ready.get("cores") or 0)
+        ticket.set(gnina_version=ready.get("version"), runtime_gpu=ready.get("gpu"),
+                   runtime_cores=cores or None, session_created=created)
+        state = probe()
+        if state.get("exit_code") == "0" and state.get("out_bytes"):
+            if mode == MODE_SUBMIT:
+                # The queue matches on this exact word and moves the record to
+                # REMOTE_DONE. Falling through to a download here would make a
+                # submit do collect's work in the pump's process.
+                log("a completed run for these inputs already exists on colab "
+                    "session %r -- nothing to launch; it will be collected"
+                    % session.session)
+                ticket.finish("already_done", exit_code=0)
+                return EXIT_SUBMITTED
+            log("found a completed run for these inputs -- collecting, not re-docking")
+        else:
+            # Fit to the runtime HERE, not before the resume check: a job whose
+            # result is already on the runtime needs no docking, so a deadline it
+            # will never spend must not stand between the operator and their
+            # result. Verified the hard way -- a completed job was refused for an
+            # exhaustiveness it was not going to run.
+            # Still before the upload, so a refusal costs no GPU time and no
+            # transfer.
+            effective = cb.fit_to_runtime(passthrough, cores, run_timeout, log) \
+                if cores else list(passthrough)
+
+            r_name = os.path.basename(known.receptor)
+            l_name = os.path.basename(known.ligand)
+
+            # Clear the REMOTE markers of a previous failed attempt first. The
+            # poll loop reads exit_code, so a stale non-zero one from an earlier
+            # run is read immediately and the fresh job is reported as failed
+            # before it has done anything. The SSH backend clears them for the
+            # same reason.
+            if state.get("exit_code") is not None:
+                log("previous attempt exited %s; clearing its markers and re-running"
+                    % state.get("exit_code"))
+                session.exec_python(
+                    "import os\n"
+                    "for name in ('exit_code', 'out.sdf', 'stderr.txt', 'stdout.txt'):\n"
+                    "    path = os.path.join(%r, name)\n"
+                    "    if os.path.exists(path):\n"
+                    "        os.unlink(path)\n"
+                    "print('{}')" % job_dir,
+                    "clear stale markers", timeout=300)
+
+            # Clear local leftovers BEFORE launching. An out.sdf surviving from an
+            # earlier attempt would let consensus_docker's split_mol succeed on
+            # stale bytes and write a results.csv from the previous parameter set:
+            # a wrong score with nothing downstream able to detect it.
+            for stale_path in (known.out, known.log):
+                if stale_path and os.path.exists(stale_path):
+                    try:
+                        os.unlink(stale_path)
+                    except OSError as exc:
+                        raise cb.ColabError(
+                            "could not remove the stale %s before submitting: %s. "
+                            "Leaving it would let this job's results.csv be built "
+                            "from the previous run's poses." % (stale_path, exc))
+            # Staging needs the directory to exist: colab upload does not create
+            # a missing parent, and a failed upload here would otherwise look
+            # like a docking failure.
+            session.exec_python(
+                "import os; os.makedirs(%r, exist_ok=True); print('{}')" % job_dir,
+                "mkdir job dir", timeout=300)
+            session.upload(known.receptor, posixpath.join(job_dir, r_name))
+            session.upload(known.ligand, posixpath.join(job_dir, l_name))
+
+            # One runtime, one GPU. The queue sets GNINA_REMOTE_LOCK=1 on every
+            # submit; honouring it is what keeps two detached gnina processes off
+            # the same card. Taken AFTER the upload, so a job that loses the race
+            # has still staged its inputs and the next attempt reuses them rather
+            # than holding the GPU idle through a transfer.
+            lock_root = None
+            if os.environ.get("GNINA_REMOTE_LOCK") == "1":
+                stale = int(float(os.environ.get("GNINA_REMOTE_LOCK_STALE",
+                                                 cb.DEFAULT_LOCK_STALE)
+                                  or cb.DEFAULT_LOCK_STALE))
+                verdict = cb.last_json(session.exec_python(
+                    cb.lock_source(session.remote_root, "%s:%d" % (mode, os.getpid()),
+                                   stale), "take gpu lock", timeout=300)) or {}
+                if not verdict.get("acquired"):
+                    log("the colab GPU mutex is held by %s (%.0fs old); not "
+                        "starting a second gnina on one GPU"
+                        % (verdict.get("owner", {}).get("owner", "another job"),
+                           verdict.get("age") or 0))
+                    ticket.finish("busy", lock="busy")
+                    return EXIT_LOCK_BUSY
+                lock_root = session.remote_root
+
+            try:
+                session.exec_python(
+                    cb.launch_source(job_dir, r_name, l_name, effective,
+                                     lock_root=lock_root),
+                    "launch gnina", timeout=600)
+            except cb.ColabError:
+                # The detached job is what releases the mutex, so a launch that
+                # never started would hold the GPU until the staleness timeout.
+                if lock_root:
+                    try:
+                        session.exec_python(cb.unlock_source(lock_root),
+                                            "release gpu lock", timeout=120)
+                    except cb.ColabError:
+                        pass
+                raise
+
+            if mode == MODE_SUBMIT:
+                log("launched on colab session %r (%s) in %s; not waiting"
+                    % (session.session, session.gpu or "CPU", job_dir))
+                # "launched" is the queue's vocabulary, not a description: it is
+                # what moves the record to SUBMITTED. Any other word falls through
+                # to SUBMIT_NO_TICKET and the job is treated as failed.
+                ticket.finish("launched",
+                              lock="acquired" if lock_root else "not_taken")
+                return EXIT_SUBMITTED
+
+            started = time.time()
+            deadline = started + run_timeout
+            code = None
+            while time.time() < deadline:
+                time.sleep(poll_interval)
+                try:
+                    state = probe()
+                    if state.get("no_gpu"):
+                        # Caught early and deliberately fatal. gnina prints this
+                        # and then finishes on CPU, which is valid chemistry at
+                        # better than 12x the wall time -- while the runtime bills
+                        # for a GPU and fit_to_runtime's deadline model assumes
+                        # one. Letting it run would blow both the budget and the
+                        # prediction while looking like success.
+                        raise cb.ColabError(
+                            "gnina reports 'No GPU detected' on the colab runtime "
+                            "and is running on CPU. The job was stopped rather "
+                            "than left to take ~12x as long on a GPU-billed "
+                            "runtime. Check that LD_LIBRARY_PATH still carries "
+                            "/usr/lib64-nvidia (libcuda.so.1).")
+                except cb.ColabTransientError as exc:
+                    # The job is detached on the runtime; a lost socket is not a
+                    # lost run.
+                    log("probe unreachable (%s) -- job is detached, still waiting"
+                        % exc)
+                    continue
+                if state.get("exit_code") is not None:
+                    code = state["exit_code"]
+                    break
+            if code is None:
+                raise cb.ColabError(
+                    "the colab job did not finish within %.0fs. It is detached and "
+                    "may still be running; re-running this job will collect its "
+                    "result from %s" % (run_timeout, job_dir))
+            if code != "0":
+                raise cb.ColabError(
+                    "gnina exited %s on the colab runtime:\n%s"
+                    % (code, (state.get("stderr_tail") or "").strip()[-800:]))
+            log("gnina finished on colab in %.1fs" % (time.time() - started))
+
+        collect()
+        ticket.finish("collected", exit_code=0)
+        return EXIT_OK
+
+    except (cb.ColabUnavailable, cb.ColabRefused) as exc:
+        # Nothing ran and nothing is resumable: a missing CLI or an exhaustiveness
+        # this runtime cannot finish are both "you asked for the impossible",
+        # not "the job failed". Claiming a kept job directory would be a lie.
+        log("%s" % exc)
+        ticket.finish("refused", error=str(exc))
+        return EXIT_USAGE
+    except cb.ColabError as exc:
+        log("%s" % exc)
+        log("colab job directory kept for resume: %s" % job_dir)
+        ticket.finish("error", error=str(exc))
+        return EXIT_FAILED
+    finally:
+        if stop_when_done and mode != MODE_SUBMIT:
+            # Off by default: a campaign submits thousands of jobs into one
+            # session, and stopping after each would pay the allocation wait
+            # every time. Opt in for a one-shot run, where an idle T4 bills at
+            # about 1.07 compute units an hour until someone notices.
+            session.stop()
+        if not keep and mode == MODE_SYNC:
+            try:
+                session.exec_python(
+                    "import shutil; shutil.rmtree(%r, ignore_errors=True); print('{}')"
+                    % job_dir, "cleanup", timeout=300)
+            except cb.ColabError:
+                pass
+
 
 def _configure_file_log():
     """Add a file handler when GNINA_REMOTE_LOG names one. Never a console one.
@@ -954,11 +1229,18 @@ def main(argv=None):
             ".gnina_remote_ticket.json")
     ticket = _Ticket(ticket_path, mode, argv)
 
+    backend = resolve_backend()
+    if backend not in BACKENDS:
+        log("GNINA_REMOTE_BACKEND=%r is not one of %s. Refusing to guess which "
+            "GPU to spend." % (backend, "/".join(BACKENDS)))
+        return EXIT_USAGE
+
     host = os.environ.get("GNINA_REMOTE_HOST")
-    if not host:
+    if backend == BACKEND_SSH and not host:
         log("GNINA_REMOTE_HOST is not set. This is a stand-in for the gnina binary "
             "that runs it on a remote GPU host; silently falling back to a local "
-            "gnina would hide where the CNN scores came from.")
+            "gnina would hide where the CNN scores came from. To use a Colab GPU "
+            "instead, set GNINA_REMOTE_BACKEND=colab.")
         return EXIT_USAGE
 
     for flag, path in (("-r/--receptor", known.receptor), ("-l/--ligand", known.ligand)):
@@ -971,6 +1253,11 @@ def main(argv=None):
     if not known.out:
         log("-o/--out is required")
         return EXIT_USAGE
+
+    if backend == BACKEND_COLAB:
+        ticket.set(out=os.path.abspath(known.out),
+                   log=os.path.abspath(known.log) if known.log else None)
+        return _run_colab(known, passthrough, log, ticket, mode)
 
     cfg = _Config(known, passthrough, log)
     ticket.set(host=cfg.host, port=cfg.port, image=cfg.image,

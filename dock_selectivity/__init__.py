@@ -20,6 +20,9 @@ Modules:
   ``main()`` uses: the common ``--out-dir/--log-*/--notify*`` flags, logging
   configured *after* parsing into ``<run-dir>/steps/<step>/<step>.log``, and
   Pushover notifications that can fail without failing the run.
+* :mod:`dock_selectivity.colab_backend` -- the second GPU backend for
+  ``gnina_remote.py``: gnina on a Google Colab runtime, for when the SSH host's
+  one GPU is in use. Selected with ``GNINA_REMOTE_BACKEND=colab``.
 
 Submodules are imported lazily (PEP 562) so that importing the package costs
 nothing and never depends on optional third-party libraries.

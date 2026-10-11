@@ -166,8 +166,21 @@ export GNINA_REMOTE_HOST=user@gpu-host GNINA_REMOTE_PORT=50000
 ```
 
 With `GNINA_ASYNC=1`, gnina jobs queue to the GPU while the other engines use
-local cores, and `gnina_collect.py` files results as they land. Details in
-`SETUP.md`.
+local cores, and `gnina_collect.py` files results as they land.
+
+When that host is busy, the same shim runs the jobs on a Google Colab GPU against
+a Colab Pro/Pro+ subscription:
+
+```bash
+export GNINA_REMOTE_BACKEND=colab GNINA_COLAB_GPU=T4
+```
+
+It needs the Colab CLI (`uv tool install google-colab-cli`) — not `gcloud`, which
+manages a different product. A Colab GPU comes with very few vCPUs and gnina's
+search is CPU-parallel, so it is much slower per job at high `--exhaustiveness`;
+the backend clamps `--cpu` to the runtime and refuses an exhaustiveness that
+cannot finish in time rather than lowering it silently. Both backends and the
+measured timings are in `SETUP.md`.
 
 ## Logs
 

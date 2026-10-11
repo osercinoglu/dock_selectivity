@@ -234,6 +234,40 @@ Resume is universal and implicit: every stage checks for valid existing output
 (`check_tool_completion`, `check_final_results_completion`) and skips. `FORCE_RMSD_RECALCULATION` and
 `UPDATE_SMINA_ONLY` are the escape hatches that delete selected outputs before re-running.
 
+### gnina has two GPU backends
+
+`gnina_remote.py` is a stand-in for the gnina *binary*: `consensus_docker.py` execs it and parses its
+stdout, so its output contract is fixed and `tests/test_argument_help_coverage.py` exempts it from the
+`help=` lint. `GNINA_REMOTE_BACKEND` picks where the GPU is:
+
+- **`ssh`** (default) — one host, gnina in Docker, `GNINA_REMOTE_HOST` required.
+- **`colab`** — a Google Colab runtime via the `colab` CLI, for when that host is busy.
+  `dock_selectivity/colab_backend.py`.
+
+Both share the design that matters: the job directory is content-addressed on `job_key(receptor, ligand,
+passthrough)`, the run is detached (`setsid nohup` + an exit-code marker) so a dropped connection loses
+the connection and not the run, a finished job is collected rather than re-docked, and the same exit
+codes reach `gnina_queue` (`3` submitted, `4` not ready, `5` GPU mutex busy).
+
+Colab-specific traps, each of which cost something to find:
+
+- **`gcloud colab` is the wrong tool.** It manages Colab Enterprise (Vertex AI, billed to a GCP
+  project) and cannot spend a consumer Pro/Pro+ subscription's compute units. The `colab` CLI can.
+- **No Docker on Colab**, so the release binary is fetched on the runtime. It is named
+  `gnina.cuda12.8.static` but needs four CUDA 12 sonames that current Colab images (CUDA 13) do not
+  provide at system level; they exist as pip wheels and `LD_LIBRARY_PATH` is composed at run time. Do
+  not hardcode those paths — they carry the runtime's Python version.
+- **vCPUs bound the run, not the GPU.** gnina's search is CPU-parallel; only CNN rescoring is on the
+  card. The same job is 2 m 23 s on the 24-core SSH host and over 32 minutes on a 2-vCPU T4 at
+  `--exhaustiveness 32`. `colab_backend.fit_to_runtime()` therefore clamps `--cpu` loudly and
+  **refuses** an unaffordable `--exhaustiveness` rather than lowering it, reusing `remote_caps`'
+  calibration instead of inventing a second model.
+- **The job key uses the REQUESTED arguments**, never the ones fitted to the runtime. Fitting changes
+  only the thread count, which changes speed and not the result, so a job must resume as the same job
+  on a differently-sized runtime.
+- **An allocated runtime bills whether or not it computes** — 1.07 compute units per hour for a T4
+  measured. Jobs share one named session; `GNINA_COLAB_STOP=1` is for one-shot runs.
+
 ### Job folder naming is a load-bearing contract
 
 In queue mode the job directory name is chosen upstream by `build_run_manifest.py` and encoded by

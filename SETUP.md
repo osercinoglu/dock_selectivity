@@ -152,6 +152,138 @@ If a job exceeds `GNINA_REMOTE_TIMEOUT` the shim exits non-zero but leaves the
 remote directory intact, and says so — re-running that job collects the result.
 Remote directories are removed only after a successful download.
 
+### gnina — on a Colab GPU instead
+
+When the SSH host's single GPU is busy, `GNINA_REMOTE_BACKEND=colab` runs the
+same jobs on a Google Colab runtime against a Colab Pro/Pro+ subscription. Same
+shim, same command line, same exit codes, same content-addressed resume — only
+the transport and how gnina gets there differ.
+
+**This is not `gcloud`.** `gcloud colab` manages *Colab Enterprise*, a Vertex AI
+product billed to a GCP project; it cannot spend a consumer subscription's
+compute units. The tool that can is the separate Colab CLI:
+
+```bash
+uv tool install google-colab-cli          # or: pip install google-colab-cli
+
+# ADC is the headless path. The colaboratory scope matters; re-mint if a call 401s.
+gcloud auth application-default login \
+  --scopes=openid,https://www.googleapis.com/auth/cloud-platform,\
+https://www.googleapis.com/auth/userinfo.email,\
+https://www.googleapis.com/auth/colaboratory
+
+colab --auth=adc usage                    # confirms entitlement and balance
+```
+
+Then point the shim at it:
+
+```bash
+export GNINA_PATH=/home/onur/repos/dock_selectivity/gnina_remote.py
+export GNINA_REMOTE_BACKEND=colab
+export GNINA_COLAB_GPU=T4                 # T4 | L4 | G4 | A100 | H100
+python3 batch_dock.py --queue … --tools smina,gnina,ledock
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GNINA_REMOTE_BACKEND` | `ssh` | `colab` selects this backend |
+| `GNINA_COLAB_SESSION` | `gnina` | session name; jobs share one runtime |
+| `GNINA_COLAB_GPU` | `T4` | an unlisted value is refused, not passed on |
+| `GNINA_COLAB_AUTH` | `adc` | or `oauth2` (needs a browser) |
+| `GNINA_COLAB_CONFIG` | — | CLI state file, to isolate parallel runs |
+| `GNINA_COLAB_STOP` | — | `1` releases the runtime after each job |
+| `GNINA_COLAB_KEEP` | — | `1` leaves the job directory on the runtime |
+| `GNINA_COLAB_BINARY_URL` | v1.3.3 release | override the gnina asset |
+
+**How gnina gets there.** Colab has no Docker, so the container is not an option.
+The release binary is fetched *on the runtime* — 2.06 GB at ~74 MB/s, about 28 s,
+far quicker than uploading 2 GB from here. It is called
+`gnina.cuda12.8.static` but is not fully static: current Colab images ship CUDA
+13, so `libcudart.so.12`, `libcufft.so.11`, `libcublas.so.12` and
+`libcublasLt.so.12` are missing at the system level. They are present as pip
+wheels, and the backend finds each one and composes `LD_LIBRARY_PATH` at run
+time rather than hardcoding a path that carries the runtime's Python version.
+The download happens once per session; a marker file makes later jobs free.
+
+**The bottleneck is vCPUs, not the GPU.** gnina's Monte Carlo search is
+CPU-parallel and only the CNN rescoring uses the card, and a Colab GPU runtime
+comes with very few vCPUs. Measured on the same job (DB00035 / P09211, box
+30×29×31 Å):
+
+| Host | vCPUs | `--exhaustiveness` | Wall time |
+|---|---|---|---|
+| SSH host, RTX 3060 Ti | 24 | 32 | 2 m 23 s |
+| Colab T4, GPU active | 2 | 8 | 22 m 17 s (1337 s) |
+| Colab T4, **CPU fallback** | 2 | 32 | > 32 min |
+
+From the middle row: 1337 x 2 / 8 = **334 core-seconds per exhaustiveness unit**,
+against `remote_caps`' 112.5 measured on the SSH host. The Colab backend carries
+its own constant (344, slightly conservative) because an under-predicting deadline
+model admits a job and then misses the deadline, which is the worse direction.
+Override with `GNINA_COLAB_CORE_SECONDS` after measuring another accelerator.
+
+That second row is a bug, not a benchmark, and it is recorded because it was
+expensive to spot. Composing `LD_LIBRARY_PATH` from the CUDA 12 wheel directories
+alone *replaced* the runtime's own value, `/usr/lib64-nvidia` — which is where
+`libcuda.so.1`, the driver library, lives. gnina then started normally, logged
+`No GPU detected` to its run log, and finished the job on two CPU cores, on a
+runtime billed by the hour for a GPU it never touched. Nothing else in the stack
+noticed; the poses would have been perfectly valid.
+
+Two guards now exist because of it: the library path is always *extended*, never
+replaced, and both the installer and the per-job probe treat `No GPU detected` as
+a hard failure rather than a warning.
+
+So the backend applies the same two rules `remote_caps` applies to the SSH host:
+`--cpu` is **clamped loudly** to the runtime's vCPU count (`consensus_docker.py`
+passes `--cpu 60`; asking 60 threads of 2 vCPUs thrashes), and an
+`--exhaustiveness` the model says cannot finish inside `GNINA_REMOTE_TIMEOUT` is
+**refused, never quietly lowered** — lowering it changes what the docking is, and
+a campaign whose jobs used different values is not comparable.
+
+**Billing.** A runtime bills for wall-clock time it is *allocated*, not time it
+computes: a measured **1.07 compute units per hour** for a T4. An idle session
+costs exactly what a busy one does. Jobs therefore share one named session, and
+`GNINA_COLAB_STOP=1` is for one-shot runs; a campaign stops the session once at
+the end (`colab stop -s gnina`). Check the balance with `colab --auth=adc usage`.
+At 1.07 CU/hr a 600-unit monthly Pro+ allowance is about 560 GPU-hours, which is
+why exhaustiveness matters here in a way it does not on a host you own. What that
+buys, for a queue of 13,222 gnina jobs and the measured 2-vCPU runtime:
+
+| `--exhaustiveness` | Per job (2 vCPU) | CU per job | Jobs per 600 CU | Jobs per 1,784 CU |
+|---|---|---|---|---|
+| 32 (production) | ~89 min | 1.59 | ~380 | ~1,100 |
+| 16 | ~45 min | 0.79 | ~760 | ~2,240 |
+| 8 (measured) | 22 min | 0.40 | ~1,510 | ~4,500 |
+
+Against a queue of 13,222 gnina jobs, Colab at production exhaustiveness is about
+**8% of a campaign for the whole current balance**. It is a way to keep a few
+hundred to a few thousand jobs moving while the SSH host is occupied, not a
+replacement for it — one RTX 3060 Ti with 24 cores does a production job in 2 m 23
+s, which is 37x faster than this T4 with 2 vCPUs.
+
+Lowering exhaustiveness to fit is a scientific decision, not a throughput one:
+jobs docked at different values are not comparable, which is why the backend
+refuses rather than adjusting it.
+
+**One GPU, one job.** `gnina_queue` sets `GNINA_REMOTE_LOCK=1` on every submit;
+this backend honours it with a `mkdir`-atomic mutex in the job root, released by
+the detached job itself after it writes its exit code. Two gnina processes on one
+T4 contend for VRAM and both finish later than if they had queued.
+
+**What survives a disconnection.** The run is launched with `setsid nohup` and
+its exit code goes to a marker file, exactly as on the SSH host — so a dropped
+websocket, an interrupted local process or a `colab exec` timeout loses the
+connection, not the run. Observed while measuring the table above: the local
+`colab exec` client was `SIGTERM`ed 30 minutes into a run and the runtime's
+kernel carried on executing, with `colab status` still reporting `BUSY`. That run
+was *not* detached — it was a foreground `subprocess.run` inside the cell — so
+the detached path this backend uses is strictly more robust than what that
+already demonstrated. Polling resumes against the same content-addressed
+directory, and a finished job is collected rather than re-docked. What does *not*
+survive is the runtime being pruned by the backend: the job directory goes with
+it, and `collect` reports `gone` so the job is docked again.
+
 ## Reference data
 
 Large, shared, not copied per run:
