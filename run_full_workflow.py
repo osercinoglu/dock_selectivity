@@ -556,7 +556,12 @@ def build_parser():
                               "non-interaction jobs the sampler may draw from before "
                               "queueing new work"))
     parser.add_argument("--job-classification", default=None,
-                        help="optional job_classification.csv from bootstrap_output_dir.py")
+                        help=("optional job_classification.csv from "
+                              "classify_existing.py, naming which protein each "
+                              "already-docked job really docked. Supplying it lets "
+                              "the manifest mark those jobs reused_from and leave "
+                              "them out of the redock queue; omit it for a fresh "
+                              "run, where every planned job is newly docked."))
     parser.add_argument("--complex-pdb", choices=("keep", "delete", "compress"),
                         default="keep",
                         help=("consensus_docker.py computes RMSD from complex_*.pdb, "
